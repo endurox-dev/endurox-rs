@@ -34,5 +34,5 @@ impl fmt::Display for AtmiError {
 
 impl Error for AtmiError {}
 
-pub type AppResult<T> = Result<T, AtmiError>;
+pub type AtmiResult<T> = Result<T, AtmiError>;
 
