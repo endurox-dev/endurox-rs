@@ -1,10 +1,11 @@
 [package]
 name = "endurox-rs"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 libc = "0.2"
 
 [build-dependencies]
+bindgen = "0.70"        # pin a version for stability
 cc = "1.0"
