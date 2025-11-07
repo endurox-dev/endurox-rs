@@ -13,7 +13,7 @@ repository = "https://github.com/endurox-dev/endurox-rs"
 homepage = "https://www.mavimax.com"
 documentation = "https://www.endurox.org/dokuwiki"
 keywords = ["middleware", "development", "endurox", "bindings", "rust"]
-categories = ["development-tools::build-utilities"]
+categories = ["development-tools"]
 
 [dependencies]
 libc = "0.2"
