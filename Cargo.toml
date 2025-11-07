@@ -5,7 +5,7 @@ edition = "2021"
 
 # REQUIRED by crates.io
 description = "Dev middleware utilities for Enduro/X projects (Rust bindings)."
-license = "AGPLv3"   # pick one license or an SPDX expression
+license = "AGPL-3.0"   # pick one license or an SPDX expression
 
 # Strongly recommended
 readme = "README.md"
