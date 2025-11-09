@@ -22,3 +22,6 @@ libc = "0.2"
 bindgen = "0.70"        # pin a version for stability
 cc = "1.0"
 
+[features]
+# default = []     # default: !Send & !Sync
+ctx-send = []      # enable to make AtmiCtx: Send & !Sync

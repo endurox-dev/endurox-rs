@@ -3,6 +3,10 @@ pub(crate) mod raw { include!(concat!(env!("OUT_DIR"), "/bindings.rs")); }
 
 // your high-level modules
 mod atmictx;
+mod atmictx_log;
+mod errors;
 
 // re-export the public façade so external users/tests can `use endurox_rs::AtmiCtx`
+pub use errors::{AtmiError, AtmiResult};
 pub use atmictx::AtmiCtx;
+pub use atmictx_log::LogLevel;
