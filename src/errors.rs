@@ -2,13 +2,13 @@ use std::{borrow::Cow, error::Error, fmt};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AtmiError {
-    pub code: u16,
+    pub code: u32,
     pub message: Cow<'static, str>,
 }
 
 /* ATMI error */
 impl AtmiError {
-    pub fn new(code: u16, message: impl Into<Cow<'static, str>>) -> Self {
+    pub fn new(code: u32, message: impl Into<Cow<'static, str>>) -> Self {
         Self { code, message: message.into() }
     }
 

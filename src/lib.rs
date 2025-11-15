@@ -6,9 +6,11 @@ mod atmictx;
 mod atmictx_log;
 mod errors;
 mod typed_buf;
+mod typed_ubf;
 
 // re-export the public façade so external users/tests can `use endurox_rs::AtmiCtx`
 pub use errors::{AtmiError, AtmiResult};
 pub use atmictx::AtmiCtx;
 pub use atmictx_log::LogLevel;
 pub use typed_buf::TypedBuffer;
+pub use typed_ubf::TypedUbf;
