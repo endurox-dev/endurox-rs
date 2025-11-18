@@ -1,5 +1,5 @@
 use core::ffi::{c_int, c_long, c_char};
-use crate::{raw, AtmiError, AtmiResult, TypedBuffer, TypedUbf};
+use crate::{raw, AtmiError, AtmiResult, TypedBuffer, TypedUbf, UbfError, NstdError};
 
 use std::{
     ffi::{CStr, CString},
@@ -80,7 +80,7 @@ impl AtmiCtx {
     }
 
     /// Perform un-init (tpterm). On success ATMI session is terminated
-    /// See *tpinit(3)* for more details.
+    /// See *tpterm(3)* for more details.
     pub fn tpterm(&self) -> AtmiResult<()> {
         let rc = unsafe { raw::tpterm() };
         if rc == raw::EXSUCCEED as c_int {
@@ -99,6 +99,30 @@ impl AtmiCtx {
             let msg_ptr = raw::tpstrerror(code);      // *const c_char
             let message = CStr::from_ptr(msg_ptr).to_string_lossy().into_owned();
             AtmiError::new(code as u32, message)
+        }
+    }
+
+    /// Return last UBF error for the current thread/context.
+    pub fn ubf_last_error(&self) -> UbfError {
+        unsafe {
+            // Adjust types to your actual FFI signatures.
+            let err_ptr = raw::ndrx_Bget_Ferror_addr(); // *const i32 or *mut i32
+            let code = *err_ptr;
+            let msg_ptr = raw::Bstrerror(code);      // *const c_char
+            let message = CStr::from_ptr(msg_ptr).to_string_lossy().into_owned();
+            UbfError::new(code as u32, message)
+        }
+    }
+
+    /// Return last Nerror for the current thread/context.
+    pub fn nstd_last_error(&self) -> NstdError {
+        unsafe {
+            // Adjust types to your actual FFI signatures.
+            let err_ptr = raw::_Nget_Nerror_addr(); // *const i32 or *mut i32
+            let code = *err_ptr;
+            let msg_ptr = raw::Nstrerror(code);      // *const c_char
+            let message = CStr::from_ptr(msg_ptr).to_string_lossy().into_owned();
+            NstdError::new(code as u32, message)
         }
     }
 
@@ -125,9 +149,7 @@ impl AtmiCtx {
         if ptr.is_null() {
             Err(self.atmi_last_error())
         } else {
-            // SAFETY: just allocated, owned by this context.
-            let buf = unsafe { TypedBuffer::from_raw(self, ptr) }
-                .expect("tpalloc returned non-null pointer but from_raw returned None");
+            let buf = unsafe { TypedBuffer::from_raw(self, ptr) };
             Ok(buf)
         }
     }
@@ -148,9 +170,7 @@ impl AtmiCtx {
         if raw_ptr.is_null() {
             Err(self.atmi_last_error())
         } else {
-            // SAFETY: just allocated UBF buffer for this context.
-            let ubf = unsafe { TypedUbf::from_raw(self, raw_ptr) }
-                .expect("tpalloc_ubf returned non-null pointer but from_raw returned None");
+            let ubf = unsafe { TypedUbf::from_raw(self, raw_ptr) };
             Ok(ubf)
         }
     }

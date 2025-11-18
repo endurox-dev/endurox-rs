@@ -9,18 +9,14 @@ use std::{
 #[derive(Debug)]
 pub struct TypedBuffer<'ctx> {
     ptr: *mut c_char,    // may be null
-    ctx: &'ctx AtmiCtx,  // real reference to the owning context
+    pub ctx: &'ctx AtmiCtx,  // real reference to the owning context
 }
 
 impl<'ctx> TypedBuffer<'ctx> {
     /// # Safety
     /// `raw` must be a valid `atmibuf*` allocated for this context and owned by the caller.
-    pub unsafe fn from_raw(ctx: &'ctx AtmiCtx, raw: *mut c_char) -> Option<Self> {
-        if raw.is_null() {
-            None
-        } else {
-            Some(Self { ptr: raw, ctx })
-        }
+    pub unsafe fn from_raw(ctx: &'ctx AtmiCtx, raw: *mut c_char) -> Self {
+        Self { ptr: raw, ctx }
     }
 
     /// Transfers ownership to C or another wrapper. No Drop is run.
@@ -47,7 +43,6 @@ impl<'ctx> TypedBuffer<'ctx> {
         let ptr = self.into_raw();
         // rewrap with new lifetime / context
         TypedBuffer::from_raw(new_ctx, ptr)
-            .expect("move_to_context: pointer unexpectedly null")
     }
 
     /// Reallocate this buffer with a new size using `tprealloc`.
@@ -69,6 +64,7 @@ impl<'ctx> TypedBuffer<'ctx> {
             Ok(())
         }
     }
+
 }
 
 impl<'ctx> Drop for TypedBuffer<'ctx> {
