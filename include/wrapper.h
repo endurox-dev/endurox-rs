@@ -5,4 +5,5 @@
 #include <oatmisrv.h>
 #include <oatmisrv_integra.h>
 #include <ubf.h>
+#include <oubf.h>
 #include <nerror.h>

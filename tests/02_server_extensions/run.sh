@@ -6,20 +6,31 @@ THIS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF_DIR="$THIS_DIR/conf"
 BIN_DIR="$THIS_DIR/bin"
 PROJECT_DIR="$(cd "$THIS_DIR/../.." && pwd)"
-RUN_ID="$((($$ % 9000) + 1000))"
-
-export NDRX_RS_EXT_QPREFIX="/nre${RUN_ID}"
-export NDRX_RS_EXT_DPID="/tmp/ndrxd-rs-ext-${RUN_ID}.pid"
-export NDRX_RS_EXT_RNDK="rsext${RUN_ID}"
-export NDRX_RS_EXT_IPCKEY="$((60000 + RUN_ID))"
 
 mkdir -p "$BIN_DIR"
 
+if [ -f ~/ndrx_home ]; then
+    . ~/ndrx_home
+fi
+
+rm -f "$CONF_DIR/app.ini" "$CONF_DIR/settest1"
+mkdir -p "$THIS_DIR/log"
+find "$THIS_DIR/log" -type f -exec rm -f {} +
+
+pushd "$THIS_DIR" >/dev/null
+xadmin provision -d \
+    -vaddubf=../ubftab/test.fd \
+    -vtimeout=60 \
+    -vmsgmax=10 \
+    -vmsgsizemax=40000
+popd >/dev/null
+
 pushd "$CONF_DIR" >/dev/null
+. ./settest1
 . ./setndrx
 popd >/dev/null
 
-cargo build --manifest-path "$PROJECT_DIR/Cargo.toml" --bin rs_it_ext_server --bin rs_it_ext_client
+cargo build --manifest-path "$TEST_DIR/Cargo.toml" --target-dir "$PROJECT_DIR/target" --bin rs_it_ext_server --bin rs_it_ext_client
 cp "$PROJECT_DIR/target/debug/rs_it_ext_server" "$BIN_DIR/rs_it_ext_server"
 chmod +x "$BIN_DIR/rs_it_ext_server"
 
@@ -28,7 +39,7 @@ cleanup() {
 }
 
 dump_logs() {
-    for f in /tmp/xadmin-rs-ext.log /tmp/ndrxd-rs-ext.log /tmp/ndrx-rs-ext.log /tmp/rs_it_ext_server.log; do
+    for f in "$NDRX_APPHOME"/log/*; do
         if [ -f "$f" ]; then
             echo "===== $f (tail) ====="
             tail -n 80 "$f" || true

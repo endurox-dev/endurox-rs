@@ -7,20 +7,31 @@ CONF_DIR="$THIS_DIR/conf"
 BIN_DIR="$THIS_DIR/bin"
 PROJECT_DIR="$(cd "$THIS_DIR/../.." && pwd)"
 SCENARIO="${1:-tpcall}"
-RUN_ID="$((($$ % 9000) + 1000))"
-
-export NDRX_RS_IT_QPREFIX="/nri${RUN_ID}"
-export NDRX_RS_IT_DPID="/tmp/ndrxd-rs-it-${RUN_ID}.pid"
-export NDRX_RS_IT_RNDK="rsit${RUN_ID}"
-export NDRX_RS_IT_IPCKEY="$((50000 + RUN_ID))"
 
 mkdir -p "$BIN_DIR"
 
+if [ -f ~/ndrx_home ]; then
+    . ~/ndrx_home
+fi
+
+rm -f "$CONF_DIR/app.ini" "$CONF_DIR/settest1"
+mkdir -p "$THIS_DIR/log"
+find "$THIS_DIR/log" -type f -exec rm -f {} +
+
+pushd "$THIS_DIR" >/dev/null
+xadmin provision -d \
+    -vaddubf=../ubftab/test.fd \
+    -vtimeout=60 \
+    -vmsgmax=10 \
+    -vmsgsizemax=40000
+popd >/dev/null
+
 pushd "$CONF_DIR" >/dev/null
+. ./settest1
 . ./setndrx
 popd >/dev/null
 
-cargo build --manifest-path "$PROJECT_DIR/Cargo.toml" --bin rs_it_server --bin rs_it_client
+cargo build --manifest-path "$TEST_DIR/Cargo.toml" --target-dir "$PROJECT_DIR/target" --bin rs_it_server --bin rs_it_client
 cp "$PROJECT_DIR/target/debug/rs_it_server" "$BIN_DIR/rs_it_server"
 chmod +x "$BIN_DIR/rs_it_server"
 
@@ -29,7 +40,7 @@ cleanup() {
 }
 
 dump_logs() {
-    for f in /tmp/xadmin-rs-it.log /tmp/ndrxd-rs-it.log /tmp/ndrx-rs-it.log /tmp/rs_it_server.log; do
+    for f in "$NDRX_APPHOME"/log/*; do
         if [ -f "$f" ]; then
             echo "===== $f (tail) ====="
             tail -n 80 "$f" || true

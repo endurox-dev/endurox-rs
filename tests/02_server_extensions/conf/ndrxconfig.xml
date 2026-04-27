@@ -24,7 +24,7 @@
             <srvid>1</srvid>
             <min>1</min>
             <max>1</max>
-            <sysopt>-e /tmp/rs_it_ext_server.log -r</sysopt>
+            <sysopt>-e ${NDRX_APPHOME}/log/rs_it_ext_server.log -r</sysopt>
         </server>
     </servers>
 </endurox>

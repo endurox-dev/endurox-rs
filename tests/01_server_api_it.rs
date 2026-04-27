@@ -2,15 +2,37 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
 #[test]
-fn xatmi_server_extensions_poller_and_before_poll_callbacks() {
+fn xatmi_server_client_tpcall_ubf_roundtrip() {
+    run_xatmi_server_client_scenario("tpcall");
+}
+
+#[test]
+fn xatmi_server_client_tpacall_ubf_roundtrip() {
+    run_xatmi_server_client_scenario("tpacall");
+}
+
+#[test]
+fn xatmi_server_client_tpacall_getany_ubf_roundtrip() {
+    run_xatmi_server_client_scenario("tpacall-getany");
+}
+
+#[test]
+fn xatmi_server_client_tpforward_ubf_roundtrip() {
+    run_xatmi_server_client_scenario("tpforward");
+}
+
+#[test]
+fn xatmi_server_client_embedded_ubf_roundtrip() {
+    run_xatmi_server_client_scenario("inner-ubf");
+}
+
+fn run_xatmi_server_client_scenario(scenario: &str) {
     let _guard = match integration_test_lock().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
     let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let test_dir = manifest_dir
-        .join("tests")
-        .join("xatmi_server_extensions_api");
+    let test_dir = manifest_dir.join("tests").join("01_server_api");
     let run_sh = test_dir.join("run.sh");
 
     assert!(
@@ -21,13 +43,14 @@ fn xatmi_server_extensions_poller_and_before_poll_callbacks() {
 
     let output = Command::new("bash")
         .arg(&run_sh)
+        .arg(scenario)
         .current_dir(&test_dir)
         .output()
         .expect("failed to execute run.sh");
 
     if !output.status.success() {
         panic!(
-            "run.sh failed with status={}\nstdout:\n{}\nstderr:\n{}",
+            "run.sh {scenario} failed with status={}\nstdout:\n{}\nstderr:\n{}",
             output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
