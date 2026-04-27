@@ -353,7 +353,7 @@ impl AtmiCtx {
         Ok(())
     }
 
-    pub unsafe fn tpreturn(
+    pub(crate) unsafe fn tpreturn(
         &self,
         rval: i32,
         rcode: i64,
@@ -381,7 +381,7 @@ impl AtmiCtx {
         );
     }
 
-    pub unsafe fn tpforward(&self, svc: &str, data: *mut c_char, len: usize, flags: i64) {
+    pub(crate) unsafe fn tpforward(&self, svc: &str, data: *mut c_char, len: usize, flags: i64) {
         let c_svc = match CString::new(svc) {
             Ok(s) => s,
             Err(_) => return,
@@ -405,7 +405,16 @@ impl AtmiCtx {
         );
     }
 
-    pub unsafe fn tpexit(&self) {
+    /// Forward a UBF request from the current service to another service.
+    ///
+    /// This consumes `data` and transfers ownership to Enduro/X. The function
+    /// does not return to the caller in normal Enduro/X control flow.
+    pub fn tpforward_ubf(&self, svc: &str, data: TypedUbf<'_>, flags: i64) {
+        let ptr = data.into_raw();
+        unsafe { self.tpforward(svc, ptr, 0, flags) };
+    }
+
+    pub(crate) unsafe fn tpexit(&self) {
         #[cfg(not(feature = "ctx-send"))]
         raw::tpexit();
 
@@ -413,7 +422,7 @@ impl AtmiCtx {
         raw::Otpexit(self.c_ctx_ptr());
     }
 
-    pub unsafe fn tpcontinue(&self) {
+    pub(crate) unsafe fn tpcontinue(&self) {
         #[cfg(not(feature = "ctx-send"))]
         raw::tpcontinue();
 
@@ -421,7 +430,7 @@ impl AtmiCtx {
         raw::Otpcontinue(self.c_ctx_ptr());
     }
 
-    pub unsafe fn tpsrvgetctxdata(&self) -> *mut c_char {
+    pub(crate) unsafe fn tpsrvgetctxdata(&self) -> *mut c_char {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::tpsrvgetctxdata()
@@ -433,7 +442,11 @@ impl AtmiCtx {
         }
     }
 
-    pub unsafe fn tpsrvgetctxdata2(&self, p_buf: *mut c_char, p_len: *mut c_long) -> *mut c_char {
+    pub(crate) unsafe fn tpsrvgetctxdata2(
+        &self,
+        p_buf: *mut c_char,
+        p_len: *mut c_long,
+    ) -> *mut c_char {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::tpsrvgetctxdata2(p_buf, p_len)
@@ -445,7 +458,7 @@ impl AtmiCtx {
         }
     }
 
-    pub unsafe fn tpsrvfreectxdata(&self, p_buf: *mut c_char) {
+    pub(crate) unsafe fn tpsrvfreectxdata(&self, p_buf: *mut c_char) {
         #[cfg(not(feature = "ctx-send"))]
         raw::tpsrvfreectxdata(p_buf);
 
@@ -453,7 +466,7 @@ impl AtmiCtx {
         raw::Otpsrvfreectxdata(self.c_ctx_ptr(), p_buf);
     }
 
-    pub fn tpsrvsetctxdata(&self, data: *mut c_char, flags: i64) -> AtmiResult<()> {
+    pub(crate) fn tpsrvsetctxdata(&self, data: *mut c_char, flags: i64) -> AtmiResult<()> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpsrvsetctxdata(data, flags as c_long) };
 
@@ -618,7 +631,7 @@ impl AtmiCtx {
         }
     }
 
-    pub unsafe fn ndrx_main(&self, argc: i32, argv: *mut *mut c_char) -> i32 {
+    pub(crate) unsafe fn ndrx_main(&self, argc: i32, argv: *mut *mut c_char) -> i32 {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::ndrx_main(argc as c_int, argv)
@@ -630,7 +643,7 @@ impl AtmiCtx {
         }
     }
 
-    pub unsafe fn ndrx_main_integra(
+    pub(crate) unsafe fn ndrx_main_integra(
         &self,
         argc: i32,
         argv: *mut *mut c_char,
@@ -673,7 +686,7 @@ impl AtmiCtx {
         self.tp_run_inner(init_hook, Some(done_hook))
     }
 
-    /// Variant of [`tp_run`] without a shutdown callback.
+    /// Variant of [`AtmiCtx::tp_run`] without a shutdown callback.
     pub fn tp_run_no_uninit(&self, init_hook: RustServerInitHook) -> AtmiResult<()> {
         self.tp_run_inner(init_hook, None)
     }
@@ -751,7 +764,7 @@ impl AtmiCtx {
 
     /// Return a UBF buffer from a service callback.
     ///
-    /// Convenience wrapper over [`tpreturn_buffer`] for the common UBF case.
+    /// Convenience wrapper over [`AtmiCtx::tpreturn_buffer`] for the common UBF case.
     pub fn tpreturn_ubf(&self, status: TpReturnStatus, rcode: i64, data: TypedUbf<'_>, flags: i64) {
         self.tpreturn_buffer(status, rcode, data.into_inner(), flags);
     }

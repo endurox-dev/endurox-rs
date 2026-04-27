@@ -20,8 +20,9 @@ type CtxMarker = Cell<()>; // -> Send & !Sync
 type CtxHandle = raw::TPCONTEXT_T;
 
 /// Per-thread XATMI context.
-/// - Default (no "ctx-send"): !Send & !Sync
-/// - With "ctx-send": Send & !Sync
+///
+/// By default the context is neither `Send` nor `Sync`. With the `ctx-send`
+/// feature enabled it becomes `Send`, but remains `!Sync`.
 #[derive(Debug)]
 pub struct AtmiCtx {
     _marker: PhantomData<CtxMarker>,
@@ -31,9 +32,8 @@ pub struct AtmiCtx {
 }
 
 impl AtmiCtx {
-    ///Estalish new ATMI context
+    /// Create a new ATMI context handle.
     pub fn new() -> Result<Self, AtmiError> {
-        // No ctx-send: just a thread-local marker, nothing to allocate.
         #[cfg(not(feature = "ctx-send"))]
         {
             Ok(AtmiCtx {
@@ -41,18 +41,15 @@ impl AtmiCtx {
             })
         }
 
-        // With ctx-send: allocate context on C side via tpnewctxt(0, 0).
         #[cfg(feature = "ctx-send")]
         {
             unsafe {
-                // Adjust signature to your actual raw binding:
-                // e.g. fn tpnewctxt(flags: i64, rsvd: i64) -> raw::TPCONTEXT_T;
                 let handle = raw::tpnewctxt(0, 0);
 
                 if handle.is_null() {
                     return Err(AtmiError::new(
                         raw::TPESYSTEM,
-                        "Failed to allocate new context - see ULOG for details",
+                        "failed to allocate ATMI context",
                     ));
                 }
 
@@ -64,8 +61,7 @@ impl AtmiCtx {
         }
     }
 
-    /// Perform init (tpinit). On success current context becomes assocated with ATMI session.
-    /// See *tpinit(3)* for more details.
+    /// Join the application as a client by calling `tpinit`.
     pub fn tpinit(&self) -> AtmiResult<()> {
         let rc = unsafe { raw::tpinit(ptr::null_mut()) };
         if rc == raw::EXSUCCEED as c_int {
@@ -75,8 +71,7 @@ impl AtmiCtx {
         }
     }
 
-    /// Perform un-init (tpterm). On success ATMI session is terminated
-    /// See *tpterm(3)* for more details.
+    /// Leave the application by calling `tpterm`.
     pub fn tpterm(&self) -> AtmiResult<()> {
         let rc = unsafe { raw::tpterm() };
         if rc == raw::EXSUCCEED as c_int {
@@ -101,19 +96,17 @@ impl AtmiCtx {
     /// Return last UBF error for the current thread/context.
     pub fn ubf_last_error(&self) -> UbfError {
         unsafe {
-            // Adjust types to your actual FFI signatures.
-            let err_ptr = raw::ndrx_Bget_Ferror_addr(); // *const i32 or *mut i32
+            let err_ptr = self.ndrx_bget_ferror_addr();
             let code = *err_ptr;
-            let msg_ptr = raw::Bstrerror(code); // *const c_char
+            let msg_ptr = self.bstrerror(code);
             let message = CStr::from_ptr(msg_ptr).to_string_lossy().into_owned();
             UbfError::new(code as u32, message)
         }
     }
 
-    /// Return last Nerror for the current thread/context.
+    /// Return the last NSTD error for the current thread/context.
     pub fn nstd_last_error(&self) -> NstdError {
         unsafe {
-            // Adjust types to your actual FFI signatures.
             let err_ptr = raw::_Nget_Nerror_addr(); // *const i32 or *mut i32
             let code = *err_ptr;
             let msg_ptr = raw::Nstrerror(code); // *const c_char
@@ -122,7 +115,7 @@ impl AtmiCtx {
         }
     }
 
-    /// Generic tpalloc -> lifetime-tied `TypedBuffer<'ctx>`.
+    /// Allocate a typed XATMI buffer tied to this context.
     pub fn tpalloc<'ctx>(
         &'ctx self,
         type_: &str,
@@ -150,7 +143,7 @@ impl AtmiCtx {
         }
     }
 
-    /// Typed helper: UBF buffer.
+    /// Allocate a UBF buffer tied to this context.
     pub fn tpalloc_ubf<'ctx>(&'ctx self, size: usize) -> AtmiResult<TypedUbf<'ctx>> {
         let type_c = CString::new("UBF").unwrap();
         let subtype_c = CString::new("").unwrap();

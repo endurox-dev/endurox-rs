@@ -39,9 +39,7 @@ fn rs_it_forward(ctx: &AtmiCtx, svc: &mut TpSvcInfo<'_>) {
         Some(b) => b,
         None => return,
     };
-    unsafe {
-        ctx.tpforward("RS_IT_FORWARD_FINAL", ubf.into_raw(), 0, 0);
-    }
+    ctx.tpforward_ubf("RS_IT_FORWARD_FINAL", ubf, 0);
 }
 
 fn rs_it_inner_ubf(ctx: &AtmiCtx, svc: &mut TpSvcInfo<'_>) {

@@ -5,16 +5,29 @@ use std::ops::{Deref, DerefMut};
 
 use crate::{raw, AtmiCtx, AtmiError, TypedBuffer, UbfError, UbfResult};
 
-///UBF field value
+/// Value that can be written into a UBF field.
+///
+/// The variant should match the destination field type. When possible, `bchg`
+/// uses Enduro/X typed conversion APIs so Rust callers can work with ordinary
+/// Rust values.
 pub enum UbfValue<'ctx> {
+    /// Signed 16-bit integer field.
     Short(i16),
+    /// Signed long integer field.
     Long(i64),
+    /// Single byte character field.
     Char(i8),
+    /// 32-bit floating point field.
     Float(f32),
+    /// 64-bit floating point field.
     Double(f64),
+    /// NUL-terminated string field. Interior NUL bytes are rejected.
     String(String),
+    /// Byte array field. Length is preserved.
     Carray(Vec<u8>),
+    /// Pointer field containing another typed ATMI buffer.
     Ptr(TypedBuffer<'ctx>),
+    /// Embedded UBF field.
     Ubf(TypedUbf<'ctx>), //Ubf(TypedView<'ctx>) - TODO
 }
 
@@ -78,24 +91,31 @@ impl<'a, 'ctx> BorrowedUbf<'a, 'ctx> {
 impl<'ctx> TypedUbf<'ctx> {
     /// # Safety
     /// `raw` must be a valid UBF (`UBFH*`) allocated for this context.
-    pub unsafe fn from_raw(ctx: &'ctx AtmiCtx, raw: *mut c_char) -> Self {
+    pub(crate) unsafe fn from_raw(ctx: &'ctx AtmiCtx, raw: *mut c_char) -> Self {
         TypedUbf {
             inner: TypedBuffer::from_raw(ctx, raw),
         }
     }
 
-    /// Blind cast from a generic buffer you know is UBF.
+    /// Convert a generic typed buffer into a UBF buffer wrapper.
+    ///
+    /// The caller must know that the wrapped ATMI buffer is actually a UBF
+    /// buffer, for example because it came from `tpalloc("UBF", ...)`.
     pub fn from_typed(buf: TypedBuffer<'ctx>) -> Self {
         TypedUbf { inner: buf }
     }
 
-    /// Give up this wrapper and return the underlying `TypedBuffer`.
+    /// Return the underlying generic typed buffer wrapper.
     pub fn into_inner(self) -> TypedBuffer<'ctx> {
         self.inner
     }
 
-    /// Transfer ownership of the underlying pointer (no Drop).
-    pub fn into_raw(self) -> *mut c_char {
+    /// Transfer ownership of the underlying UBF buffer pointer.
+    ///
+    /// The returned pointer will not be freed by this Rust value. This is mainly
+    /// useful when handing the buffer to Enduro/X APIs that take ownership, such
+    /// as service forwarding/return paths.
+    pub(crate) fn into_raw(self) -> *mut c_char {
         self.inner.into_raw()
     }
 
@@ -109,17 +129,15 @@ impl<'ctx> TypedUbf<'ctx> {
     /// Move this UBF buffer to a different context.
     ///
     /// Only valid if the C library allows using this buffer under `new_ctx`.
-    pub unsafe fn move_to_context<'new>(self, new_ctx: &'new AtmiCtx) -> TypedUbf<'new> {
+    pub(crate) unsafe fn move_to_context<'new>(self, new_ctx: &'new AtmiCtx) -> TypedUbf<'new> {
         let ptr = self.into_raw();
         TypedUbf::from_raw(new_ctx, ptr)
     }
 
-    ///Get size of the buffer. See *Bsizeof(3)* for more details
+    /// Return the allocated UBF buffer size in bytes.
     ///
-    /// # Returns
-    ///
-    /// * `Ok(size)` – size of the buffer in bytes.
-    /// * `Err(e)` – if the underlying `Bsizeof` call fails.
+    /// Wraps `Bsizeof(3)`. This reports the buffer allocation size, not the
+    /// amount of payload currently used.
     pub fn bsizeof(&mut self) -> UbfResult<usize> {
         let rc = unsafe { raw::Bsizeof(self.inner.as_ptr() as *mut raw::UBFH) };
 
@@ -141,15 +159,13 @@ impl<'ctx> TypedUbf<'ctx> {
         Ok(())
     }
 
-    /// Change UBF field value. See Bchg(3) for more details.
+    /// Change or add a UBF field occurrence.
     ///
-    /// # Parameters
+    /// Wraps `CBchg(3)` for scalar values and `Bchg(3)` for embedded UBF
+    /// values.
     ///
-    /// * `bfldid` – UBF field id to change.
-    /// * `occ` – occurrence index for the field (0-based).
-    /// * `v` – value to store at the given field/occurrence in this buffer.
-    /// * `realloc` – whether the operation may reallocate the underlying
-    ///   buffer in case of getting BNOSPACE error.
+    /// If `realloc` is true and Enduro/X reports `BNOSPACE`, the buffer is
+    /// grown and the operation is retried.
     pub fn bchg(
         &mut self,
         bfldid: i32,
@@ -266,7 +282,10 @@ impl<'ctx> TypedUbf<'ctx> {
 
     // --- Safe typed field getters -------------------------------------------
 
-    /// Read a UBF field as a `String`.  Uses `CBgetalloc` for any source type.
+    /// Read a UBF field occurrence as a `String`.
+    ///
+    /// Uses `CBgetalloc(3)` so Enduro/X performs type conversion from the
+    /// stored field type to `BFLD_STRING`.
     pub fn bget_string(&self, bfldid: i32, occ: i32) -> UbfResult<String> {
         let mut extralen: raw::BFLDLEN = 0;
         let ptr = unsafe {
@@ -288,7 +307,9 @@ impl<'ctx> TypedUbf<'ctx> {
         Ok(s)
     }
 
-    /// Read a UBF field as `i64` (BFLD_LONG target type).
+    /// Read a UBF field occurrence as an `i64`.
+    ///
+    /// Uses `CBget(3)` with `BFLD_LONG` as the requested target type.
     pub fn bget_long(&self, bfldid: i32, occ: i32) -> UbfResult<i64> {
         let mut val: i64 = 0;
         let mut len = std::mem::size_of::<i64>() as raw::BFLDLEN;
@@ -309,7 +330,9 @@ impl<'ctx> TypedUbf<'ctx> {
         }
     }
 
-    /// Read a UBF field as `i16` (BFLD_SHORT target type).
+    /// Read a UBF field occurrence as an `i16`.
+    ///
+    /// Uses `CBget(3)` with `BFLD_SHORT` as the requested target type.
     pub fn bget_short(&self, bfldid: i32, occ: i32) -> UbfResult<i16> {
         let mut val: i16 = 0;
         let mut len = std::mem::size_of::<i16>() as raw::BFLDLEN;
@@ -330,7 +353,9 @@ impl<'ctx> TypedUbf<'ctx> {
         }
     }
 
-    /// Read a UBF field as `f64` (BFLD_DOUBLE target type).
+    /// Read a UBF field occurrence as an `f64`.
+    ///
+    /// Uses `CBget(3)` with `BFLD_DOUBLE` as the requested target type.
     pub fn bget_double(&self, bfldid: i32, occ: i32) -> UbfResult<f64> {
         let mut val: f64 = 0.0;
         let mut len = std::mem::size_of::<f64>() as raw::BFLDLEN;
@@ -351,7 +376,9 @@ impl<'ctx> TypedUbf<'ctx> {
         }
     }
 
-    /// Read a UBF field as `f32` (BFLD_FLOAT target type).
+    /// Read a UBF field occurrence as an `f32`.
+    ///
+    /// Uses `CBget(3)` with `BFLD_FLOAT` as the requested target type.
     pub fn bget_float(&self, bfldid: i32, occ: i32) -> UbfResult<f32> {
         let mut val: f32 = 0.0;
         let mut len = std::mem::size_of::<f32>() as raw::BFLDLEN;
@@ -372,7 +399,9 @@ impl<'ctx> TypedUbf<'ctx> {
         }
     }
 
-    /// Read a UBF field as `i8` (BFLD_CHAR target type).
+    /// Read a UBF field occurrence as an `i8`.
+    ///
+    /// Uses `CBget(3)` with `BFLD_CHAR` as the requested target type.
     pub fn bget_char(&self, bfldid: i32, occ: i32) -> UbfResult<i8> {
         let mut val: i8 = 0;
         let mut len = std::mem::size_of::<i8>() as raw::BFLDLEN;
@@ -393,7 +422,9 @@ impl<'ctx> TypedUbf<'ctx> {
         }
     }
 
-    /// Read a UBF BFLD_CARRAY field into an owned `Vec<u8>`.
+    /// Read a UBF `BFLD_CARRAY` occurrence into an owned byte vector.
+    ///
+    /// The exact CARRAY length returned by Enduro/X is preserved.
     pub fn bget_bytes(&self, bfldid: i32, occ: i32) -> UbfResult<Vec<u8>> {
         let mut extralen: raw::BFLDLEN = 0;
         let ptr = unsafe {
@@ -414,7 +445,9 @@ impl<'ctx> TypedUbf<'ctx> {
         Ok(bytes)
     }
 
-    /// Read an embedded UBF field as a borrowed read-only UBF view.
+    /// Read an embedded UBF occurrence as a borrowed read-only UBF view.
+    ///
+    /// The returned view is tied to this parent buffer and must not outlive it.
     pub fn bget_ubf<'a>(&'a self, bfldid: i32, occ: i32) -> UbfResult<BorrowedUbf<'a, 'ctx>> {
         let mut len: raw::BFLDLEN = 0;
         let ptr = unsafe {

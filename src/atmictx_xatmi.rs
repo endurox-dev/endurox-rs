@@ -504,7 +504,7 @@ impl AtmiCtx {
         &self,
         eventexpr: &str,
         filter: Option<&str>,
-        ctl: *mut crate::TpEvCtl,
+        ctl: Option<&mut crate::TpEvCtl>,
         flags: i64,
     ) -> AtmiResult<i64> {
         let c_expr = CString::new(eventexpr).map_err(|_| self.atmi_last_error())?;
@@ -516,13 +516,14 @@ impl AtmiCtx {
             .as_ref()
             .map(|v| v.as_ptr() as *mut c_char)
             .unwrap_or(ptr::null_mut());
+        let ctl_ptr = ctl.map_or(ptr::null_mut(), |ctl| ctl.as_mut_ptr());
 
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe {
             raw::tpsubscribe(
                 c_expr.as_ptr() as *mut c_char,
                 filter_ptr,
-                ctl,
+                ctl_ptr,
                 flags as c_long,
             )
         };
@@ -533,7 +534,7 @@ impl AtmiCtx {
                 self.c_ctx_ptr(),
                 c_expr.as_ptr() as *mut c_char,
                 filter_ptr,
-                ctl,
+                ctl_ptr,
                 flags as c_long,
             )
         };
@@ -557,21 +558,15 @@ impl AtmiCtx {
         self.rc_to_result(rc)
     }
 
-    pub fn tppost(
-        &self,
-        eventname: &str,
-        data: *mut c_char,
-        len: usize,
-        flags: i64,
-    ) -> AtmiResult<()> {
+    pub fn tppost(&self, eventname: &str, data: &TypedBuffer<'_>, flags: i64) -> AtmiResult<()> {
         let c_event = CString::new(eventname).map_err(|_| self.atmi_last_error())?;
 
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe {
             raw::tppost(
                 c_event.as_ptr() as *mut c_char,
-                data,
-                len as c_long,
+                data.as_ptr(),
+                0,
                 flags as c_long,
             )
         };
@@ -581,8 +576,8 @@ impl AtmiCtx {
             raw::Otppost(
                 self.c_ctx_ptr(),
                 c_event.as_ptr() as *mut c_char,
-                data,
-                len as c_long,
+                data.as_ptr(),
+                0,
                 flags as c_long,
             )
         };
@@ -734,25 +729,27 @@ impl AtmiCtx {
         }
     }
 
-    pub fn tpimport<'ctx>(
-        &'ctx self,
-        istr: *mut c_char,
-        ilen: usize,
-        flags: i64,
-    ) -> AtmiResult<(TypedBuffer<'ctx>, usize)> {
+    pub fn tpimport<'ctx>(&'ctx self, payload: &[u8], flags: i64) -> AtmiResult<TypedBuffer<'ctx>> {
         let mut obuf: *mut c_char = ptr::null_mut();
         let mut olen: c_long = 0;
 
         #[cfg(not(feature = "ctx-send"))]
-        let rc =
-            unsafe { raw::tpimport(istr, ilen as c_long, &mut obuf, &mut olen, flags as c_long) };
+        let rc = unsafe {
+            raw::tpimport(
+                payload.as_ptr() as *mut c_char,
+                payload.len() as c_long,
+                &mut obuf,
+                &mut olen,
+                flags as c_long,
+            )
+        };
 
         #[cfg(feature = "ctx-send")]
         let rc = unsafe {
             raw::Otpimport(
                 self.c_ctx_ptr(),
-                istr,
-                ilen as c_long,
+                payload.as_ptr() as *mut c_char,
+                payload.len() as c_long,
                 &mut obuf,
                 &mut olen,
                 flags as c_long,
@@ -760,40 +757,49 @@ impl AtmiCtx {
         };
 
         if rc == raw::EXSUCCEED as c_int {
-            Ok((unsafe { TypedBuffer::from_raw(self, obuf) }, olen as usize))
+            let _ = olen;
+            Ok(unsafe { TypedBuffer::from_raw(self, obuf) })
         } else {
             Err(self.atmi_last_error())
         }
     }
 
-    pub fn tpexport(
-        &self,
-        ibuf: &TypedBuffer<'_>,
-        ilen: usize,
-        ostr: *mut c_char,
-        olen: *mut c_long,
-        flags: i64,
-    ) -> AtmiResult<()> {
+    pub fn tpexport(&self, ibuf: &TypedBuffer<'_>, flags: i64) -> AtmiResult<Vec<u8>> {
+        let mut out = vec![0u8; 65536];
+        let mut olen = out.len() as c_long;
+
         #[cfg(not(feature = "ctx-send"))]
-        let rc =
-            unsafe { raw::tpexport(ibuf.as_ptr(), ilen as c_long, ostr, olen, flags as c_long) };
+        let rc = unsafe {
+            raw::tpexport(
+                ibuf.as_ptr(),
+                0,
+                out.as_mut_ptr() as *mut c_char,
+                &mut olen,
+                flags as c_long,
+            )
+        };
 
         #[cfg(feature = "ctx-send")]
         let rc = unsafe {
             raw::Otpexport(
                 self.c_ctx_ptr(),
                 ibuf.as_ptr(),
-                ilen as c_long,
-                ostr,
-                olen,
+                0,
+                out.as_mut_ptr() as *mut c_char,
+                &mut olen,
                 flags as c_long,
             )
         };
 
-        self.rc_to_result(rc)
+        if rc == raw::EXSUCCEED as c_int {
+            out.truncate(olen as usize);
+            Ok(out)
+        } else {
+            Err(self.atmi_last_error())
+        }
     }
 
-    pub unsafe fn tpgetconn(&self) -> *mut ::std::os::raw::c_void {
+    pub(crate) unsafe fn tpgetconn(&self) -> *mut ::std::os::raw::c_void {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::tpgetconn()
@@ -805,7 +811,7 @@ impl AtmiCtx {
         }
     }
 
-    pub fn tpgetcallinfo(
+    pub(crate) fn tpgetcallinfo(
         &self,
         msg: *const c_char,
         cibuf: *mut *mut raw::UBFH,
@@ -820,7 +826,7 @@ impl AtmiCtx {
         self.rc_to_result(rc)
     }
 
-    pub fn tpsetcallinfo(
+    pub(crate) fn tpsetcallinfo(
         &self,
         msg: *const c_char,
         cibuf: *mut raw::UBFH,
@@ -887,7 +893,7 @@ impl AtmiCtx {
         }
     }
 
-    pub fn tpviewtojson(
+    pub(crate) fn tpviewtojson(
         &self,
         cstruct: *mut c_char,
         view: *mut c_char,
@@ -914,7 +920,7 @@ impl AtmiCtx {
         self.rc_to_result(rc)
     }
 
-    pub unsafe fn tpjsontoview(
+    pub(crate) unsafe fn tpjsontoview(
         &self,
         view: *mut c_char,
         buffer: *mut c_char,
@@ -937,19 +943,20 @@ impl AtmiCtx {
         &self,
         qspace: &str,
         qname: &str,
-        ctl: *mut crate::TpQCtl,
+        ctl: Option<&mut crate::TpQCtl>,
         data: &TypedBuffer<'_>,
         flags: i64,
     ) -> AtmiResult<()> {
         let c_qspace = CString::new(qspace).map_err(|_| self.atmi_last_error())?;
         let c_qname = CString::new(qname).map_err(|_| self.atmi_last_error())?;
+        let ctl_ptr = ctl.map_or(ptr::null_mut(), |ctl| ctl.as_mut_ptr());
 
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe {
             raw::tpenqueue(
                 c_qspace.as_ptr() as *mut c_char,
                 c_qname.as_ptr() as *mut c_char,
-                ctl,
+                ctl_ptr,
                 data.as_ptr(),
                 0,
                 flags as c_long,
@@ -962,7 +969,7 @@ impl AtmiCtx {
                 self.c_ctx_ptr(),
                 c_qspace.as_ptr() as *mut c_char,
                 c_qname.as_ptr() as *mut c_char,
-                ctl,
+                ctl_ptr,
                 data.as_ptr(),
                 0,
                 flags as c_long,
@@ -977,11 +984,12 @@ impl AtmiCtx {
         &'ctx self,
         qspace: &str,
         qname: &str,
-        ctl: *mut crate::TpQCtl,
+        ctl: Option<&mut crate::TpQCtl>,
         flags: i64,
     ) -> AtmiResult<TypedBuffer<'ctx>> {
         let c_qspace = CString::new(qspace).map_err(|_| self.atmi_last_error())?;
         let c_qname = CString::new(qname).map_err(|_| self.atmi_last_error())?;
+        let ctl_ptr = ctl.map_or(ptr::null_mut(), |ctl| ctl.as_mut_ptr());
         let mut odata: *mut c_char = ptr::null_mut();
         let mut olen: c_long = 0;
 
@@ -990,7 +998,7 @@ impl AtmiCtx {
             raw::tpdequeue(
                 c_qspace.as_ptr() as *mut c_char,
                 c_qname.as_ptr() as *mut c_char,
-                ctl,
+                ctl_ptr,
                 &mut odata,
                 &mut olen,
                 flags as c_long,
@@ -1003,7 +1011,7 @@ impl AtmiCtx {
                 self.c_ctx_ptr(),
                 c_qspace.as_ptr() as *mut c_char,
                 c_qname.as_ptr() as *mut c_char,
-                ctl,
+                ctl_ptr,
                 &mut odata,
                 &mut olen,
                 flags as c_long,
@@ -1022,11 +1030,12 @@ impl AtmiCtx {
         nodeid: i16,
         srvid: i16,
         qname: &str,
-        ctl: *mut crate::TpQCtl,
+        ctl: Option<&mut crate::TpQCtl>,
         data: &TypedBuffer<'_>,
         flags: i64,
     ) -> AtmiResult<()> {
         let c_qname = CString::new(qname).map_err(|_| self.atmi_last_error())?;
+        let ctl_ptr = ctl.map_or(ptr::null_mut(), |ctl| ctl.as_mut_ptr());
 
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe {
@@ -1034,7 +1043,7 @@ impl AtmiCtx {
                 nodeid,
                 srvid,
                 c_qname.as_ptr() as *mut c_char,
-                ctl,
+                ctl_ptr,
                 data.as_ptr(),
                 0,
                 flags as c_long,
@@ -1048,7 +1057,7 @@ impl AtmiCtx {
                 nodeid,
                 srvid,
                 c_qname.as_ptr() as *mut c_char,
-                ctl,
+                ctl_ptr,
                 data.as_ptr(),
                 0,
                 flags as c_long,
@@ -1064,10 +1073,11 @@ impl AtmiCtx {
         nodeid: i16,
         srvid: i16,
         qname: &str,
-        ctl: *mut crate::TpQCtl,
+        ctl: Option<&mut crate::TpQCtl>,
         flags: i64,
     ) -> AtmiResult<TypedBuffer<'ctx>> {
         let c_qname = CString::new(qname).map_err(|_| self.atmi_last_error())?;
+        let ctl_ptr = ctl.map_or(ptr::null_mut(), |ctl| ctl.as_mut_ptr());
         let mut odata: *mut c_char = ptr::null_mut();
         let mut olen: c_long = 0;
 
@@ -1077,7 +1087,7 @@ impl AtmiCtx {
                 nodeid,
                 srvid,
                 c_qname.as_ptr() as *mut c_char,
-                ctl,
+                ctl_ptr,
                 &mut odata,
                 &mut olen,
                 flags as c_long,
@@ -1091,7 +1101,7 @@ impl AtmiCtx {
                 nodeid,
                 srvid,
                 c_qname.as_ptr() as *mut c_char,
-                ctl,
+                ctl_ptr,
                 &mut odata,
                 &mut olen,
                 flags as c_long,
@@ -1133,56 +1143,74 @@ impl AtmiCtx {
         self.rc_to_result(rc)
     }
 
-    pub fn tpencrypt(
-        &self,
-        input: *mut c_char,
-        ilen: usize,
-        output: *mut c_char,
-        olen: *mut c_long,
-        flags: i64,
-    ) -> AtmiResult<()> {
+    pub fn tpencrypt(&self, input: &[u8], flags: i64) -> AtmiResult<Vec<u8>> {
+        let mut out = vec![0u8; input.len().saturating_mul(2).max(256)];
+        let mut olen = out.len() as c_long;
+
         #[cfg(not(feature = "ctx-send"))]
-        let rc = unsafe { raw::tpencrypt(input, ilen as c_long, output, olen, flags as c_long) };
+        let rc = unsafe {
+            raw::tpencrypt(
+                input.as_ptr() as *mut c_char,
+                input.len() as c_long,
+                out.as_mut_ptr() as *mut c_char,
+                &mut olen,
+                flags as c_long,
+            )
+        };
 
         #[cfg(feature = "ctx-send")]
         let rc = unsafe {
             raw::Otpencrypt(
                 self.c_ctx_ptr(),
-                input,
-                ilen as c_long,
-                output,
-                olen,
+                input.as_ptr() as *mut c_char,
+                input.len() as c_long,
+                out.as_mut_ptr() as *mut c_char,
+                &mut olen,
                 flags as c_long,
             )
         };
 
-        self.rc_to_result(rc)
+        if rc == raw::EXSUCCEED as c_int {
+            out.truncate(olen as usize);
+            Ok(out)
+        } else {
+            Err(self.atmi_last_error())
+        }
     }
 
-    pub fn tpdecrypt(
-        &self,
-        input: *mut c_char,
-        ilen: usize,
-        output: *mut c_char,
-        olen: *mut c_long,
-        flags: i64,
-    ) -> AtmiResult<()> {
+    pub fn tpdecrypt(&self, input: &[u8], flags: i64) -> AtmiResult<Vec<u8>> {
+        let mut out = vec![0u8; input.len().max(256)];
+        let mut olen = out.len() as c_long;
+
         #[cfg(not(feature = "ctx-send"))]
-        let rc = unsafe { raw::tpdecrypt(input, ilen as c_long, output, olen, flags as c_long) };
+        let rc = unsafe {
+            raw::tpdecrypt(
+                input.as_ptr() as *mut c_char,
+                input.len() as c_long,
+                out.as_mut_ptr() as *mut c_char,
+                &mut olen,
+                flags as c_long,
+            )
+        };
 
         #[cfg(feature = "ctx-send")]
         let rc = unsafe {
             raw::Otpdecrypt(
                 self.c_ctx_ptr(),
-                input,
-                ilen as c_long,
-                output,
-                olen,
+                input.as_ptr() as *mut c_char,
+                input.len() as c_long,
+                out.as_mut_ptr() as *mut c_char,
+                &mut olen,
                 flags as c_long,
             )
         };
 
-        self.rc_to_result(rc)
+        if rc == raw::EXSUCCEED as c_int {
+            out.truncate(olen as usize);
+            Ok(out)
+        } else {
+            Err(self.atmi_last_error())
+        }
     }
 
     pub fn tpsprio(&self, prio: i32, flags: i64) -> AtmiResult<()> {

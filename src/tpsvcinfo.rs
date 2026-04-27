@@ -87,10 +87,7 @@ impl<'ctx> TpSvcInfo<'ctx> {
         self.raw().cltid
     }
 
-    /// Return the raw data pointer without transferring ownership.
-    /// Use this only for low-level / read-only inspection; prefer
-    /// `take_data_ubf()` for normal service handler use.
-    pub fn data_ptr(&self) -> *mut c_char {
+    pub(crate) fn data_ptr(&self) -> *mut c_char {
         self.data
             .as_ref()
             .map(|b| b.as_ptr())

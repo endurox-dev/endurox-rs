@@ -29,3 +29,7 @@ ctx-send = []      # enable to make AtmiCtx: Send & !Sync
 [[test]]
 name = "atmictx_tests"
 path = "tests/00_unittest/atmictx_tests.rs"
+
+[[test]]
+name = "ubf_tests"
+path = "tests/00_unittest/ubf_tests.rs"

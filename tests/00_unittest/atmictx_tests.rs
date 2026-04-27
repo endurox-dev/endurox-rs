@@ -35,9 +35,9 @@ fn tpalloc_generic_and_cast_to_ubf() {
     let tbuf: TypedBuffer<'_> = ctx.tpalloc("UBF", "", 0).expect("tpalloc failed");
 
     // "inherit" by casting to TypedUbf
-    let ubf: TypedUbf<'_> = TypedUbf::from_typed(tbuf);
+    let mut ubf: TypedUbf<'_> = TypedUbf::from_typed(tbuf);
 
-    assert!(!ubf.as_ptr().is_null());
+    assert!(ubf.bsizeof().expect("Bsizeof failed") > 0);
 
     //ctx.tpterm().expect("tpterm failed");
     ctx.tpinit().expect("Second init shall go OK");
@@ -55,14 +55,8 @@ fn tpalloc_ubf() {
     buf.bchg(1, 0, UbfValue::Long(5), false)
         .expect("Bchg failed");
 
-    //Move context
-    let ctx2 = AtmiCtx::new().expect("failed to create AtmiCtx2");
-
-    /* allocate to new context */
-    let buf2 = unsafe { buf.move_to_context(&ctx2) };
-
     endurox_rs::ndrx_error!(ctx, ">>>>> About to free UBF...");
-    drop(buf2);
+    drop(buf);
     drop(ctx);
 }
 

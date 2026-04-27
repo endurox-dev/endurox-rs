@@ -8,6 +8,7 @@ pub(crate) mod raw {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
 
+#[doc(hidden)]
 pub mod ubf_fields {
     include!(concat!(env!("OUT_DIR"), "/test.rs"));
 }
@@ -41,7 +42,48 @@ pub use typed_buf::TypedBuffer;
 pub use typed_ubf::{BorrowedUbf, TypedUbf, UbfValue};
 pub use types::{ClientId, TpContext, TpTranId};
 
-// Re-export complex C structs users may need to fill when calling advanced APIs
-// (tpsubscribe, tpenqueue/tpdequeue).  Named without the raw:: prefix so callers
-// never need to reference the internal `raw` module.
-pub use raw::{TPEVCTL as TpEvCtl, TPQCTL as TpQCtl};
+/// Event subscription control block used by [`AtmiCtx::tpsubscribe`].
+///
+/// This is an opaque Rust wrapper around the Enduro/X `TPEVCTL` structure.
+/// Use [`Default::default`] when no fields need to be customized.
+pub struct TpEvCtl {
+    inner: raw::TPEVCTL,
+}
+
+impl Default for TpEvCtl {
+    fn default() -> Self {
+        Self {
+            inner: unsafe { std::mem::zeroed() },
+        }
+    }
+}
+
+impl TpEvCtl {
+    #[inline]
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut raw::TPEVCTL {
+        &mut self.inner
+    }
+}
+
+/// Persistent queue control block used by queue enqueue/dequeue APIs.
+///
+/// This is an opaque Rust wrapper around the Enduro/X `TPQCTL` structure.
+/// Use [`Default::default`] when no fields need to be customized.
+pub struct TpQCtl {
+    inner: raw::TPQCTL,
+}
+
+impl Default for TpQCtl {
+    fn default() -> Self {
+        Self {
+            inner: unsafe { std::mem::zeroed() },
+        }
+    }
+}
+
+impl TpQCtl {
+    #[inline]
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut raw::TPQCTL {
+        &mut self.inner
+    }
+}

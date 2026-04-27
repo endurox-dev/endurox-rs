@@ -1,31 +1,40 @@
-// src/typed_buffer.rs
 use crate::{raw, AtmiCtx, AtmiResult};
 use core::ffi::{c_char, c_long};
 
-use std::mem::ManuallyDrop;
-
+/// Owned XATMI typed buffer allocated by `tpalloc`.
+///
+/// The buffer is tied to the [`AtmiCtx`] that allocated it and is released with
+/// `tpfree` when dropped.
 #[derive(Debug)]
 pub struct TypedBuffer<'ctx> {
-    ptr: *mut c_char,       // may be null
-    pub ctx: &'ctx AtmiCtx, // real reference to the owning context
+    ptr: *mut c_char,
+    pub(crate) ctx: &'ctx AtmiCtx,
 }
 
 impl<'ctx> TypedBuffer<'ctx> {
     /// # Safety
     /// `raw` must be a valid `atmibuf*` allocated for this context and owned by the caller.
-    pub unsafe fn from_raw(ctx: &'ctx AtmiCtx, raw: *mut c_char) -> Self {
+    pub(crate) unsafe fn from_raw(ctx: &'ctx AtmiCtx, raw: *mut c_char) -> Self {
         Self { ptr: raw, ctx }
     }
 
-    /// Transfers ownership to C or another wrapper. No Drop is run.
-    pub fn into_raw(self) -> *mut c_char {
-        let me = ManuallyDrop::new(self);
-        me.ptr
+    /// Transfer ownership of the underlying ATMI buffer pointer.
+    ///
+    /// The returned pointer will not be freed by this Rust value. Use this only
+    /// when passing ownership to Enduro/X or immediately wrapping it in another
+    /// owner.
+    pub(crate) fn into_raw(self) -> *mut c_char {
+        let ptr = self.ptr;
+        std::mem::forget(self);
+        ptr
     }
 
-    /// Return current C pointer.
+    /// Return the current ATMI buffer pointer without transferring ownership.
+    ///
+    /// This is intended for low-level integration with APIs that are not yet
+    /// represented by a safe Rust wrapper.
     #[inline]
-    pub fn as_ptr(&self) -> *mut c_char {
+    pub(crate) fn as_ptr(&self) -> *mut c_char {
         self.ptr
     }
 
@@ -34,10 +43,8 @@ impl<'ctx> TypedBuffer<'ctx> {
     ///
     /// Only valid if the underlying ATMI/UBF API actually allows this buffer
     /// to be used under `new_ctx`. The lifetime re-tie is unchecked by Rust.
-    pub unsafe fn move_to_context<'new>(self, new_ctx: &'new AtmiCtx) -> TypedBuffer<'new> {
-        let ptr = self.into_raw();
-        // rewrap with new lifetime / context
-        TypedBuffer::from_raw(new_ctx, ptr)
+    pub(crate) unsafe fn move_to_context<'new>(self, new_ctx: &'new AtmiCtx) -> TypedBuffer<'new> {
+        TypedBuffer::from_raw(new_ctx, self.into_raw())
     }
 
     /// Update the internal pointer after a C API may have reallocated the buffer.
@@ -54,11 +61,8 @@ impl<'ctx> TypedBuffer<'ctx> {
         let new_ptr = unsafe { raw::tprealloc(self.ptr as *mut c_char, new_size as c_long) };
 
         if new_ptr.is_null() {
-            // C failed; original pointer still valid.
-            // Use the error from *this* context instance.
             Err(self.ctx.atmi_last_error())
         } else {
-            // Success, update pointer (may or may not have moved).
             self.ptr = new_ptr;
             Ok(())
         }

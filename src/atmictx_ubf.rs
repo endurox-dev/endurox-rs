@@ -1,18 +1,28 @@
 use crate::raw::*;
-use crate::{raw, AtmiCtx};
+use crate::{raw, AtmiCtx, TypedUbf, UbfResult};
 
 /// UBF field type for safe field-id construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UbfFieldType {
+    /// `BFLD_SHORT`.
     Short,
+    /// `BFLD_LONG`.
     Long,
+    /// `BFLD_CHAR`.
     Char,
+    /// `BFLD_FLOAT`.
     Float,
+    /// `BFLD_DOUBLE`.
     Double,
+    /// `BFLD_STRING`.
     String,
+    /// `BFLD_CARRAY`.
     Carray,
+    /// `BFLD_PTR`.
     Ptr,
+    /// `BFLD_UBF`.
     Ubf,
+    /// `BFLD_VIEW`.
     View,
 }
 
@@ -41,7 +51,29 @@ impl AtmiCtx {
     /// associated context; otherwise they call plain `B*`/`CB*` variants.
 
     #[inline]
-    pub unsafe fn b16to32(&self, dest: *mut UBFH, src: *mut UBFH) -> ::std::os::raw::c_int {
+    fn ubf_unit_result(&self, rc: ::std::os::raw::c_int) -> UbfResult<()> {
+        if rc == raw::EXSUCCEED as ::std::os::raw::c_int {
+            Ok(())
+        } else {
+            Err(self.ubf_last_error())
+        }
+    }
+
+    #[inline]
+    fn ubf_count_result<T>(&self, rc: T) -> UbfResult<usize>
+    where
+        T: Into<i64> + Copy,
+    {
+        let value = rc.into();
+        if value < 0 {
+            Err(self.ubf_last_error())
+        } else {
+            Ok(value as usize)
+        }
+    }
+
+    #[inline]
+    pub(crate) unsafe fn b16to32(&self, dest: *mut UBFH, src: *mut UBFH) -> ::std::os::raw::c_int {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::B16to32(dest, src)
@@ -54,7 +86,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn b32to16(&self, dest: *mut UBFH, src: *mut UBFH) -> ::std::os::raw::c_int {
+    pub(crate) unsafe fn b32to16(&self, dest: *mut UBFH, src: *mut UBFH) -> ::std::os::raw::c_int {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::B32to16(dest, src)
@@ -67,7 +99,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn b_error(&self, str_: *mut ::std::os::raw::c_char) {
+    pub(crate) unsafe fn b_error(&self, str_: *mut ::std::os::raw::c_char) {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::B_error(str_)
@@ -80,7 +112,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn badd(
+    pub(crate) unsafe fn badd(
         &self,
         p_ub: *mut UBFH,
         bfldid: BFLDID,
@@ -99,7 +131,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn baddfast(
+    pub(crate) unsafe fn baddfast(
         &self,
         p_ub: *mut UBFH,
         bfldid: BFLDID,
@@ -119,7 +151,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn badds(
+    pub(crate) unsafe fn badds(
         &self,
         p_ub: *mut UBFH,
         bfldid: BFLDID,
@@ -137,7 +169,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn balloc(&self, f: BFLDOCC, v: BFLDLEN) -> *mut UBFH {
+    pub(crate) unsafe fn balloc(&self, f: BFLDOCC, v: BFLDLEN) -> *mut UBFH {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Balloc(f, v)
@@ -150,7 +182,10 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bboolco(&self, expr: *mut ::std::os::raw::c_char) -> *mut ::std::os::raw::c_char {
+    pub(crate) unsafe fn bboolco(
+        &self,
+        expr: *mut ::std::os::raw::c_char,
+    ) -> *mut ::std::os::raw::c_char {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Bboolco(expr)
@@ -163,7 +198,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bboolev(
+    pub(crate) unsafe fn bboolev(
         &self,
         p_ub: *mut UBFH,
         tree: *mut ::std::os::raw::c_char,
@@ -180,7 +215,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bboolpr(&self, tree: *mut ::std::os::raw::c_char, outf: *mut FILE) {
+    pub(crate) unsafe fn bboolpr(&self, tree: *mut ::std::os::raw::c_char, outf: *mut FILE) {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Bboolpr(tree, outf)
@@ -193,7 +228,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bboolprcb(
+    pub(crate) unsafe fn bboolprcb(
         &self,
         tree: *mut ::std::os::raw::c_char,
         p_writef: ::std::option::Option<
@@ -217,7 +252,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bboolsetcbf(
+    pub(crate) unsafe fn bboolsetcbf(
         &self,
         funcname: *mut ::std::os::raw::c_char,
         functionPtr: ::std::option::Option<
@@ -239,7 +274,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bboolsetcbf2(
+    pub(crate) unsafe fn bboolsetcbf2(
         &self,
         funcname: *mut ::std::os::raw::c_char,
         functionPtr: ::std::option::Option<
@@ -262,7 +297,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bchg(
+    pub(crate) unsafe fn bchg(
         &self,
         p_ub: *mut UBFH,
         bfldid: BFLDID,
@@ -282,7 +317,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bchgs(
+    pub(crate) unsafe fn bchgs(
         &self,
         p_ub: *mut UBFH,
         bfldid: BFLDID,
@@ -301,94 +336,99 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bcmp(&self, p_ubf1: *mut UBFH, p_ubf2: *mut UBFH) -> ::std::os::raw::c_int {
+    /// Return whether two UBF buffers contain the same fields and values.
+    ///
+    /// Uses `Bcmp(3)` internally.
+    pub fn bcmp(&self, ubf1: &TypedUbf<'_>, ubf2: &TypedUbf<'_>) -> bool {
         #[cfg(not(feature = "ctx-send"))]
         {
-            raw::Bcmp(p_ubf1, p_ubf2)
+            unsafe { raw::Bcmp(ubf1.as_ubfh(), ubf2.as_ubfh()) == 0 }
         }
 
         #[cfg(feature = "ctx-send")]
         {
-            raw::OBcmp(self.c_ctx_ptr(), p_ubf1, p_ubf2)
+            unsafe { raw::OBcmp(self.c_ctx_ptr(), ubf1.as_ubfh(), ubf2.as_ubfh()) == 0 }
         }
     }
 
     #[inline]
-    pub unsafe fn bconcat(
+    /// Append all fields from `src` into `dst`.
+    ///
+    /// Wraps `Bconcat(3)`. Existing destination occurrences are kept and source
+    /// occurrences are appended.
+    pub fn bconcat(&self, dst: &mut TypedUbf<'_>, src: &TypedUbf<'_>) -> UbfResult<()> {
+        #[cfg(not(feature = "ctx-send"))]
+        let rc = unsafe { raw::Bconcat(dst.as_ubfh(), src.as_ubfh()) };
+
+        #[cfg(feature = "ctx-send")]
+        let rc = unsafe { raw::OBconcat(self.c_ctx_ptr(), dst.as_ubfh(), src.as_ubfh()) };
+
+        self.ubf_unit_result(rc)
+    }
+
+    #[inline]
+    /// Copy the full contents of `src` into `dst`.
+    ///
+    /// Wraps `Bcpy(3)`. The destination buffer must be large enough for the
+    /// copied data.
+    pub fn bcpy(&self, dst: &mut TypedUbf<'_>, src: &TypedUbf<'_>) -> UbfResult<()> {
+        #[cfg(not(feature = "ctx-send"))]
+        let rc = unsafe { raw::Bcpy(dst.as_ubfh(), src.as_ubfh()) };
+
+        #[cfg(feature = "ctx-send")]
+        let rc = unsafe { raw::OBcpy(self.c_ctx_ptr(), dst.as_ubfh(), src.as_ubfh()) };
+
+        self.ubf_unit_result(rc)
+    }
+
+    #[inline]
+    /// Delete one occurrence of a field from a UBF buffer.
+    ///
+    /// Wraps `Bdel(3)`. Occurrences after the deleted one shift down.
+    pub fn bdel(&self, ubf: &mut TypedUbf<'_>, bfldid: BFLDID, occ: BFLDOCC) -> UbfResult<()> {
+        #[cfg(not(feature = "ctx-send"))]
+        let rc = unsafe { raw::Bdel(ubf.as_ubfh(), bfldid, occ) };
+
+        #[cfg(feature = "ctx-send")]
+        let rc = unsafe { raw::OBdel(self.c_ctx_ptr(), ubf.as_ubfh(), bfldid, occ) };
+
+        self.ubf_unit_result(rc)
+    }
+
+    #[inline]
+    /// Delete all occurrences of a field from a UBF buffer.
+    ///
+    /// Wraps `Bdelall(3)`.
+    pub fn bdelall(&self, ubf: &mut TypedUbf<'_>, bfldid: BFLDID) -> UbfResult<()> {
+        #[cfg(not(feature = "ctx-send"))]
+        let rc = unsafe { raw::Bdelall(ubf.as_ubfh(), bfldid) };
+
+        #[cfg(feature = "ctx-send")]
+        let rc = unsafe { raw::OBdelall(self.c_ctx_ptr(), ubf.as_ubfh(), bfldid) };
+
+        self.ubf_unit_result(rc)
+    }
+
+    #[inline]
+    /// Delete all fields listed in `fldlist` from a UBF buffer.
+    ///
+    /// Wraps `Bdelete(3)`. The field list must be terminated with `0`, matching
+    /// the Enduro/X C API convention.
+    pub fn bdelete(&self, ubf: &mut TypedUbf<'_>, fldlist: &mut [i32]) -> UbfResult<()> {
+        #[cfg(not(feature = "ctx-send"))]
+        let rc = unsafe { raw::Bdelete(ubf.as_ubfh(), fldlist.as_mut_ptr()) };
+
+        #[cfg(feature = "ctx-send")]
+        let rc = unsafe { raw::OBdelete(self.c_ctx_ptr(), ubf.as_ubfh(), fldlist.as_mut_ptr()) };
+
+        self.ubf_unit_result(rc)
+    }
+
+    #[inline]
+    pub(crate) unsafe fn becodestr(
         &self,
-        p_ub_dst: *mut UBFH,
-        p_ub_src: *mut UBFH,
-    ) -> ::std::os::raw::c_int {
-        #[cfg(not(feature = "ctx-send"))]
-        {
-            raw::Bconcat(p_ub_dst, p_ub_src)
-        }
-
-        #[cfg(feature = "ctx-send")]
-        {
-            raw::OBconcat(self.c_ctx_ptr(), p_ub_dst, p_ub_src)
-        }
-    }
-
-    #[inline]
-    pub unsafe fn bcpy(&self, p_ub_dst: *mut UBFH, p_ub_src: *mut UBFH) -> ::std::os::raw::c_int {
-        #[cfg(not(feature = "ctx-send"))]
-        {
-            raw::Bcpy(p_ub_dst, p_ub_src)
-        }
-
-        #[cfg(feature = "ctx-send")]
-        {
-            raw::OBcpy(self.c_ctx_ptr(), p_ub_dst, p_ub_src)
-        }
-    }
-
-    #[inline]
-    pub unsafe fn bdel(
-        &self,
-        p_ub: *mut UBFH,
-        bfldid: BFLDID,
-        occ: BFLDOCC,
-    ) -> ::std::os::raw::c_int {
-        #[cfg(not(feature = "ctx-send"))]
-        {
-            raw::Bdel(p_ub, bfldid, occ)
-        }
-
-        #[cfg(feature = "ctx-send")]
-        {
-            raw::OBdel(self.c_ctx_ptr(), p_ub, bfldid, occ)
-        }
-    }
-
-    #[inline]
-    pub unsafe fn bdelall(&self, p_ub: *mut UBFH, bfldid: BFLDID) -> ::std::os::raw::c_int {
-        #[cfg(not(feature = "ctx-send"))]
-        {
-            raw::Bdelall(p_ub, bfldid)
-        }
-
-        #[cfg(feature = "ctx-send")]
-        {
-            raw::OBdelall(self.c_ctx_ptr(), p_ub, bfldid)
-        }
-    }
-
-    #[inline]
-    pub unsafe fn bdelete(&self, p_ub: *mut UBFH, fldlist: *mut BFLDID) -> ::std::os::raw::c_int {
-        #[cfg(not(feature = "ctx-send"))]
-        {
-            raw::Bdelete(p_ub, fldlist)
-        }
-
-        #[cfg(feature = "ctx-send")]
-        {
-            raw::OBdelete(self.c_ctx_ptr(), p_ub, fldlist)
-        }
-    }
-
-    #[inline]
-    pub unsafe fn becodestr(&self, err: ::std::os::raw::c_int) -> *mut ::std::os::raw::c_char {
+        err: ::std::os::raw::c_int,
+    ) -> *mut ::std::os::raw::c_char {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Becodestr(err)
@@ -401,7 +441,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bextread(&self, p_ub: *mut UBFH, inf: *mut FILE) -> ::std::os::raw::c_int {
+    pub(crate) unsafe fn bextread(&self, p_ub: *mut UBFH, inf: *mut FILE) -> ::std::os::raw::c_int {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Bextread(p_ub, inf)
@@ -414,7 +454,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bextreadcb(
+    pub(crate) unsafe fn bextreadcb(
         &self,
         p_ub: *mut UBFH,
         p_readf: ::std::option::Option<
@@ -438,7 +478,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bfind(
+    pub(crate) unsafe fn bfind(
         &self,
         p_ub: *mut UBFH,
         bfldid: BFLDID,
@@ -457,7 +497,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bfindlast(
+    pub(crate) unsafe fn bfindlast(
         &self,
         p_ub: *mut UBFH,
         bfldid: BFLDID,
@@ -476,7 +516,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bfindocc(
+    pub(crate) unsafe fn bfindocc(
         &self,
         p_ub: *mut UBFH,
         bfldid: BFLDID,
@@ -495,7 +535,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bfindr(
+    pub(crate) unsafe fn bfindr(
         &self,
         p_ub: *mut UBFH,
         fldidocc: *mut BFLDID,
@@ -513,7 +553,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bfinds(
+    pub(crate) unsafe fn bfinds(
         &self,
         p_ub: *mut UBFH,
         bfldid: BFLDID,
@@ -531,7 +571,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bflddbadd(
+    pub(crate) unsafe fn bflddbadd(
         &self,
         txn: *mut EDB_txn,
         fldtype: ::std::os::raw::c_short,
@@ -550,7 +590,11 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bflddbdel(&self, txn: *mut EDB_txn, bfldid: BFLDID) -> ::std::os::raw::c_int {
+    pub(crate) unsafe fn bflddbdel(
+        &self,
+        txn: *mut EDB_txn,
+        bfldid: BFLDID,
+    ) -> ::std::os::raw::c_int {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Bflddbdel(txn, bfldid)
@@ -563,7 +607,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bflddbdrop(&self, txn: *mut EDB_txn) -> ::std::os::raw::c_int {
+    pub(crate) unsafe fn bflddbdrop(&self, txn: *mut EDB_txn) -> ::std::os::raw::c_int {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Bflddbdrop(txn)
@@ -576,7 +620,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bflddbget(
+    pub(crate) unsafe fn bflddbget(
         &self,
         data: *mut EDB_val,
         p_fldtype: *mut ::std::os::raw::c_short,
@@ -605,7 +649,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bflddbid(&self, fldname: *mut ::std::os::raw::c_char) -> BFLDID {
+    pub(crate) unsafe fn bflddbid(&self, fldname: *mut ::std::os::raw::c_char) -> BFLDID {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Bflddbid(fldname)
@@ -618,7 +662,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bflddbload(&self) -> ::std::os::raw::c_int {
+    pub(crate) unsafe fn bflddbload(&self) -> ::std::os::raw::c_int {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Bflddbload()
@@ -631,7 +675,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bflddbname(&self, bfldid: BFLDID) -> *mut ::std::os::raw::c_char {
+    pub(crate) unsafe fn bflddbname(&self, bfldid: BFLDID) -> *mut ::std::os::raw::c_char {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Bflddbname(bfldid)
@@ -644,7 +688,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bflddbunlink(&self) -> ::std::os::raw::c_int {
+    pub(crate) unsafe fn bflddbunlink(&self) -> ::std::os::raw::c_int {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Bflddbunlink()
@@ -657,7 +701,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bflddbunload(&self) {
+    pub(crate) unsafe fn bflddbunload(&self) {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Bflddbunload()
@@ -670,7 +714,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bfldddbgetenv(
+    pub(crate) unsafe fn bfldddbgetenv(
         &self,
         dbi_id: *mut *mut EDB_dbi,
         dbi_nm: *mut *mut EDB_dbi,
@@ -687,7 +731,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bfldid(&self, fldnm: *mut ::std::os::raw::c_char) -> BFLDID {
+    pub(crate) unsafe fn bfldid(&self, fldnm: *mut ::std::os::raw::c_char) -> BFLDID {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Bfldid(fldnm)
@@ -700,7 +744,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bfldno(&self, bfldid: BFLDID) -> BFLDOCC {
+    pub(crate) unsafe fn bfldno(&self, bfldid: BFLDID) -> BFLDOCC {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Bfldno(bfldid)
@@ -713,7 +757,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bfldtype(&self, bfldid: BFLDID) -> ::std::os::raw::c_int {
+    pub(crate) unsafe fn bfldtype(&self, bfldid: BFLDID) -> ::std::os::raw::c_int {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Bfldtype(bfldid)
@@ -726,7 +770,11 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bfloatev(&self, p_ub: *mut UBFH, tree: *mut ::std::os::raw::c_char) -> f64 {
+    pub(crate) unsafe fn bfloatev(
+        &self,
+        p_ub: *mut UBFH,
+        tree: *mut ::std::os::raw::c_char,
+    ) -> f64 {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Bfloatev(p_ub, tree)
@@ -739,7 +787,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bfname(&self, bfldid: BFLDID) -> *mut ::std::os::raw::c_char {
+    pub(crate) unsafe fn bfname(&self, bfldid: BFLDID) -> *mut ::std::os::raw::c_char {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Bfname(bfldid)
@@ -752,7 +800,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bfprint(&self, p_ub: *mut UBFH, outf: *mut FILE) -> ::std::os::raw::c_int {
+    pub(crate) unsafe fn bfprint(&self, p_ub: *mut UBFH, outf: *mut FILE) -> ::std::os::raw::c_int {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Bfprint(p_ub, outf)
@@ -765,7 +813,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bfprintcb(
+    pub(crate) unsafe fn bfprintcb(
         &self,
         p_ub: *mut UBFH,
         p_writef: ndrx_plugin_tplogprintubf_hook_t,
@@ -783,7 +831,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bfree(&self, p_ub: *mut UBFH) -> ::std::os::raw::c_int {
+    pub(crate) unsafe fn bfree(&self, p_ub: *mut UBFH) -> ::std::os::raw::c_int {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Bfree(p_ub)
@@ -796,7 +844,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bget(
+    pub(crate) unsafe fn bget(
         &self,
         p_ub: *mut UBFH,
         bfldid: BFLDID,
@@ -816,7 +864,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bgetalloc(
+    pub(crate) unsafe fn bgetalloc(
         &self,
         p_ub: *mut UBFH,
         bfldid: BFLDID,
@@ -835,7 +883,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bgetlast(
+    pub(crate) unsafe fn bgetlast(
         &self,
         p_ub: *mut UBFH,
         bfldid: BFLDID,
@@ -855,7 +903,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bgetr(
+    pub(crate) unsafe fn bgetr(
         &self,
         p_ub: *mut UBFH,
         fldidocc: *mut BFLDID,
@@ -874,7 +922,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bgets(
+    pub(crate) unsafe fn bgets(
         &self,
         p_ub: *mut UBFH,
         bfldid: BFLDID,
@@ -893,7 +941,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bgetsa(
+    pub(crate) unsafe fn bgetsa(
         &self,
         p_ub: *mut UBFH,
         bfldid: BFLDID,
@@ -912,33 +960,35 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bidxused(&self, p_ub: *mut UBFH) -> ::std::os::raw::c_long {
+    /// Return the number of index slots used by a UBF buffer.
+    ///
+    /// Wraps `Bidxused(3)`.
+    pub fn bidxused(&self, ubf: &TypedUbf<'_>) -> UbfResult<usize> {
         #[cfg(not(feature = "ctx-send"))]
-        {
-            raw::Bidxused(p_ub)
-        }
+        let rc = unsafe { raw::Bidxused(ubf.as_ubfh()) };
 
         #[cfg(feature = "ctx-send")]
-        {
-            raw::OBidxused(self.c_ctx_ptr(), p_ub)
-        }
+        let rc = unsafe { raw::OBidxused(self.c_ctx_ptr(), ubf.as_ubfh()) };
+
+        self.ubf_count_result(rc)
     }
 
     #[inline]
-    pub unsafe fn bindex(&self, p_ub: *mut UBFH, occ: BFLDOCC) -> ::std::os::raw::c_int {
+    /// Build or rebuild the UBF index.
+    ///
+    /// Wraps `Bindex(3)`. The `occ` argument is passed directly to Enduro/X.
+    pub fn bindex(&self, ubf: &mut TypedUbf<'_>, occ: BFLDOCC) -> UbfResult<()> {
         #[cfg(not(feature = "ctx-send"))]
-        {
-            raw::Bindex(p_ub, occ)
-        }
+        let rc = unsafe { raw::Bindex(ubf.as_ubfh(), occ) };
 
         #[cfg(feature = "ctx-send")]
-        {
-            raw::OBindex(self.c_ctx_ptr(), p_ub, occ)
-        }
+        let rc = unsafe { raw::OBindex(self.c_ctx_ptr(), ubf.as_ubfh(), occ) };
+
+        self.ubf_unit_result(rc)
     }
 
     #[inline]
-    pub unsafe fn binit(&self, p_ub: *mut UBFH, len: BFLDLEN) -> ::std::os::raw::c_int {
+    pub(crate) unsafe fn binit(&self, p_ub: *mut UBFH, len: BFLDLEN) -> ::std::os::raw::c_int {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Binit(p_ub, len)
@@ -951,51 +1001,52 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bisubf(&self, p_ub: *mut UBFH) -> ::std::os::raw::c_int {
+    /// Return whether a buffer is a valid UBF buffer.
+    ///
+    /// Uses `Bisubf(3)` internally.
+    pub fn bisubf(&self, ubf: &TypedUbf<'_>) -> bool {
         #[cfg(not(feature = "ctx-send"))]
         {
-            raw::Bisubf(p_ub)
+            unsafe { raw::Bisubf(ubf.as_ubfh()) != 0 }
         }
 
         #[cfg(feature = "ctx-send")]
         {
-            raw::OBisubf(self.c_ctx_ptr(), p_ub)
+            unsafe { raw::OBisubf(self.c_ctx_ptr(), ubf.as_ubfh()) != 0 }
         }
     }
 
     #[inline]
-    pub unsafe fn bjoin(&self, dest: *mut UBFH, src: *mut UBFH) -> ::std::os::raw::c_int {
+    /// Join fields from `src` into `dest`.
+    ///
+    /// Wraps `Bjoin(3)`. Enduro/X applies the merge semantics defined by the C
+    /// API.
+    pub fn bjoin(&self, dest: &mut TypedUbf<'_>, src: &TypedUbf<'_>) -> UbfResult<()> {
         #[cfg(not(feature = "ctx-send"))]
-        {
-            raw::Bjoin(dest, src)
-        }
+        let rc = unsafe { raw::Bjoin(dest.as_ubfh(), src.as_ubfh()) };
 
         #[cfg(feature = "ctx-send")]
-        {
-            raw::OBjoin(self.c_ctx_ptr(), dest, src)
-        }
+        let rc = unsafe { raw::OBjoin(self.c_ctx_ptr(), dest.as_ubfh(), src.as_ubfh()) };
+
+        self.ubf_unit_result(rc)
     }
 
     #[inline]
-    pub unsafe fn blen(
-        &self,
-        p_ub: *mut UBFH,
-        bfldid: BFLDID,
-        occ: BFLDOCC,
-    ) -> ::std::os::raw::c_int {
+    /// Return the stored length of a field occurrence.
+    ///
+    /// Wraps `Blen(3)`.
+    pub fn blen(&self, ubf: &TypedUbf<'_>, bfldid: BFLDID, occ: BFLDOCC) -> UbfResult<usize> {
         #[cfg(not(feature = "ctx-send"))]
-        {
-            raw::Blen(p_ub, bfldid, occ)
-        }
+        let rc = unsafe { raw::Blen(ubf.as_ubfh(), bfldid, occ) };
 
         #[cfg(feature = "ctx-send")]
-        {
-            raw::OBlen(self.c_ctx_ptr(), p_ub, bfldid, occ)
-        }
+        let rc = unsafe { raw::OBlen(self.c_ctx_ptr(), ubf.as_ubfh(), bfldid, occ) };
+
+        self.ubf_count_result(rc)
     }
 
     #[inline]
-    pub unsafe fn bmkfldid(&self, fldtype: ::std::os::raw::c_int, bfldid: BFLDID) -> BFLDID {
+    pub(crate) unsafe fn bmkfldid(&self, fldtype: ::std::os::raw::c_int, bfldid: BFLDID) -> BFLDID {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Bmkfldid(fldtype, bfldid)
@@ -1008,7 +1059,11 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bneeded(&self, nrfields: BFLDOCC, totsize: BFLDLEN) -> ::std::os::raw::c_long {
+    pub(crate) unsafe fn bneeded(
+        &self,
+        nrfields: BFLDOCC,
+        totsize: BFLDLEN,
+    ) -> ::std::os::raw::c_long {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Bneeded(nrfields, totsize)
@@ -1021,7 +1076,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bnext(
+    pub(crate) unsafe fn bnext(
         &self,
         p_ub: *mut UBFH,
         bfldid: *mut BFLDID,
@@ -1041,7 +1096,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bnext2(
+    pub(crate) unsafe fn bnext2(
         &self,
         bnext_state: *mut Bnext_state_t,
         p_ub: *mut UBFH,
@@ -1072,64 +1127,70 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bnum(&self, p_ub: *mut UBFH) -> BFLDOCC {
+    /// Return the total number of field occurrences in a UBF buffer.
+    ///
+    /// Wraps `Bnum(3)`.
+    pub fn bnum(&self, ubf: &TypedUbf<'_>) -> UbfResult<usize> {
+        #[cfg(not(feature = "ctx-send"))]
+        let rc = unsafe { raw::Bnum(ubf.as_ubfh()) };
+
+        #[cfg(feature = "ctx-send")]
+        let rc = unsafe { raw::OBnum(self.c_ctx_ptr(), ubf.as_ubfh()) };
+
+        self.ubf_count_result(rc)
+    }
+
+    #[inline]
+    /// Return the number of occurrences for one field.
+    ///
+    /// Wraps `Boccur(3)`.
+    pub fn boccur(&self, ubf: &TypedUbf<'_>, bfldid: BFLDID) -> UbfResult<usize> {
+        #[cfg(not(feature = "ctx-send"))]
+        let rc = unsafe { raw::Boccur(ubf.as_ubfh(), bfldid) };
+
+        #[cfg(feature = "ctx-send")]
+        let rc = unsafe { raw::OBoccur(self.c_ctx_ptr(), ubf.as_ubfh(), bfldid) };
+
+        self.ubf_count_result(rc)
+    }
+
+    #[inline]
+    /// Outer-join fields from `src` into `dest`.
+    ///
+    /// Wraps `Bojoin(3)`. Enduro/X applies the outer-join merge semantics
+    /// defined by the C API.
+    pub fn bojoin(&self, dest: &mut TypedUbf<'_>, src: &TypedUbf<'_>) -> UbfResult<()> {
+        #[cfg(not(feature = "ctx-send"))]
+        let rc = unsafe { raw::Bojoin(dest.as_ubfh(), src.as_ubfh()) };
+
+        #[cfg(feature = "ctx-send")]
+        let rc = unsafe { raw::OBojoin(self.c_ctx_ptr(), dest.as_ubfh(), src.as_ubfh()) };
+
+        self.ubf_unit_result(rc)
+    }
+
+    #[inline]
+    /// Return whether a field occurrence is present.
+    ///
+    /// Uses `Bpres(3)` internally.
+    pub fn bpres(&self, ubf: &TypedUbf<'_>, bfldid: BFLDID, occ: BFLDOCC) -> bool {
         #[cfg(not(feature = "ctx-send"))]
         {
-            raw::Bnum(p_ub)
+            unsafe { raw::Bpres(ubf.as_ubfh(), bfldid, occ) != 0 }
         }
 
         #[cfg(feature = "ctx-send")]
         {
-            raw::OBnum(self.c_ctx_ptr(), p_ub)
+            unsafe { raw::OBpres(self.c_ctx_ptr(), ubf.as_ubfh(), bfldid, occ) != 0 }
         }
     }
 
     #[inline]
-    pub unsafe fn boccur(&self, p_ub: *mut UBFH, bfldid: BFLDID) -> BFLDOCC {
-        #[cfg(not(feature = "ctx-send"))]
-        {
-            raw::Boccur(p_ub, bfldid)
-        }
-
-        #[cfg(feature = "ctx-send")]
-        {
-            raw::OBoccur(self.c_ctx_ptr(), p_ub, bfldid)
-        }
-    }
-
-    #[inline]
-    pub unsafe fn bojoin(&self, dest: *mut UBFH, src: *mut UBFH) -> ::std::os::raw::c_int {
-        #[cfg(not(feature = "ctx-send"))]
-        {
-            raw::Bojoin(dest, src)
-        }
-
-        #[cfg(feature = "ctx-send")]
-        {
-            raw::OBojoin(self.c_ctx_ptr(), dest, src)
-        }
-    }
-
-    #[inline]
-    pub unsafe fn bpres(
+    pub(crate) unsafe fn bpresr(
         &self,
         p_ub: *mut UBFH,
-        bfldid: BFLDID,
-        occ: BFLDOCC,
+        fldidocc: *mut BFLDID,
     ) -> ::std::os::raw::c_int {
-        #[cfg(not(feature = "ctx-send"))]
-        {
-            raw::Bpres(p_ub, bfldid, occ)
-        }
-
-        #[cfg(feature = "ctx-send")]
-        {
-            raw::OBpres(self.c_ctx_ptr(), p_ub, bfldid, occ)
-        }
-    }
-
-    #[inline]
-    pub unsafe fn bpresr(&self, p_ub: *mut UBFH, fldidocc: *mut BFLDID) -> ::std::os::raw::c_int {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Bpresr(p_ub, fldidocc)
@@ -1142,7 +1203,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bprint(&self, p_ub: *mut UBFH) -> ::std::os::raw::c_int {
+    pub(crate) unsafe fn bprint(&self, p_ub: *mut UBFH) -> ::std::os::raw::c_int {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Bprint(p_ub)
@@ -1155,38 +1216,48 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bproj(&self, p_ub: *mut UBFH, fldlist: *mut BFLDID) -> ::std::os::raw::c_int {
+    /// Project a UBF buffer in place to the fields listed in `fldlist`.
+    ///
+    /// Wraps `Bproj(3)`. The field list must be terminated with `0`, matching
+    /// the Enduro/X C API convention.
+    pub fn bproj(&self, ubf: &mut TypedUbf<'_>, fldlist: &mut [i32]) -> UbfResult<()> {
         #[cfg(not(feature = "ctx-send"))]
-        {
-            raw::Bproj(p_ub, fldlist)
-        }
+        let rc = unsafe { raw::Bproj(ubf.as_ubfh(), fldlist.as_mut_ptr()) };
 
         #[cfg(feature = "ctx-send")]
-        {
-            raw::OBproj(self.c_ctx_ptr(), p_ub, fldlist)
-        }
+        let rc = unsafe { raw::OBproj(self.c_ctx_ptr(), ubf.as_ubfh(), fldlist.as_mut_ptr()) };
+
+        self.ubf_unit_result(rc)
     }
 
     #[inline]
-    pub unsafe fn bprojcpy(
+    /// Copy a projection of `src` into `dst`.
+    ///
+    /// Wraps `Bprojcpy(3)`. The field list must be terminated with `0`.
+    pub fn bprojcpy(
         &self,
-        p_ub_dst: *mut UBFH,
-        p_ub_src: *mut UBFH,
-        fldlist: *mut BFLDID,
-    ) -> ::std::os::raw::c_int {
+        dst: &mut TypedUbf<'_>,
+        src: &TypedUbf<'_>,
+        fldlist: &mut [i32],
+    ) -> UbfResult<()> {
         #[cfg(not(feature = "ctx-send"))]
-        {
-            raw::Bprojcpy(p_ub_dst, p_ub_src, fldlist)
-        }
+        let rc = unsafe { raw::Bprojcpy(dst.as_ubfh(), src.as_ubfh(), fldlist.as_mut_ptr()) };
 
         #[cfg(feature = "ctx-send")]
-        {
-            raw::OBprojcpy(self.c_ctx_ptr(), p_ub_dst, p_ub_src, fldlist)
-        }
+        let rc = unsafe {
+            raw::OBprojcpy(
+                self.c_ctx_ptr(),
+                dst.as_ubfh(),
+                src.as_ubfh(),
+                fldlist.as_mut_ptr(),
+            )
+        };
+
+        self.ubf_unit_result(rc)
     }
 
     #[inline]
-    pub unsafe fn bread(&self, p_ub: *mut UBFH, inf: *mut FILE) -> ::std::os::raw::c_int {
+    pub(crate) unsafe fn bread(&self, p_ub: *mut UBFH, inf: *mut FILE) -> ::std::os::raw::c_int {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Bread(p_ub, inf)
@@ -1201,7 +1272,7 @@ impl AtmiCtx {
     /// `oatmi.h` does not expose an `OBreadcb` variant; this method falls back
     /// to the global API in `ctx-send` mode.
     #[inline]
-    pub unsafe fn breadcb(
+    pub(crate) unsafe fn breadcb(
         &self,
         p_ub: *mut UBFH,
         p_readf: ::std::option::Option<
@@ -1225,7 +1296,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn brealloc(&self, p_ub: *mut UBFH, f: BFLDOCC, v: BFLDLEN) -> *mut UBFH {
+    pub(crate) unsafe fn brealloc(&self, p_ub: *mut UBFH, f: BFLDOCC, v: BFLDLEN) -> *mut UBFH {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Brealloc(p_ub, f, v)
@@ -1238,7 +1309,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn brstrindex(&self, p_ub: *mut UBFH, occ: BFLDOCC) -> ::std::os::raw::c_int {
+    pub(crate) unsafe fn brstrindex(&self, p_ub: *mut UBFH, occ: BFLDOCC) -> ::std::os::raw::c_int {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Brstrindex(p_ub, occ)
@@ -1251,20 +1322,24 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bsizeof(&self, p_ub: *mut UBFH) -> ::std::os::raw::c_long {
+    /// Return the allocated size of a UBF buffer in bytes.
+    ///
+    /// Wraps `Bsizeof(3)`.
+    pub fn bsizeof(&self, ubf: &TypedUbf<'_>) -> UbfResult<usize> {
         #[cfg(not(feature = "ctx-send"))]
-        {
-            raw::Bsizeof(p_ub)
-        }
+        let rc = unsafe { raw::Bsizeof(ubf.as_ubfh()) };
 
         #[cfg(feature = "ctx-send")]
-        {
-            raw::OBsizeof(self.c_ctx_ptr(), p_ub)
-        }
+        let rc = unsafe { raw::OBsizeof(self.c_ctx_ptr(), ubf.as_ubfh()) };
+
+        self.ubf_count_result(rc)
     }
 
     #[inline]
-    pub unsafe fn bstrerror(&self, err: ::std::os::raw::c_int) -> *mut ::std::os::raw::c_char {
+    pub(crate) unsafe fn bstrerror(
+        &self,
+        err: ::std::os::raw::c_int,
+    ) -> *mut ::std::os::raw::c_char {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Bstrerror(err)
@@ -1277,20 +1352,23 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bsubset(&self, p_ubf1: *mut UBFH, p_ubf2: *mut UBFH) -> ::std::os::raw::c_int {
+    /// Return whether `ubf1` is a subset of `ubf2`.
+    ///
+    /// Uses `Bsubset(3)` internally.
+    pub fn bsubset(&self, ubf1: &TypedUbf<'_>, ubf2: &TypedUbf<'_>) -> bool {
         #[cfg(not(feature = "ctx-send"))]
         {
-            raw::Bsubset(p_ubf1, p_ubf2)
+            unsafe { raw::Bsubset(ubf1.as_ubfh(), ubf2.as_ubfh()) != 0 }
         }
 
         #[cfg(feature = "ctx-send")]
         {
-            raw::OBsubset(self.c_ctx_ptr(), p_ubf1, p_ubf2)
+            unsafe { raw::OBsubset(self.c_ctx_ptr(), ubf1.as_ubfh(), ubf2.as_ubfh()) != 0 }
         }
     }
 
     #[inline]
-    pub unsafe fn btreefree(&self, tree: *mut ::std::os::raw::c_char) {
+    pub(crate) unsafe fn btreefree(&self, tree: *mut ::std::os::raw::c_char) {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Btreefree(tree)
@@ -1303,7 +1381,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn btypcvt(
+    pub(crate) unsafe fn btypcvt(
         &self,
         to_len: *mut BFLDLEN,
         to_type: ::std::os::raw::c_int,
@@ -1330,7 +1408,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn btype(&self, bfldid: BFLDID) -> *mut ::std::os::raw::c_char {
+    pub(crate) unsafe fn btype(&self, bfldid: BFLDID) -> *mut ::std::os::raw::c_char {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Btype(bfldid)
@@ -1343,63 +1421,64 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bunindex(&self, p_ub: *mut UBFH) -> BFLDOCC {
+    /// Remove the index from a UBF buffer.
+    ///
+    /// Wraps `Bunindex(3)`.
+    pub fn bunindex(&self, ubf: &mut TypedUbf<'_>) -> UbfResult<usize> {
         #[cfg(not(feature = "ctx-send"))]
-        {
-            raw::Bunindex(p_ub)
-        }
+        let rc = unsafe { raw::Bunindex(ubf.as_ubfh()) };
 
         #[cfg(feature = "ctx-send")]
-        {
-            raw::OBunindex(self.c_ctx_ptr(), p_ub)
-        }
+        let rc = unsafe { raw::OBunindex(self.c_ctx_ptr(), ubf.as_ubfh()) };
+
+        self.ubf_count_result(rc)
     }
 
     #[inline]
-    pub unsafe fn bunused(&self, p_ub: *mut UBFH) -> ::std::os::raw::c_long {
+    /// Return the unused byte count in a UBF buffer.
+    ///
+    /// Wraps `Bunused(3)`.
+    pub fn bunused(&self, ubf: &TypedUbf<'_>) -> UbfResult<usize> {
         #[cfg(not(feature = "ctx-send"))]
-        {
-            raw::Bunused(p_ub)
-        }
+        let rc = unsafe { raw::Bunused(ubf.as_ubfh()) };
 
         #[cfg(feature = "ctx-send")]
-        {
-            raw::OBunused(self.c_ctx_ptr(), p_ub)
-        }
+        let rc = unsafe { raw::OBunused(self.c_ctx_ptr(), ubf.as_ubfh()) };
+
+        self.ubf_count_result(rc)
     }
 
     #[inline]
-    pub unsafe fn bupdate(
-        &self,
-        p_ub_dst: *mut UBFH,
-        p_ub_src: *mut UBFH,
-    ) -> ::std::os::raw::c_int {
+    /// Update `dst` with fields from `src`.
+    ///
+    /// Wraps `Bupdate(3)`. Source fields replace matching destination fields
+    /// according to Enduro/X UBF update semantics.
+    pub fn bupdate(&self, dst: &mut TypedUbf<'_>, src: &TypedUbf<'_>) -> UbfResult<()> {
         #[cfg(not(feature = "ctx-send"))]
-        {
-            raw::Bupdate(p_ub_dst, p_ub_src)
-        }
+        let rc = unsafe { raw::Bupdate(dst.as_ubfh(), src.as_ubfh()) };
 
         #[cfg(feature = "ctx-send")]
-        {
-            raw::OBupdate(self.c_ctx_ptr(), p_ub_dst, p_ub_src)
-        }
+        let rc = unsafe { raw::OBupdate(self.c_ctx_ptr(), dst.as_ubfh(), src.as_ubfh()) };
+
+        self.ubf_unit_result(rc)
     }
 
     #[inline]
-    pub unsafe fn bused(&self, p_ub: *mut UBFH) -> ::std::os::raw::c_long {
+    /// Return the used byte count in a UBF buffer.
+    ///
+    /// Wraps `Bused(3)`.
+    pub fn bused(&self, ubf: &TypedUbf<'_>) -> UbfResult<usize> {
         #[cfg(not(feature = "ctx-send"))]
-        {
-            raw::Bused(p_ub)
-        }
+        let rc = unsafe { raw::Bused(ubf.as_ubfh()) };
 
         #[cfg(feature = "ctx-send")]
-        {
-            raw::OBused(self.c_ctx_ptr(), p_ub)
-        }
+        let rc = unsafe { raw::OBused(self.c_ctx_ptr(), ubf.as_ubfh()) };
+
+        self.ubf_count_result(rc)
     }
 
     #[inline]
-    pub unsafe fn bvcmp(
+    pub(crate) unsafe fn bvcmp(
         &self,
         cstruct1: *mut ::std::os::raw::c_char,
         view1: *mut ::std::os::raw::c_char,
@@ -1418,7 +1497,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bvcpy(
+    pub(crate) unsafe fn bvcpy(
         &self,
         cstruct_dst: *mut ::std::os::raw::c_char,
         cstruct_src: *mut ::std::os::raw::c_char,
@@ -1436,7 +1515,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bvextread(
+    pub(crate) unsafe fn bvextread(
         &self,
         cstruct: *mut ::std::os::raw::c_char,
         view: *mut ::std::os::raw::c_char,
@@ -1454,7 +1533,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bvextreadcb(
+    pub(crate) unsafe fn bvextreadcb(
         &self,
         cstruct: *mut ::std::os::raw::c_char,
         view: *mut ::std::os::raw::c_char,
@@ -1479,7 +1558,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bvfprint(
+    pub(crate) unsafe fn bvfprint(
         &self,
         cstruct: *mut ::std::os::raw::c_char,
         view: *mut ::std::os::raw::c_char,
@@ -1497,7 +1576,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bvfprintcb(
+    pub(crate) unsafe fn bvfprintcb(
         &self,
         cstruct: *mut ::std::os::raw::c_char,
         view: *mut ::std::os::raw::c_char,
@@ -1516,7 +1595,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bvftos(
+    pub(crate) unsafe fn bvftos(
         &self,
         p_ub: *mut UBFH,
         cstruct: *mut ::std::os::raw::c_char,
@@ -1534,7 +1613,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bvnext(
+    pub(crate) unsafe fn bvnext(
         &self,
         state: *mut Bvnext_state_t,
         view: *mut ::std::os::raw::c_char,
@@ -1563,7 +1642,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bvnull(
+    pub(crate) unsafe fn bvnull(
         &self,
         cstruct: *mut ::std::os::raw::c_char,
         cname: *mut ::std::os::raw::c_char,
@@ -1582,7 +1661,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bvnullr(
+    pub(crate) unsafe fn bvnullr(
         &self,
         p_ub: *mut UBFH,
         fldidocc: *mut BFLDID,
@@ -1601,7 +1680,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bvoccur(
+    pub(crate) unsafe fn bvoccur(
         &self,
         cstruct: *mut ::std::os::raw::c_char,
         view: *mut ::std::os::raw::c_char,
@@ -1632,7 +1711,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bvopt(
+    pub(crate) unsafe fn bvopt(
         &self,
         cname: *mut ::std::os::raw::c_char,
         option: ::std::os::raw::c_int,
@@ -1650,7 +1729,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bvprint(
+    pub(crate) unsafe fn bvprint(
         &self,
         cstruct: *mut ::std::os::raw::c_char,
         view: *mut ::std::os::raw::c_char,
@@ -1667,7 +1746,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bvrefresh(&self) {
+    pub(crate) unsafe fn bvrefresh(&self) {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Bvrefresh()
@@ -1680,7 +1759,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bvselinit(
+    pub(crate) unsafe fn bvselinit(
         &self,
         cstruct: *mut ::std::os::raw::c_char,
         cname: *mut ::std::os::raw::c_char,
@@ -1698,7 +1777,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bvsetoccur(
+    pub(crate) unsafe fn bvsetoccur(
         &self,
         cstruct: *mut ::std::os::raw::c_char,
         view: *mut ::std::os::raw::c_char,
@@ -1717,7 +1796,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bvsinit(
+    pub(crate) unsafe fn bvsinit(
         &self,
         cstruct: *mut ::std::os::raw::c_char,
         view: *mut ::std::os::raw::c_char,
@@ -1734,7 +1813,10 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bvsizeof(&self, view: *mut ::std::os::raw::c_char) -> ::std::os::raw::c_long {
+    pub(crate) unsafe fn bvsizeof(
+        &self,
+        view: *mut ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_long {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Bvsizeof(view)
@@ -1747,7 +1829,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bvstof(
+    pub(crate) unsafe fn bvstof(
         &self,
         p_ub: *mut UBFH,
         cstruct: *mut ::std::os::raw::c_char,
@@ -1766,7 +1848,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bwrite(&self, p_ub: *mut UBFH, outf: *mut FILE) -> ::std::os::raw::c_int {
+    pub(crate) unsafe fn bwrite(&self, p_ub: *mut UBFH, outf: *mut FILE) -> ::std::os::raw::c_int {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::Bwrite(p_ub, outf)
@@ -1779,7 +1861,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn bwritecb(
+    pub(crate) unsafe fn bwritecb(
         &self,
         p_ub: *mut UBFH,
         p_writef: ::std::option::Option<
@@ -1803,7 +1885,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn cbadd(
+    pub(crate) unsafe fn cbadd(
         &self,
         p_ub: *mut UBFH,
         bfldid: BFLDID,
@@ -1825,7 +1907,7 @@ impl AtmiCtx {
     /// `oatmi.h` does not expose `OCBaddfast`; in `ctx-send` mode this falls
     /// back to `cbadd` (conversion retained, location hint ignored).
     #[inline]
-    pub unsafe fn cbaddfast(
+    pub(crate) unsafe fn cbaddfast(
         &self,
         p_ub: *mut UBFH,
         bfldid: BFLDID,
@@ -1847,7 +1929,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn cbchg(
+    pub(crate) unsafe fn cbchg(
         &self,
         p_ub: *mut UBFH,
         bfldid: BFLDID,
@@ -1868,7 +1950,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn cbfind(
+    pub(crate) unsafe fn cbfind(
         &self,
         p_ub: *mut UBFH,
         bfldid: BFLDID,
@@ -1888,7 +1970,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn cbfindocc(
+    pub(crate) unsafe fn cbfindocc(
         &self,
         p_ub: *mut UBFH,
         bfldid: BFLDID,
@@ -1908,7 +1990,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn cbfindr(
+    pub(crate) unsafe fn cbfindr(
         &self,
         p_ub: *mut UBFH,
         fldidocc: *mut BFLDID,
@@ -1927,7 +2009,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn cbget(
+    pub(crate) unsafe fn cbget(
         &self,
         p_ub: *mut UBFH,
         bfldid: BFLDID,
@@ -1948,7 +2030,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn cbgetalloc(
+    pub(crate) unsafe fn cbgetalloc(
         &self,
         p_ub: *mut UBFH,
         bfldid: BFLDID,
@@ -1968,7 +2050,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn cbgetallocr(
+    pub(crate) unsafe fn cbgetallocr(
         &self,
         p_ub: *mut UBFH,
         fldidocc: *mut BFLDID,
@@ -1987,7 +2069,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn cbgetr(
+    pub(crate) unsafe fn cbgetr(
         &self,
         p_ub: *mut UBFH,
         fldidocc: *mut BFLDID,
@@ -2007,7 +2089,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn cbvchg(
+    pub(crate) unsafe fn cbvchg(
         &self,
         cstruct: *mut ::std::os::raw::c_char,
         view: *mut ::std::os::raw::c_char,
@@ -2038,7 +2120,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn cbvget(
+    pub(crate) unsafe fn cbvget(
         &self,
         cstruct: *mut ::std::os::raw::c_char,
         view: *mut ::std::os::raw::c_char,
@@ -2071,7 +2153,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn cbvgetalloc(
+    pub(crate) unsafe fn cbvgetalloc(
         &self,
         cstruct: *mut ::std::os::raw::c_char,
         view: *mut ::std::os::raw::c_char,
@@ -2102,7 +2184,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn cbvgetallocr(
+    pub(crate) unsafe fn cbvgetallocr(
         &self,
         p_ub: *mut UBFH,
         fldidocc: *mut BFLDID,
@@ -2133,7 +2215,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn cbvgetr(
+    pub(crate) unsafe fn cbvgetr(
         &self,
         p_ub: *mut UBFH,
         fldidocc: *mut BFLDID,
@@ -2166,7 +2248,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn _bget_ferror_addr(&self) -> *mut ::std::os::raw::c_int {
+    pub(crate) unsafe fn _bget_ferror_addr(&self) -> *mut ::std::os::raw::c_int {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::_Bget_Ferror_addr()
@@ -2179,7 +2261,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn ndrx_bget_ferror_addr(&self) -> *mut ::std::os::raw::c_int {
+    pub(crate) unsafe fn ndrx_bget_ferror_addr(&self) -> *mut ::std::os::raw::c_int {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::ndrx_Bget_Ferror_addr()
@@ -2192,7 +2274,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn ndrx_ubf_tls_free(&self, data: *mut ::std::os::raw::c_void) {
+    pub(crate) unsafe fn ndrx_ubf_tls_free(&self, data: *mut ::std::os::raw::c_void) {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::ndrx_ubf_tls_free(data)
@@ -2205,7 +2287,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn ndrx_ubf_tls_get(&self) -> *mut ::std::os::raw::c_void {
+    pub(crate) unsafe fn ndrx_ubf_tls_get(&self) -> *mut ::std::os::raw::c_void {
         #[cfg(not(feature = "ctx-send"))]
         {
             raw::ndrx_ubf_tls_get()
@@ -2218,7 +2300,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn ndrx_ubf_tls_new(
+    pub(crate) unsafe fn ndrx_ubf_tls_new(
         &self,
         auto_destroy: ::std::os::raw::c_int,
         auto_set: ::std::os::raw::c_int,
@@ -2235,7 +2317,7 @@ impl AtmiCtx {
     }
 
     #[inline]
-    pub unsafe fn ndrx_ubf_tls_set(
+    pub(crate) unsafe fn ndrx_ubf_tls_set(
         &self,
         data: *mut ::std::os::raw::c_void,
     ) -> ::std::os::raw::c_int {
@@ -2252,7 +2334,7 @@ impl AtmiCtx {
 
     /// List-based alternative for variadic `Bgetrv`.
     #[inline]
-    pub unsafe fn bgetrv(
+    pub(crate) unsafe fn bgetrv(
         &self,
         p_ub: *mut UBFH,
         buf: *mut ::std::os::raw::c_char,
@@ -2264,7 +2346,7 @@ impl AtmiCtx {
 
     /// List-based alternative for variadic `CBgetrv`.
     #[inline]
-    pub unsafe fn cbgetrv(
+    pub(crate) unsafe fn cbgetrv(
         &self,
         p_ub: *mut UBFH,
         buf: *mut ::std::os::raw::c_char,
@@ -2277,7 +2359,7 @@ impl AtmiCtx {
 
     /// List-based alternative for variadic `CBgetallocrv`.
     #[inline]
-    pub unsafe fn cbgetallocrv(
+    pub(crate) unsafe fn cbgetallocrv(
         &self,
         p_ub: *mut UBFH,
         usrtype: ::std::os::raw::c_int,
@@ -2289,7 +2371,7 @@ impl AtmiCtx {
 
     /// List-based alternative for variadic `Bfindrv`.
     #[inline]
-    pub unsafe fn bfindrv(
+    pub(crate) unsafe fn bfindrv(
         &self,
         p_ub: *mut UBFH,
         p_len: *mut BFLDLEN,
@@ -2300,7 +2382,7 @@ impl AtmiCtx {
 
     /// List-based alternative for variadic `CBfindrv`.
     #[inline]
-    pub unsafe fn cbfindrv(
+    pub(crate) unsafe fn cbfindrv(
         &self,
         p_ub: *mut UBFH,
         len: *mut BFLDLEN,
@@ -2312,13 +2394,17 @@ impl AtmiCtx {
 
     /// List-based alternative for variadic `Bpresrv`.
     #[inline]
-    pub unsafe fn bpresrv(&self, p_ub: *mut UBFH, fldidocc: *mut BFLDID) -> ::std::os::raw::c_int {
+    pub(crate) unsafe fn bpresrv(
+        &self,
+        p_ub: *mut UBFH,
+        fldidocc: *mut BFLDID,
+    ) -> ::std::os::raw::c_int {
         self.bpresr(p_ub, fldidocc)
     }
 
     /// List-based alternative for variadic `CBvgetrv`.
     #[inline]
-    pub unsafe fn cbvgetrv(
+    pub(crate) unsafe fn cbvgetrv(
         &self,
         p_ub: *mut UBFH,
         cname: *mut ::std::os::raw::c_char,
@@ -2334,7 +2420,7 @@ impl AtmiCtx {
 
     /// List-based alternative for variadic `Bvnullrv`.
     #[inline]
-    pub unsafe fn bvnullrv(
+    pub(crate) unsafe fn bvnullrv(
         &self,
         p_ub: *mut UBFH,
         cname: *mut ::std::os::raw::c_char,
@@ -2346,7 +2432,7 @@ impl AtmiCtx {
 
     /// List-based alternative for variadic `CBvgetallocrv`.
     #[inline]
-    pub unsafe fn cbvgetallocrv(
+    pub(crate) unsafe fn cbvgetallocrv(
         &self,
         p_ub: *mut UBFH,
         cname: *mut ::std::os::raw::c_char,
@@ -2359,7 +2445,11 @@ impl AtmiCtx {
         self.cbvgetallocr(p_ub, fldidocc, cname, occ, usrtype, flags, extralen)
     }
 
-    /// Safe helper for `Bmkfldid`.
+    /// Build a field id from a Rust field type enum and field number.
+    ///
+    /// Wraps `Bmkfldid(3)` while avoiding direct use of Enduro/X raw field type
+    /// constants. `field_no` is the numeric field number understood by
+    /// Enduro/X, typically the value after field-table base expansion.
     #[inline]
     pub fn bmkfldid_typed(&self, field_type: UbfFieldType, field_no: i32) -> i32 {
         unsafe { self.bmkfldid(field_type.as_raw(), field_no as BFLDID) as i32 }
