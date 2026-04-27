@@ -164,12 +164,14 @@ impl AtmiCtx {
         flags: i64,
         timeout: Option<Duration>,
     ) -> AtmiResult<()> {
-        let reply_fd = unsafe { raw::endurox_rs_reply_queue_fd() };
+        #[cfg(not(feature = "ctx-send"))]
+        let reply_fd = unsafe { raw::tpext_getreplyqfd() };
+
+        #[cfg(feature = "ctx-send")]
+        let reply_fd = unsafe { raw::Otpext_getreplyqfd(self.c_ctx_ptr()) };
+
         if reply_fd < 0 {
-            return Err(AtmiError::new(
-                raw::TPESYSTEM,
-                "Enduro/X reply queue descriptor is not available",
-            ));
+            return Err(self.atmi_last_error());
         }
 
         let mut cd = self.tpacall(svc, data, flags)?;

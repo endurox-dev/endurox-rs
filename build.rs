@@ -41,7 +41,6 @@ fn main() {
     // --- 2) Rebuild triggers --------------------------------------------------
     // Re-run if wrapper or any env that affects codegen changes.
     println!("cargo:rerun-if-changed=include/wrapper.h");
-    println!("cargo:rerun-if-changed=csrc/endurox_rs_shim.c");
     println!("cargo:rerun-if-changed=tests/ubftab/test.fd");
     println!("cargo:rerun-if-env-changed=ENDUROX_MKFLDHDR");
     println!("cargo:rerun-if-env-changed=CFLAGS");
@@ -53,29 +52,11 @@ fn main() {
 
     generate_ubf_field_constants();
 
-    // --- 3) (Optional) compile any bundled C sources -------------------------
-    // If you have .c files, add them here; otherwise you can remove this block.
-    let mut cc_build = cc::Build::new();
-    for dir in &include_dirs {
-        cc_build.include(dir);
-    }
-    for def in &defines {
-        // Accept "NAME" or "NAME=VALUE"
-        if let Some((k, v)) = def.split_once('=') {
-            cc_build.define(k, Some(v));
-        } else {
-            cc_build.define(def, None);
-        }
-    }
-    cc_build
-        .file("csrc/endurox_rs_shim.c")
-        .compile("endurox_rs_shim");
-
     if endurox_config_is_epoll(&include_dirs) {
         println!("cargo:rustc-cfg=endurox_epoll");
     }
 
-    // --- 4) Generate bindings with bindgen -----------------------------------
+    // --- 3) Generate bindings with bindgen -----------------------------------
     // Skip bindgen on docs.rs (no libclang). You can also gate with a feature.
     let building_docs = env::var("DOCS_RS").is_ok();
     if !building_docs {

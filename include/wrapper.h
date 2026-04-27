@@ -6,5 +6,3 @@
 #include <oatmisrv_integra.h>
 #include <ubf.h>
 #include <nerror.h>
-
-int endurox_rs_reply_queue_fd(void);
