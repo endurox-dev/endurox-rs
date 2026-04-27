@@ -1,19 +1,20 @@
-use core::ffi::{c_int, c_long, c_char};
-use crate::{raw, AtmiError, AtmiResult, TypedBuffer, TypedUbf, UbfError, NstdError};
+use crate::{raw, AtmiError, AtmiResult, NstdError, TypedBuffer, TypedUbf, UbfError};
+use core::ffi::{c_char, c_int, c_long};
 
+#[cfg(feature = "ctx-send")]
+use std::cell::Cell;
 use std::{
     ffi::{CStr, CString},
     marker::PhantomData,
     ptr,
 };
 
-
 // --- Marker selection -------------------------------------------------------
 #[cfg(not(feature = "ctx-send"))]
 type CtxMarker = std::rc::Rc<()>; // -> !Send & !Sync
 
 #[cfg(feature = "ctx-send")]
-type CtxMarker = std::cell::Cell<()>; // -> Send & !Sync
+type CtxMarker = Cell<()>; // -> Send & !Sync
 
 #[cfg(feature = "ctx-send")]
 type CtxHandle = raw::TPCONTEXT_T;
@@ -23,22 +24,21 @@ type CtxHandle = raw::TPCONTEXT_T;
 /// - With "ctx-send": Send & !Sync
 #[derive(Debug)]
 pub struct AtmiCtx {
-
     _marker: PhantomData<CtxMarker>,
 
     #[cfg(feature = "ctx-send")]
-    handle: CtxHandle,
+    handle: Cell<CtxHandle>,
 }
 
 impl AtmiCtx {
-
     ///Estalish new ATMI context
     pub fn new() -> Result<Self, AtmiError> {
-
         // No ctx-send: just a thread-local marker, nothing to allocate.
         #[cfg(not(feature = "ctx-send"))]
         {
-            Ok(AtmiCtx { _marker: PhantomData })
+            Ok(AtmiCtx {
+                _marker: PhantomData,
+            })
         }
 
         // With ctx-send: allocate context on C side via tpnewctxt(0, 0).
@@ -49,11 +49,7 @@ impl AtmiCtx {
                 // e.g. fn tpnewctxt(flags: i64, rsvd: i64) -> raw::TPCONTEXT_T;
                 let handle = raw::tpnewctxt(0, 0);
 
-                // If TPCONTEXT_T is a pointer type, check for null:
-                // if handle.is_null() { ... }
-
-                if handle_invalid(handle) {
-                    // replace `handle_invalid` with your real check if needed
+                if handle.is_null() {
                     return Err(AtmiError::new(
                         raw::TPESYSTEM,
                         "Failed to allocate new context - see ULOG for details",
@@ -62,7 +58,7 @@ impl AtmiCtx {
 
                 Ok(AtmiCtx {
                     _marker: PhantomData,
-                    handle,
+                    handle: Cell::new(handle),
                 })
             }
         }
@@ -96,7 +92,7 @@ impl AtmiCtx {
             // Adjust types to your actual FFI signatures.
             let err_ptr = raw::_exget_tperrno_addr(); // *const i32 or *mut i32
             let code = *err_ptr;
-            let msg_ptr = raw::tpstrerror(code);      // *const c_char
+            let msg_ptr = raw::tpstrerror(code); // *const c_char
             let message = CStr::from_ptr(msg_ptr).to_string_lossy().into_owned();
             AtmiError::new(code as u32, message)
         }
@@ -108,7 +104,7 @@ impl AtmiCtx {
             // Adjust types to your actual FFI signatures.
             let err_ptr = raw::ndrx_Bget_Ferror_addr(); // *const i32 or *mut i32
             let code = *err_ptr;
-            let msg_ptr = raw::Bstrerror(code);      // *const c_char
+            let msg_ptr = raw::Bstrerror(code); // *const c_char
             let message = CStr::from_ptr(msg_ptr).to_string_lossy().into_owned();
             UbfError::new(code as u32, message)
         }
@@ -120,7 +116,7 @@ impl AtmiCtx {
             // Adjust types to your actual FFI signatures.
             let err_ptr = raw::_Nget_Nerror_addr(); // *const i32 or *mut i32
             let code = *err_ptr;
-            let msg_ptr = raw::Nstrerror(code);      // *const c_char
+            let msg_ptr = raw::Nstrerror(code); // *const c_char
             let message = CStr::from_ptr(msg_ptr).to_string_lossy().into_owned();
             NstdError::new(code as u32, message)
         }
@@ -179,10 +175,28 @@ impl AtmiCtx {
     fn ubf_last_error() -> AtmiError { ... }
     fn nstd_last_error() -> AtmiError { ... }
     */
+
+    #[cfg(feature = "ctx-send")]
+    #[inline]
+    pub(crate) fn c_ctx_ptr(&self) -> *mut raw::TPCONTEXT_T {
+        self.handle.as_ptr()
+    }
 }
 
 impl Drop for AtmiCtx {
     fn drop(&mut self) {
-        unsafe { raw::tpterm(); }
+        #[cfg(not(feature = "ctx-send"))]
+        unsafe {
+            raw::tpterm();
+        }
+
+        #[cfg(feature = "ctx-send")]
+        unsafe {
+            let handle = self.handle.get();
+            if !handle.is_null() {
+                raw::tpfreectxt(handle);
+                self.handle.set(ptr::null_mut());
+            }
+        }
     }
 }

@@ -1,25 +1,33 @@
-use crate::{raw, AtmiCtx, TypedBuffer};
+use crate::{raw, AtmiCtx, TypedBuffer, TypedUbf};
 use core::ffi::c_char;
-use std::{ffi::CStr};
+use std::ffi::CStr;
 
 /// Safe Rust wrapper for TPSVCINFO passed into a service callback.
 ///
-/// This does **not** own the service buffer.
-/// XATMI owns TPSVCINFO and its data; Rust only observes it.
+/// Owns the service buffer until the handler calls `take_data()` /
+/// `take_data_ubf()` and passes it to `tpreturn_ubf`.  If the handler
+/// returns without taking the data the buffer is freed automatically via
+/// the `TypedBuffer` Drop impl (correct: service must either return or free it).
 #[derive(Debug)]
 pub struct TpSvcInfo<'ctx> {
     raw: *mut raw::TPSVCINFO,
     ctx: &'ctx AtmiCtx,
+    /// Owned data buffer from TPSVCINFO::data.  Moved out on take_data*().
+    data: Option<TypedBuffer<'ctx>>,
 }
 
-///Service info returned by the service call
 impl<'ctx> TpSvcInfo<'ctx> {
     /// # Safety
     /// - `raw` must be a valid TPSVCINFO pointer supplied by XATMI.
     /// - `ctx` must be the current ATMI context for this thread.
-    /// - XATMI owns the memory; Rust must NOT free anything.
-    pub unsafe fn from_raw(ctx: &'ctx AtmiCtx, raw: *mut raw::TPSVCINFO) -> Self {
-        TpSvcInfo { raw, ctx }
+    pub(crate) unsafe fn from_raw(ctx: &'ctx AtmiCtx, raw: *mut raw::TPSVCINFO) -> Self {
+        let data_ptr = (*raw).data as *mut c_char;
+        let data = if data_ptr.is_null() {
+            None
+        } else {
+            Some(TypedBuffer::from_raw(ctx, data_ptr))
+        };
+        TpSvcInfo { raw, ctx, data }
     }
 
     #[inline]
@@ -41,7 +49,7 @@ impl<'ctx> TpSvcInfo<'ctx> {
         }
     }
 
-    /// Name of the advertised function.
+    /// Name of the advertised function (may differ from service name).
     pub fn fname(&self) -> &str {
         unsafe {
             CStr::from_ptr(self.raw().fname.as_ptr())
@@ -50,7 +58,7 @@ impl<'ctx> TpSvcInfo<'ctx> {
         }
     }
 
-    /// Input buffer length.
+    /// Input buffer length as reported by the framework.
     pub fn len(&self) -> i64 {
         self.raw().len
     }
@@ -75,20 +83,34 @@ impl<'ctx> TpSvcInfo<'ctx> {
         self.raw().appkey
     }
 
-    pub fn cltid(&self) -> raw::CLIENTID {
+    pub fn cltid(&self) -> crate::ClientId {
         self.raw().cltid
     }
 
-    /// View the service buffer (`TPSVCINFO::data`) as a **TypedBufferView**.
+    /// Return the raw data pointer without transferring ownership.
+    /// Use this only for low-level / read-only inspection; prefer
+    /// `take_data_ubf()` for normal service handler use.
+    pub fn data_ptr(&self) -> *mut c_char {
+        self.data
+            .as_ref()
+            .map(|b| b.as_ptr())
+            .unwrap_or(std::ptr::null_mut())
+    }
+
+    /// Transfer ownership of the service data buffer.
     ///
-    /// This buffer is **not owned** by Rust; XATMI controls its lifetime.
+    /// Returns `None` if the buffer was already taken or was originally null.
+    /// After calling this, the caller is responsible for passing the buffer
+    /// to `tpreturn_buffer` (or freeing it before calling `tpreturn`).
+    pub fn take_data(&mut self) -> Option<TypedBuffer<'ctx>> {
+        self.data.take()
+    }
+
+    /// Take the service data buffer as a typed UBF buffer.
     ///
-    /// # Safety
-    /// You MUST ensure `ctx` matches the runtime's active context.
-    pub fn data(&self) -> TypedBuffer<'ctx> {
-        let ptr = self.raw().data as *mut c_char;
-        let ret = unsafe { TypedBuffer::from_raw(self.ctx, ptr) };
-        ret
+    /// Convenience wrapper over `take_data()` for the common case where the
+    /// request was sent as a UBF message.
+    pub fn take_data_ubf(&mut self) -> Option<TypedUbf<'ctx>> {
+        self.data.take().map(TypedUbf::from_typed)
     }
 }
-

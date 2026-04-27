@@ -1,12 +1,16 @@
 // build.rs
-use std::{env, path::PathBuf};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 fn main() {
     // --- 1) Parse env flags --------------------------------------------------
     // We accept typical envs:
     //   CFLAGS   -> -I / -D (compile-time)
     //   LDFLAGS  -> -L / -l (link-time)
-    let cflags  = env::var("CFLAGS").unwrap_or_default();
+    let cflags = env::var("CFLAGS").unwrap_or_default();
     let ldflags = env::var("LDFLAGS").unwrap_or_default();
 
     let mut include_dirs: Vec<String> = Vec::new();
@@ -37,11 +41,17 @@ fn main() {
     // --- 2) Rebuild triggers --------------------------------------------------
     // Re-run if wrapper or any env that affects codegen changes.
     println!("cargo:rerun-if-changed=include/wrapper.h");
+    println!("cargo:rerun-if-changed=csrc/endurox_rs_shim.c");
+    println!("cargo:rerun-if-changed=tests/ubftab/test.fd");
+    println!("cargo:rerun-if-env-changed=ENDUROX_MKFLDHDR");
     println!("cargo:rerun-if-env-changed=CFLAGS");
     println!("cargo:rerun-if-env-changed=LDFLAGS");
     println!("cargo:rerun-if-env-changed=LIBCLANG_PATH");
+    println!("cargo:rustc-check-cfg=cfg(endurox_epoll)");
 
     println!("cargo:rustc-link-lib=dylib=tux");
+
+    generate_ubf_field_constants();
 
     // --- 3) (Optional) compile any bundled C sources -------------------------
     // If you have .c files, add them here; otherwise you can remove this block.
@@ -57,8 +67,13 @@ fn main() {
             cc_build.define(def, None);
         }
     }
-    // Example:
-    // cc_build.file("csrc/mylib.c").compile("mylib");
+    cc_build
+        .file("csrc/endurox_rs_shim.c")
+        .compile("endurox_rs_shim");
+
+    if endurox_config_is_epoll(&include_dirs) {
+        println!("cargo:rustc-cfg=endurox_epoll");
+    }
 
     // --- 4) Generate bindings with bindgen -----------------------------------
     // Skip bindgen on docs.rs (no libclang). You can also gate with a feature.
@@ -95,4 +110,76 @@ fn main() {
             .write_to_file(out.join("bindings.rs"))
             .expect("Couldn't write bindings.rs");
     }
+}
+
+fn generate_ubf_field_constants() {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let fd = manifest_dir.join("tests/ubftab/test.fd");
+    let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let mkfldhdr = find_mkfldhdr(&manifest_dir);
+
+    let status = Command::new(&mkfldhdr)
+        .arg("-m4")
+        .arg("-d")
+        .arg(&out)
+        .arg(&fd)
+        .status()
+        .unwrap_or_else(|e| panic!("failed to execute {}: {e}", mkfldhdr.display()));
+
+    if !status.success() {
+        panic!(
+            "{} failed to generate Rust UBF constants from {}",
+            mkfldhdr.display(),
+            fd.display()
+        );
+    }
+}
+
+fn find_mkfldhdr(manifest_dir: &Path) -> PathBuf {
+    if let Ok(path) = env::var("ENDUROX_MKFLDHDR") {
+        return PathBuf::from(path);
+    }
+
+    let sibling = manifest_dir
+        .parent()
+        .map(|parent| parent.join("endurox/mkfldhdr/mkfldhdr"));
+    if let Some(path) = sibling {
+        if path.exists() {
+            return path;
+        }
+    }
+
+    PathBuf::from("mkfldhdr")
+}
+
+fn endurox_config_is_epoll(include_dirs: &[String]) -> bool {
+    for dir in include_dirs {
+        let cfg = PathBuf::from(dir).join("ndrx_config.h");
+        let Ok(contents) = fs::read_to_string(cfg) else {
+            continue;
+        };
+        if config_define_enabled(&contents, "EX_USE_EPOLL")
+            || config_string_define_eq(&contents, "EX_POLLER_STR", "EPOLL")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn config_define_enabled(contents: &str, name: &str) -> bool {
+    contents.lines().any(|line| {
+        let line = line.trim();
+        line == format!("#define {name} 1") || line == format!("#define {name}")
+    })
+}
+
+fn config_string_define_eq(contents: &str, name: &str, expected: &str) -> bool {
+    let prefix = format!("#define {name} ");
+    contents.lines().any(|line| {
+        let line = line.trim();
+        line.strip_prefix(&prefix)
+            .and_then(|value| value.trim().trim_matches('"').split_whitespace().next())
+            == Some(expected)
+    })
 }

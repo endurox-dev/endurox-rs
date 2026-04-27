@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+
+if [ -f ~/ndrx_home ]; then
+    . ~/ndrx_home
+fi
+
+TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+export NDRX_NODEID=1
+export NDRX_CLUSTERISED=1
+export NDRX_LDBAL=0
+export NDRX_TOUT=60
+export NDRX_ULOG=/tmp
+export NDRX_QPREFIX="${NDRX_RS_EXT_QPREFIX:-/nrsext}"
+export NDRX_SVCMAX=20000
+export NDRX_SRVMAX=10000
+export NDRX_QPATH="${NDRX_QPATH:-/tmp/mq}"
+export NDRX_SHMPATH="${NDRX_SHMPATH:-/tmp}"
+export NDRX_CMDWAIT=1
+export NDRX_DPID="${NDRX_RS_EXT_DPID:-/tmp/ndrxd-rs-ext.pid}"
+export NDRX_RNDK="${NDRX_RS_EXT_RNDK:-rsext01}"
+export NDRX_IPCKEY="${NDRX_RS_EXT_IPCKEY:-44124}"
+export NDRX_MSGMAX=10
+export NDRX_DQMAX=10
+export NDRX_MSGSIZEMAX=40000
+export NDRX_UBFMAXFLDS=16000
+export NDRX_DMNLOG=/tmp/ndrxd-rs-ext.log
+export NDRX_DMNLEV=5
+export NDRX_LOG=/tmp/ndrx-rs-ext.log
+export NDRX_LEV=5
+export NDRX_CONFIG="$PWD/ndrxconfig.xml"
+export NDRX_DEBUG_CONF="$PWD/debug.conf"
+export PATH="$PATH:$TEST_DIR/bin"
+
+mkdir -p "$NDRX_QPATH"

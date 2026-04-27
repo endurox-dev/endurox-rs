@@ -1,5 +1,5 @@
+use crate::raw;
 use std::{borrow::Cow, error::Error, fmt};
-use crate::{raw};
 
 // --- ATMI Errors -------------------------------------------------------------
 
@@ -11,7 +11,6 @@ macro_rules! gen_error_consts {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AtmiError {
-
     pub code: u32,
     pub message: Cow<'static, str>,
 }
@@ -19,7 +18,10 @@ pub struct AtmiError {
 /* ATMI error */
 impl AtmiError {
     pub fn new(code: u32, message: impl Into<Cow<'static, str>>) -> Self {
-        Self { code, message: message.into() }
+        Self {
+            code,
+            message: message.into(),
+        }
     }
 
     // List of errors codes
@@ -73,7 +75,6 @@ pub type AtmiResult<T> = Result<T, AtmiError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UbfError {
-
     pub code: u32,
     pub message: Cow<'static, str>,
 }
@@ -81,7 +82,10 @@ pub struct UbfError {
 /* ATMI error */
 impl UbfError {
     pub fn new(code: u32, message: impl Into<Cow<'static, str>>) -> Self {
-        Self { code, message: message.into() }
+        Self {
+            code,
+            message: message.into(),
+        }
     }
 
     // List of errors codes
@@ -111,7 +115,6 @@ impl UbfError {
         BEBADOP,
         BMAXVAL
     }
-
 }
 
 impl fmt::Display for UbfError {
@@ -124,7 +127,6 @@ impl Error for UbfError {}
 
 pub type UbfResult<T> = Result<T, UbfError>;
 
-
 // --- NSTD Errors -------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,7 +138,10 @@ pub struct NstdError {
 /* ATMI error */
 impl NstdError {
     pub fn new(code: u32, message: impl Into<Cow<'static, str>>) -> Self {
-        Self { code, message: message.into() }
+        Self {
+            code,
+            message: message.into(),
+        }
     }
 }
 

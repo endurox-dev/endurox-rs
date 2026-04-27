@@ -1,15 +1,13 @@
 // src/typed_buffer.rs
-use core::ffi::{c_char, c_long};
 use crate::{raw, AtmiCtx, AtmiResult};
+use core::ffi::{c_char, c_long};
 
-use std::{
-    mem::ManuallyDrop,
-};
+use std::mem::ManuallyDrop;
 
 #[derive(Debug)]
 pub struct TypedBuffer<'ctx> {
-    ptr: *mut c_char,    // may be null
-    pub ctx: &'ctx AtmiCtx,  // real reference to the owning context
+    ptr: *mut c_char,       // may be null
+    pub ctx: &'ctx AtmiCtx, // real reference to the owning context
 }
 
 impl<'ctx> TypedBuffer<'ctx> {
@@ -36,13 +34,16 @@ impl<'ctx> TypedBuffer<'ctx> {
     ///
     /// Only valid if the underlying ATMI/UBF API actually allows this buffer
     /// to be used under `new_ctx`. The lifetime re-tie is unchecked by Rust.
-    pub unsafe fn move_to_context<'new>(
-        self,
-        new_ctx: &'new AtmiCtx,
-    ) -> TypedBuffer<'new> {
+    pub unsafe fn move_to_context<'new>(self, new_ctx: &'new AtmiCtx) -> TypedBuffer<'new> {
         let ptr = self.into_raw();
         // rewrap with new lifetime / context
         TypedBuffer::from_raw(new_ctx, ptr)
+    }
+
+    /// Update the internal pointer after a C API may have reallocated the buffer.
+    #[inline]
+    pub(crate) fn replace_ptr(&mut self, new_ptr: *mut c_char) {
+        self.ptr = new_ptr;
     }
 
     /// Reallocate this buffer with a new size using `tprealloc`.
@@ -50,9 +51,7 @@ impl<'ctx> TypedBuffer<'ctx> {
     /// On success, `self` will point to the new buffer.
     /// On failure, `self` remains valid and unchanged, and the error is returned.
     pub fn tprealloc(&mut self, new_size: usize) -> AtmiResult<()> {
-        let new_ptr = unsafe {
-            raw::tprealloc(self.ptr as *mut c_char, new_size as c_long)
-        };
+        let new_ptr = unsafe { raw::tprealloc(self.ptr as *mut c_char, new_size as c_long) };
 
         if new_ptr.is_null() {
             // C failed; original pointer still valid.
@@ -64,7 +63,6 @@ impl<'ctx> TypedBuffer<'ctx> {
             Ok(())
         }
     }
-
 }
 
 impl<'ctx> Drop for TypedBuffer<'ctx> {
