@@ -3,10 +3,10 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use endurox_rs::AtmiCtx;
-use endurox_rs::TypedBuffer;
-use endurox_rs::TypedUbf;
-use endurox_rs::UbfValue;
+use endurox_rs::{
+    AtmiCtx, TpQCtl, TypedBuffer, TypedUbf, UbfValue, TPQCORRID, TPQFAILUREQ, TPQGETBYCORRID,
+    TPQMSGID, TPQPRIORITY, TPQREPLYQ,
+};
 
 #[test]
 fn atmictx_init_integration() {
@@ -58,6 +58,51 @@ fn tpalloc_ubf() {
     endurox_rs::ndrx_error!(ctx, ">>>>> About to free UBF...");
     drop(buf);
     drop(ctx);
+}
+
+#[test]
+fn tpqctl_sets_flags_and_bounded_fields() {
+    let mut qctl = TpQCtl::default();
+
+    qctl.set_flags(TPQCORRID | TPQPRIORITY)
+        .add_flags(TPQREPLYQ | TPQFAILUREQ | TPQMSGID)
+        .clear_flags(TPQPRIORITY);
+    assert_eq!(qctl.flags(), TPQCORRID | TPQREPLYQ | TPQFAILUREQ | TPQMSGID);
+
+    qctl.set_corrid(b"ORDER-1001").expect("set corrid failed");
+    qctl.set_msgid(b"MSG-1").expect("set msgid failed");
+    qctl.set_reply_queue("REPLYQ")
+        .expect("set reply queue failed");
+    qctl.set_failure_queue("ERRORQ")
+        .expect("set failure queue failed");
+    qctl.set_priority(50)
+        .set_deq_time(30)
+        .set_delivery_qos(2)
+        .set_reply_qos(4)
+        .set_exp_time(60)
+        .set_urcode(7)
+        .set_appkey(9);
+
+    assert_eq!(qctl.corrid(), b"ORDER-1001");
+    assert_eq!(qctl.msgid(), b"MSG-1");
+    assert_eq!(qctl.reply_queue(), "REPLYQ");
+    assert_eq!(qctl.failure_queue(), "ERRORQ");
+    assert_eq!(qctl.priority(), 50);
+    assert_eq!(qctl.deq_time(), 30);
+    assert_eq!(qctl.delivery_qos(), 2);
+    assert_eq!(qctl.reply_qos(), 4);
+    assert_eq!(qctl.exp_time(), 60);
+    assert_eq!(qctl.urcode(), 7);
+    assert_eq!(qctl.appkey(), 9);
+    assert_eq!(qctl.diagnostic(), 0);
+    assert_eq!(qctl.diagmsg(), "");
+
+    qctl.set_flags(TPQGETBYCORRID);
+    assert_eq!(qctl.flags(), TPQGETBYCORRID);
+
+    assert!(qctl.set_corrid(&[b'x'; 32]).is_err());
+    assert!(qctl.set_reply_queue("1234567890123456").is_err());
+    assert!(qctl.set_failure_queue("bad\0queue").is_err());
 }
 
 fn endurox_test_env() -> MutexGuard<'static, ()> {

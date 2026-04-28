@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use endurox_rs::{ubf_fields, AtmiCtx, TypedBuffer, TypedUbf, UbfFieldType, UbfValue};
+use endurox_rs::{
+    ubf_fields, AtmiCtx, BFldLocInfo, TypedBuffer, TypedUbf, UbfFieldType, UbfGetValue, UbfValue,
+};
 
 #[test]
 fn ubf_change_and_get_scalar_fields() {
@@ -116,6 +118,112 @@ fn ubf_multiple_occurrences_are_indexed() {
         ubf.bget_string(ubf_fields::T_STRING_FLD, 1).unwrap(),
         "second"
     );
+}
+
+#[test]
+fn ubf_add_and_into_value_helpers_append_occurrences() {
+    let _guard = endurox_test_env();
+    let ctx = AtmiCtx::new().expect("failed to create AtmiCtx");
+    let mut ubf = ctx.tpalloc_ubf(4096).expect("tpalloc_ubf failed");
+
+    ubf.badd(ubf_fields::T_STRING_FLD, "first", false)
+        .expect("first Badd failed");
+    ubf.badd(ubf_fields::T_STRING_FLD, String::from("second"), false)
+        .expect("second Badd failed");
+    ubf.bchg(ubf_fields::T_LONG_FLD, 0, 42_i64, false)
+        .expect("typed long Bchg failed");
+
+    assert_eq!(ctx.boccur(&ubf, ubf_fields::T_STRING_FLD).unwrap(), 2);
+    assert_eq!(
+        ubf.bget_string(ubf_fields::T_STRING_FLD, 0).unwrap(),
+        "first"
+    );
+    assert_eq!(
+        ubf.bget_string(ubf_fields::T_STRING_FLD, 1).unwrap(),
+        "second"
+    );
+    assert_eq!(ubf.bget_long(ubf_fields::T_LONG_FLD, 0).unwrap(), 42);
+}
+
+#[test]
+fn ubf_dynamic_get_and_fast_add_match_field_types() {
+    let _guard = endurox_test_env();
+    let ctx = AtmiCtx::new().expect("failed to create AtmiCtx");
+    let mut ubf = ctx.tpalloc_ubf(4096).expect("tpalloc_ubf failed");
+    let mut loc = BFldLocInfo::default();
+
+    ubf.badd_fast(ubf_fields::T_SHORT_FLD, 5_i16, &mut loc, true, false)
+        .expect("short Baddfast failed");
+    ubf.badd_fast(ubf_fields::T_SHORT_FLD, 7_i16, &mut loc, false, false)
+        .expect("second short Baddfast failed");
+    ubf.bchg(ubf_fields::T_STRING_FLD, 0, "dynamic", false)
+        .expect("string Bchg failed");
+
+    match ubf
+        .bget(ubf_fields::T_SHORT_FLD, 1)
+        .expect("dynamic short Bget failed")
+    {
+        UbfGetValue::Short(v) => assert_eq!(v, 7),
+        _ => panic!("expected short dynamic value"),
+    }
+
+    match ubf
+        .bget(ubf_fields::T_STRING_FLD, 0)
+        .expect("dynamic string Bget failed")
+    {
+        UbfGetValue::String(v) => assert_eq!(v, "dynamic"),
+        _ => panic!("expected string dynamic value"),
+    }
+}
+
+#[test]
+fn ubf_change_combined_and_binit_cover_go_parity_helpers() {
+    let _guard = endurox_test_env();
+    let ctx = AtmiCtx::new().expect("failed to create AtmiCtx");
+    let mut ubf = ctx.tpalloc_ubf(4096).expect("tpalloc_ubf failed");
+
+    ubf.bchg_combined(ubf_fields::T_STRING_FLD, 0, "combined", true, false)
+        .expect("BChgCombined add failed");
+    assert_eq!(
+        ubf.bget_string(ubf_fields::T_STRING_FLD, 0).unwrap(),
+        "combined"
+    );
+
+    ubf.bchg_combined(ubf_fields::T_STRING_FLD, 0, "changed", false, false)
+        .expect("BChgCombined change failed");
+    assert_eq!(
+        ubf.bget_string(ubf_fields::T_STRING_FLD, 0).unwrap(),
+        "changed"
+    );
+
+    let size = ubf.bsizeof().expect("Bsizeof failed");
+    ctx.binit(&mut ubf, size).expect("Binit failed");
+    assert!(!ctx.bpres(&ubf, ubf_fields::T_STRING_FLD, 0));
+}
+
+#[test]
+fn ubf_buffer_iteration_reports_fields_and_occurrences() {
+    let _guard = endurox_test_env();
+    let ctx = AtmiCtx::new().expect("failed to create AtmiCtx");
+    let mut ubf = ctx.tpalloc_ubf(4096).expect("tpalloc_ubf failed");
+
+    ubf.bchg(ubf_fields::T_STRING_FLD, 0, "iter-one", false)
+        .expect("string Bchg failed");
+    ubf.bchg(ubf_fields::T_STRING_FLD, 1, "iter-two", false)
+        .expect("second string Bchg failed");
+    ubf.bchg(ubf_fields::T_LONG_FLD, 0, 777_i64, false)
+        .expect("long Bchg failed");
+
+    let mut seen = Vec::new();
+    let mut iter = ubf.bnext();
+    while let Some(field) = iter.next().expect("Bnext failed") {
+        seen.push((field.field_id, field.occurrence, field.field_type));
+        assert!(field.len > 0);
+    }
+
+    assert!(seen.contains(&(ubf_fields::T_STRING_FLD, 0, UbfFieldType::String)));
+    assert!(seen.contains(&(ubf_fields::T_STRING_FLD, 1, UbfFieldType::String)));
+    assert!(seen.contains(&(ubf_fields::T_LONG_FLD, 0, UbfFieldType::Long)));
 }
 
 #[test]
@@ -348,6 +456,129 @@ fn atmictx_ubf_field_id_helper_uses_defined_types() {
         ctx.bmkfldid_typed(UbfFieldType::Long, 1031),
         ubf_fields::T_LONG_FLD
     );
+    assert_eq!(
+        ctx.bfldid("T_STRING_FLD").unwrap(),
+        ubf_fields::T_STRING_FLD
+    );
+    assert_eq!(
+        ctx.bfname(ubf_fields::T_STRING_FLD).unwrap(),
+        "T_STRING_FLD"
+    );
+    assert_eq!(ctx.bfldno(ubf_fields::T_STRING_FLD), 1061);
+    assert_eq!(
+        ctx.bfldtype(ubf_fields::T_STRING_FLD).unwrap(),
+        UbfFieldType::String
+    );
+    assert_eq!(ctx.btype(ubf_fields::T_STRING_FLD).unwrap(), "string");
+    assert_eq!(ctx.bmkfldid(5, 1061).unwrap(), ubf_fields::T_STRING_FLD);
+}
+
+#[test]
+fn ubf_print_extread_and_binary_roundtrip() {
+    let _guard = endurox_test_env();
+    let ctx = AtmiCtx::new().expect("failed to create AtmiCtx");
+    let mut src = ctx.tpalloc_ubf(4096).expect("source tpalloc_ubf failed");
+    let mut from_text = ctx.tpalloc_ubf(4096).expect("text tpalloc_ubf failed");
+    let mut from_dump = ctx.tpalloc_ubf(4096).expect("dump tpalloc_ubf failed");
+
+    src.bchg(ubf_fields::T_STRING_FLD, 0, "printed", false)
+        .expect("string Bchg failed");
+    src.bchg(ubf_fields::T_LONG_FLD, 0, 12345_i64, false)
+        .expect("long Bchg failed");
+
+    let printed = src.bsprint().expect("BSprint failed");
+    assert!(printed.contains("printed"));
+
+    from_text.bextread(&printed).expect("BExtRead failed");
+    assert_eq!(
+        from_text.bget_string(ubf_fields::T_STRING_FLD, 0).unwrap(),
+        "printed"
+    );
+    assert_eq!(
+        from_text.bget_long(ubf_fields::T_LONG_FLD, 0).unwrap(),
+        12345
+    );
+
+    let dump = src.bwrite().expect("BWrite failed");
+    assert!(!dump.is_empty());
+    from_dump.bread(&dump).expect("BRead failed");
+    assert_eq!(
+        from_dump.bget_string(ubf_fields::T_STRING_FLD, 0).unwrap(),
+        "printed"
+    );
+    assert_eq!(
+        from_dump.bget_long(ubf_fields::T_LONG_FLD, 0).unwrap(),
+        12345
+    );
+}
+
+#[test]
+fn ubf_boolean_expression_compile_eval_and_print() {
+    let _guard = endurox_test_env();
+    let ctx = AtmiCtx::new().expect("failed to create AtmiCtx");
+    let mut ubf = ctx.tpalloc_ubf(4096).expect("tpalloc_ubf failed");
+
+    ubf.bchg(ubf_fields::T_LONG_FLD, 0, 77_i64, false)
+        .expect("long Bchg failed");
+    ctx.bboolsetcbf("rust_long_is_77", rust_long_is_77)
+        .expect("Bboolsetcbf failed");
+
+    let tree = ctx.bboolco("rust_long_is_77()").expect("Bboolco failed");
+    assert!(ubf.bboolev(&tree));
+    assert!(ubf.bqboolev("rust_long_is_77()").expect("BQBoolEv failed"));
+
+    let printed = ctx.bboolpr(&tree).expect("Bboolpr failed");
+    assert!(!printed.is_empty());
+    let printed_via_cb = ctx.bboolprcb(&tree).expect("Bboolprcb failed");
+    assert!(!printed_via_cb.is_empty());
+    assert_eq!(ubf.bfloatev(&tree), 1.0);
+
+    ctx.btreefree(tree);
+}
+
+#[test]
+fn ubf_boolean_expression_callbacks_are_invoked() {
+    let _guard = endurox_test_env();
+    let ctx = AtmiCtx::new().expect("failed to create AtmiCtx");
+    let mut ubf = ctx.tpalloc_ubf(4096).expect("tpalloc_ubf failed");
+
+    ubf.bchg(ubf_fields::T_LONG_FLD, 0, 77_i64, false)
+        .expect("long Bchg failed");
+
+    ctx.bboolsetcbf("rust_long_is_77", rust_long_is_77)
+        .expect("Bboolsetcbf failed");
+    ctx.bboolsetcbf2("rust_long_arg", rust_long_arg)
+        .expect("Bboolsetcbf2 failed");
+
+    assert!(ubf
+        .bqboolev("rust_long_is_77()")
+        .expect("callback expression failed"));
+    assert!(ubf
+        .bqboolev("rust_long_arg('77')")
+        .expect("callback expression with arg failed"));
+}
+
+#[test]
+fn ubf_print_wrappers_are_callable() {
+    let _guard = endurox_test_env();
+    let ctx = AtmiCtx::new().expect("failed to create AtmiCtx");
+    let mut ubf = ctx.tpalloc_ubf(4096).expect("tpalloc_ubf failed");
+
+    ubf.bchg(ubf_fields::T_STRING_FLD, 0, "printable", false)
+        .expect("string Bchg failed");
+
+    ubf.bprint().expect("BPrint failed");
+    ubf.tplogprintubf(1, "rust ubf print test")
+        .expect("TpLogPrintUBF failed");
+}
+
+fn rust_long_is_77(ubf: &TypedUbf<'_>, _funcname: &str) -> i64 {
+    (ubf.bget_long(ubf_fields::T_LONG_FLD, 0).ok() == Some(77)) as i64
+}
+
+fn rust_long_arg(ubf: &TypedUbf<'_>, _funcname: &str, arg: &str) -> i64 {
+    let expected = arg.parse::<i64>().unwrap_or_default();
+    (ubf.bget_long(ubf_fields::T_LONG_FLD, 0).ok() == Some(expected)) as i64
 }
 
 #[test]
@@ -396,6 +627,9 @@ fn provision_endurox_env() {
 set -euo pipefail
 cd "$NDRX_RS_UNIT_TEST_DIR"
 if [ -f "$HOME/ndrx_home" ]; then
+    export CDPATH="${CDPATH:-}"
+    export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+    export DYLD_FALLBACK_LIBRARY_PATH="${DYLD_FALLBACK_LIBRARY_PATH:-}"
     . "$HOME/ndrx_home"
 fi
 rm -f conf/app.ini conf/settest1
@@ -403,6 +637,9 @@ mkdir -p log
 find log -type f -exec rm -f {} +
 xadmin provision -d -vaddubf="$NDRX_RS_UNIT_UBF_FILE" >/dev/null
 . conf/settest1
+export NDRX_CONFIG="$NDRX_RS_UNIT_TEST_DIR/conf/ndrxconfig.xml"
+export FLDTBLDIR="$(dirname "$NDRX_RS_UNIT_UBF_FILE")"
+export FIELDTBLS="$(basename "$NDRX_RS_UNIT_UBF_FILE")"
 unset NDRX_DEBUG_CONF
 export NDRX_DEBUG_STR="file=$NDRX_RS_UNIT_TEST_DIR/log/ubf-tests.log ndrx=5"
 env

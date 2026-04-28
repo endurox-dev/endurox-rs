@@ -9,13 +9,28 @@ use core::ffi::{c_char, c_long};
 pub struct TypedBuffer<'ctx> {
     ptr: *mut c_char,
     pub(crate) ctx: &'ctx AtmiCtx,
+    owned: bool,
 }
 
 impl<'ctx> TypedBuffer<'ctx> {
     /// # Safety
     /// `raw` must be a valid `atmibuf*` allocated for this context and owned by the caller.
     pub(crate) unsafe fn from_raw(ctx: &'ctx AtmiCtx, raw: *mut c_char) -> Self {
-        Self { ptr: raw, ctx }
+        Self {
+            ptr: raw,
+            ctx,
+            owned: true,
+        }
+    }
+
+    /// # Safety
+    /// `raw` must be a valid `atmibuf*` owned by the caller for at least `'ctx`.
+    pub(crate) unsafe fn borrowed_from_raw(ctx: &'ctx AtmiCtx, raw: *mut c_char) -> Self {
+        Self {
+            ptr: raw,
+            ctx,
+            owned: false,
+        }
     }
 
     /// Transfer ownership of the underlying ATMI buffer pointer.
@@ -71,7 +86,7 @@ impl<'ctx> TypedBuffer<'ctx> {
 
 impl<'ctx> Drop for TypedBuffer<'ctx> {
     fn drop(&mut self) {
-        if !self.ptr.is_null() {
+        if self.owned && !self.ptr.is_null() {
             unsafe { raw::tpfree(self.ptr) }
         }
     }
