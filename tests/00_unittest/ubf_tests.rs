@@ -636,12 +636,24 @@ rm -f conf/app.ini conf/settest1
 mkdir -p log
 find log -type f -exec rm -f {} +
 xadmin provision -d -vaddubf="$NDRX_RS_UNIT_UBF_FILE" >/dev/null
+python3 -c "
+import os, re
+path = os.environ['NDRX_RS_UNIT_UBF_FILE']
+d = os.path.dirname(path)
+b = os.path.basename(path)
+with open('conf/app.ini') as f:
+    txt = f.read()
+txt = re.sub(r'FIELDTBLS=Exfields,[^\n]+', 'FIELDTBLS=Exfields,' + b, txt)
+txt = re.sub(r'(FLDTBLDIR=[^\n]+)', r'\1:' + d, txt)
+with open('conf/app.ini', 'w') as f:
+    f.write(txt)
+"
 . conf/settest1
 export NDRX_CONFIG="$NDRX_RS_UNIT_TEST_DIR/conf/ndrxconfig.xml"
 export FLDTBLDIR="$(dirname "$NDRX_RS_UNIT_UBF_FILE")"
 export FIELDTBLS="$(basename "$NDRX_RS_UNIT_UBF_FILE")"
 unset NDRX_DEBUG_CONF
-export NDRX_DEBUG_STR="file=$NDRX_RS_UNIT_TEST_DIR/log/ubf-tests.log ndrx=5"
+#export NDRX_DEBUG_STR="file=$NDRX_RS_UNIT_TEST_DIR/log/ubf-tests.log ndrx=5"
 env
 "#,
             )

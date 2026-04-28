@@ -2,11 +2,8 @@ use crate::raw::*;
 use crate::{raw, AtmiCtx, BorrowedUbf, TypedUbf, UbfResult};
 use core::ffi::{c_char, c_int, c_long, c_void};
 use std::collections::HashMap;
-use std::env;
 use std::ffi::{CStr, CString};
-use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 /// Fast-add location state used by [`TypedUbf::badd_fast`](crate::TypedUbf::badd_fast).
@@ -75,62 +72,6 @@ fn expr_callbacks2() -> &'static Mutex<HashMap<String, UbfExprCallback2>> {
     CALLBACKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn field_table_paths() -> Vec<PathBuf> {
-    let dirs: Vec<PathBuf> = env::var("FLDTBLDIR")
-        .unwrap_or_default()
-        .split(':')
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .collect();
-
-    env::var("FIELDTBLS")
-        .unwrap_or_default()
-        .split(',')
-        .filter(|s| !s.is_empty())
-        .flat_map(|name| {
-            let path = PathBuf::from(name);
-            if path.is_absolute() {
-                vec![path]
-            } else {
-                dirs.iter().map(|dir| dir.join(name)).collect()
-            }
-        })
-        .collect()
-}
-
-fn parse_field_table_line(line: &str, base: i32) -> Option<(&str, i32, UbfFieldType)> {
-    let line = line.trim();
-    if line.is_empty() || line.starts_with('$') || line.starts_with('#') || line.starts_with('*') {
-        return None;
-    }
-
-    let mut parts = line.split_whitespace();
-    let name = parts.next()?;
-    let number = parts.next()?.parse::<i32>().ok()? + base;
-    let field_type = match parts.next()? {
-        "short" => UbfFieldType::Short,
-        "long" => UbfFieldType::Long,
-        "char" => UbfFieldType::Char,
-        "float" => UbfFieldType::Float,
-        "double" => UbfFieldType::Double,
-        "string" => UbfFieldType::String,
-        "carray" => UbfFieldType::Carray,
-        "ptr" => UbfFieldType::Ptr,
-        "ubf" | "fml32" => UbfFieldType::Ubf,
-        "view" | "view32" => UbfFieldType::View,
-        _ => return None,
-    };
-    Some((name, number, field_type))
-}
-
-fn parse_field_table_base(line: &str, base: &mut i32) {
-    let line = line.trim();
-    if let Some(value) = line.strip_prefix("*base") {
-        if let Ok(parsed) = value.trim().parse::<i32>() {
-            *base = parsed;
-        }
-    }
-}
 
 unsafe extern "C" fn output_callback(
     buffer: *mut c_char,
@@ -370,44 +311,6 @@ impl AtmiCtx {
         unsafe {
             raw::OBstrerror(self.c_ctx_ptr(), err)
         }
-    }
-
-    fn bfldid_from_field_tables(&self, field_name: &str) -> Option<i32> {
-        for path in field_table_paths() {
-            let Ok(contents) = fs::read_to_string(path) else {
-                continue;
-            };
-            let mut base = 0;
-            for line in contents.lines() {
-                parse_field_table_base(line, &mut base);
-                let Some((name, number, field_type)) = parse_field_table_line(line, base) else {
-                    continue;
-                };
-                if name == field_name {
-                    return Some(self.bmkfldid_typed(field_type, number));
-                }
-            }
-        }
-        None
-    }
-
-    fn bfname_from_field_tables(&self, bfldid: BFLDID) -> Option<String> {
-        for path in field_table_paths() {
-            let Ok(contents) = fs::read_to_string(path) else {
-                continue;
-            };
-            let mut base = 0;
-            for line in contents.lines() {
-                parse_field_table_base(line, &mut base);
-                let Some((name, number, field_type)) = parse_field_table_line(line, base) else {
-                    continue;
-                };
-                if self.bmkfldid_typed(field_type, number) == bfldid {
-                    return Some(name.to_string());
-                }
-            }
-        }
-        None
     }
 
     #[inline]
@@ -919,7 +822,7 @@ impl AtmiCtx {
                     .strip_prefix("((BFLDID32)")
                     .and_then(|s| s.strip_suffix(')'))
                     .and_then(|id| id.parse::<i32>().ok())
-                    .and_then(|id| self.bfname_from_field_tables(id));
+                    .and_then(|id| self.bfname(id as BFLDID).ok());
                 if let Some(name) = name {
                     out.push_str(&name);
                 } else {
@@ -1154,8 +1057,7 @@ impl AtmiCtx {
         }
 
         if rc <= 0 {
-            self.bfldid_from_field_tables(field_name)
-                .ok_or_else(|| self.ubf_last_error())
+            Err(self.ubf_last_error())
         } else {
             Ok(rc as i32)
         }
@@ -1190,10 +1092,6 @@ impl AtmiCtx {
                 .to_string_lossy()
                 .into_owned())
         }
-        .or_else(|_| {
-            self.bfname_from_field_tables(bfldid)
-                .ok_or_else(|| self.ubf_last_error())
-        })
     }
 
     /// Return the untyped field number portion of a typed field id.
