@@ -14,6 +14,11 @@ homepage = "https://www.mavimax.com"
 documentation = "https://www.endurox.org/dokuwiki"
 keywords = ["middleware", "development", "endurox", "bindings", "rust"]
 categories = ["development-tools"]
+exclude = [
+    "CLAUDE.md",
+    "target/**",
+    "endurox-rs-derive/target/**",
+]
 
 [dependencies]
 endurox-rs-derive = { version = "0.1.0", path = "endurox-rs-derive" }
