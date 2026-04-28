@@ -4,7 +4,9 @@ use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use endurox_rs::{
-    ubf_fields, AtmiCtx, BFldLocInfo, TypedBuffer, TypedUbf, UbfFieldType, UbfGetValue, UbfValue,
+    ubf_fields, ubf_read_adhoc, ubf_read_nested, ubf_write_nested, AtmiCtx, BFldLocInfo,
+    TypedBuffer, TypedUbf, UbfCarray, UbfDeserialize, UbfFieldDeserialize, UbfFieldSerialize,
+    UbfFieldType, UbfGetValue, UbfResult, UbfSerialize, UbfValue,
 };
 
 #[test]
@@ -143,6 +145,160 @@ fn ubf_add_and_into_value_helpers_append_occurrences() {
         "second"
     );
     assert_eq!(ubf.bget_long(ubf_fields::T_LONG_FLD, 0).unwrap(), 42);
+}
+
+#[derive(Debug, PartialEq)]
+struct SerdeChild {
+    code: i64,
+    note: String,
+}
+
+impl UbfSerialize for SerdeChild {
+    fn ubf_serialize<'ctx>(&self, ubf: &mut TypedUbf<'ctx>, realloc: bool) -> UbfResult<()> {
+        self.code
+            .ubf_write_field(ubf, ubf_fields::T_LONG_3_FLD, 0, realloc)?;
+        self.note
+            .ubf_write_field(ubf, ubf_fields::T_STRING_3_FLD, 0, realloc)
+    }
+}
+
+impl UbfDeserialize for SerdeChild {
+    fn ubf_deserialize<'ctx>(ubf: &TypedUbf<'ctx>) -> UbfResult<Self> {
+        Ok(Self {
+            code: i64::ubf_read_field(ubf, ubf_fields::T_LONG_3_FLD, 0)?,
+            note: String::ubf_read_field(ubf, ubf_fields::T_STRING_3_FLD, 0)?,
+        })
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct SerdeParent {
+    name: String,
+    values: Vec<i64>,
+    maybe_note: Option<String>,
+    blobs: Vec<UbfCarray>,
+    child: SerdeChild,
+    adhoc_note: String,
+}
+
+impl UbfSerialize for SerdeParent {
+    fn ubf_serialize<'ctx>(&self, ubf: &mut TypedUbf<'ctx>, realloc: bool) -> UbfResult<()> {
+        self.name
+            .ubf_write_field(ubf, ubf_fields::T_STRING_FLD, 0, realloc)?;
+        self.values
+            .ubf_write_field(ubf, ubf_fields::T_LONG_FLD, 0, realloc)?;
+        self.maybe_note
+            .ubf_write_field(ubf, ubf_fields::T_STRING_2_FLD, 0, realloc)?;
+        self.blobs
+            .ubf_write_field(ubf, ubf_fields::T_CARRAY_FLD, 0, realloc)?;
+        ubf_write_nested(ubf, ubf_fields::T_UBF_FLD, 0, &self.child, 1024, realloc)?;
+
+        let mut adhoc = ubf.ctx().tpalloc_ubf(1024).map_err(|e| {
+            endurox_rs::UbfError::new(
+                endurox_rs::UbfError::BMALLOC,
+                format!("failed to allocate ad-hoc UBF: {}", e.message),
+            )
+        })?;
+        adhoc.bchg(
+            ubf_fields::T_STRING_4_FLD,
+            0,
+            self.adhoc_note.as_str(),
+            realloc,
+        )?;
+        ubf.bchg(ubf_fields::T_UBF_2_FLD, 0, adhoc, realloc)
+    }
+}
+
+impl UbfDeserialize for SerdeParent {
+    fn ubf_deserialize<'ctx>(ubf: &TypedUbf<'ctx>) -> UbfResult<Self> {
+        Ok(Self {
+            name: String::ubf_read_field(ubf, ubf_fields::T_STRING_FLD, 0)?,
+            values: Vec::<i64>::ubf_read_field(ubf, ubf_fields::T_LONG_FLD, 0)?,
+            maybe_note: Option::<String>::ubf_read_field(ubf, ubf_fields::T_STRING_2_FLD, 0)?,
+            blobs: Vec::<UbfCarray>::ubf_read_field(ubf, ubf_fields::T_CARRAY_FLD, 0)?,
+            child: ubf_read_nested(ubf, ubf_fields::T_UBF_FLD, 0)?,
+            adhoc_note: ubf_read_adhoc(ubf, ubf_fields::T_UBF_2_FLD, 0, |nested| {
+                nested.bget_string(ubf_fields::T_STRING_4_FLD, 0)
+            })?,
+        })
+    }
+}
+
+#[test]
+fn ubf_serde_runtime_maps_repeated_optional_and_nested_fields() {
+    let _guard = endurox_test_env();
+    let ctx = AtmiCtx::new().expect("failed to create AtmiCtx");
+    let mut ubf = ctx.tpalloc_ubf(4096).expect("tpalloc_ubf failed");
+
+    let source = SerdeParent {
+        name: "parent".to_string(),
+        values: vec![10, 20, 30],
+        maybe_note: Some("optional".to_string()),
+        blobs: vec![UbfCarray(vec![1, 2, 3]), UbfCarray(vec![4, 5])],
+        child: SerdeChild {
+            code: 777,
+            note: "nested".to_string(),
+        },
+        adhoc_note: "free-form nested".to_string(),
+    };
+
+    ubf.ubf_write(&source, true).expect("UBF serialize failed");
+    let decoded: SerdeParent = ubf.ubf_read().expect("UBF deserialize failed");
+
+    assert_eq!(decoded, source);
+}
+
+#[derive(Debug, PartialEq, UbfSerialize, UbfDeserialize)]
+struct TaggedSerdeChild {
+    #[ubf(field = ubf_fields::T_LONG_3_FLD)]
+    code: i64,
+    #[ubf(field = ubf_fields::T_STRING_3_FLD)]
+    note: String,
+}
+
+#[derive(Debug, PartialEq, UbfSerialize, UbfDeserialize)]
+struct TaggedSerdeParent {
+    #[ubf(field = ubf_fields::T_STRING_FLD)]
+    name: String,
+    #[ubf(field = ubf_fields::T_LONG_FLD)]
+    values: Vec<i64>,
+    #[ubf(field = ubf_fields::T_STRING_2_FLD)]
+    maybe_note: Option<String>,
+    #[ubf(field = ubf_fields::T_CARRAY_FLD)]
+    blobs: Vec<UbfCarray>,
+    #[ubf(field = ubf_fields::T_UBF_FLD, nested, size = 1024)]
+    child: TaggedSerdeChild,
+}
+
+#[test]
+fn ubf_serde_derive_uses_field_tags_and_nested_structs() {
+    let _guard = endurox_test_env();
+    let ctx = AtmiCtx::new().expect("failed to create AtmiCtx");
+    let mut ubf = ctx.tpalloc_ubf(4096).expect("tpalloc_ubf failed");
+
+    let source = TaggedSerdeParent {
+        name: "tagged".to_string(),
+        values: vec![100, 200],
+        maybe_note: None,
+        blobs: vec![UbfCarray(vec![9, 8, 7])],
+        child: TaggedSerdeChild {
+            code: 321,
+            note: "tagged child".to_string(),
+        },
+    };
+
+    ubf.ubf_write(&source, true)
+        .expect("derive serialize failed");
+
+    assert_eq!(
+        ubf.bget_string(ubf_fields::T_STRING_FLD, 0).unwrap(),
+        "tagged"
+    );
+    assert_eq!(ubf.bget_long(ubf_fields::T_LONG_FLD, 1).unwrap(), 200);
+    assert!(!ubf.ctx().bpres(&ubf, ubf_fields::T_STRING_2_FLD, 0));
+
+    let decoded: TaggedSerdeParent = ubf.ubf_read().expect("derive deserialize failed");
+    assert_eq!(decoded, source);
 }
 
 #[test]

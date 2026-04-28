@@ -16,6 +16,7 @@ keywords = ["middleware", "development", "endurox", "bindings", "rust"]
 categories = ["development-tools"]
 
 [dependencies]
+endurox-rs-derive = { path = "endurox-rs-derive" }
 libc = "0.2"
 
 [build-dependencies]

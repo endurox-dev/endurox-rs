@@ -6,6 +6,8 @@
 )]
 use std::ffi::CStr;
 
+pub use endurox_rs_derive::{UbfDeserialize, UbfSerialize};
+
 pub(crate) mod raw {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
@@ -27,6 +29,7 @@ mod typed_buf;
 mod typed_ubf;
 mod typed_view;
 mod types;
+mod ubf_serde;
 
 pub use atmictx::AtmiCtx;
 pub use atmictx_log::LogLevel;
@@ -47,6 +50,10 @@ pub use typed_ubf::{
 };
 pub use typed_view::{BvNextState, IntoViewValue, TypedView, ViewValue, BVACCESS_NOTNULL};
 pub use types::{ClientId, TpContext, TpTranId};
+pub use ubf_serde::{
+    ubf_read_adhoc, ubf_read_nested, ubf_write_adhoc, ubf_write_nested, UbfAdhoc, UbfCarray,
+    UbfDeserialize, UbfFieldDeserialize, UbfFieldSerialize, UbfSerialize,
+};
 
 pub const TPQCORRID: i64 = raw::TPQCORRID as i64;
 pub const TPQFAILUREQ: i64 = raw::TPQFAILUREQ as i64;

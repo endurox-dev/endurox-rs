@@ -184,8 +184,8 @@ pub struct UbfIterator<'a, 'ctx> {
 /// tied to the parent UBF borrowed by [`TypedUbf::bget_ubf`].
 #[derive(Debug)]
 pub struct BorrowedUbf<'a, 'ctx> {
-    ptr: *mut raw::UBFH,
-    ctx: &'ctx AtmiCtx,
+    pub(crate) ptr: *mut raw::UBFH,
+    pub(crate) ctx: &'ctx AtmiCtx,
     _borrow: std::marker::PhantomData<&'a raw::UBFH>,
 }
 
@@ -251,6 +251,11 @@ impl<'ctx> TypedUbf<'ctx> {
     /// buffer, for example because it came from `tpalloc("UBF", ...)`.
     pub fn from_typed(buf: TypedBuffer<'ctx>) -> Self {
         TypedUbf { inner: buf }
+    }
+
+    /// Return the ATMI context that owns this UBF buffer.
+    pub fn ctx(&self) -> &'ctx AtmiCtx {
+        self.inner.ctx
     }
 
     /// Return the underlying generic typed buffer wrapper.
