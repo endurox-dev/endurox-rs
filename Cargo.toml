@@ -1,6 +1,6 @@
 [package]
 name = "endurox-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 # REQUIRED by crates.io
@@ -16,7 +16,7 @@ keywords = ["middleware", "development", "endurox", "bindings", "rust"]
 categories = ["development-tools"]
 
 [dependencies]
-endurox-rs-derive = { path = "endurox-rs-derive" }
+endurox-rs-derive = { version = "0.1.0", path = "endurox-rs-derive" }
 libc = "0.2"
 
 [build-dependencies]

@@ -2,7 +2,11 @@
 name = "endurox-rs-derive"
 version = "0.1.0"
 edition = "2021"
-publish = false
+description = "Derive macros for endurox-rs UBF serde support."
+license = "AGPL-3.0"
+repository = "https://github.com/endurox-dev/endurox-rs"
+homepage = "https://www.mavimax.com"
+documentation = "https://www.endurox.org/dokuwiki"
 
 [lib]
 proc-macro = true
