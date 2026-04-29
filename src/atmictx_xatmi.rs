@@ -189,6 +189,23 @@ impl AtmiCtx {
         self.tpgetrply_polled(&mut cd, odata, flags, timeout)
     }
 
+    /// Tokio-native variant of [`AtmiCtx::tpcall_polled`].
+    ///
+    /// This uses Enduro/X's pollable reply queue fd with `tokio::io::unix::AsyncFd`
+    /// instead of blocking the current thread in `poll(2)`.
+    #[cfg(all(endurox_epoll, feature = "tokio"))]
+    pub async fn tpcall_async(
+        &self,
+        svc: &str,
+        idata: &TypedBuffer<'_>,
+        odata: &mut TypedBuffer<'_>,
+        flags: i64,
+        timeout: Option<Duration>,
+    ) -> AtmiResult<()> {
+        let mut cd = self.tpacall(svc, idata, flags)?;
+        self.tpgetrply_async(&mut cd, odata, flags, timeout).await
+    }
+
     #[cfg(endurox_epoll)]
     fn tpgetrply_polled(
         &self,
@@ -221,6 +238,71 @@ impl AtmiCtx {
                 Err(err) if err.code == raw::TPEBLOCK => continue,
                 Err(err) => return Err(err),
             }
+        }
+    }
+
+    /// Tokio-native reply wait for a call descriptor returned by [`AtmiCtx::tpacall`].
+    ///
+    /// The method first attempts `tpgetrply(TPNOBLOCK)`, then awaits readiness on
+    /// the Enduro/X reply queue fd and retries. `timeout` is a total deadline for
+    /// the whole wait, not a per-readiness timeout.
+    #[cfg(all(endurox_epoll, feature = "tokio"))]
+    pub async fn tpgetrply_async(
+        &self,
+        cd: &mut i32,
+        data: &mut TypedBuffer<'_>,
+        flags: i64,
+        timeout: Option<Duration>,
+    ) -> AtmiResult<()> {
+        let reply_fd = self.reply_queue_fd()?;
+        let async_fd = tokio::io::unix::AsyncFd::new(reply_fd).map_err(|err| {
+            AtmiError::new(
+                raw::TPEOS,
+                format!("failed to register Enduro/X reply queue fd with Tokio: {err}"),
+            )
+        })?;
+        let deadline = timeout.map(|t| tokio::time::Instant::now() + t);
+        let get_flags = flags | raw::TPNOBLOCK as i64;
+
+        loop {
+            match self.tpgetrply(cd, data, get_flags) {
+                Ok(()) => return Ok(()),
+                Err(err) if err.code == raw::TPEBLOCK => {}
+                Err(err) => return Err(err),
+            }
+
+            let mut guard = match deadline {
+                Some(deadline) => tokio::time::timeout_at(deadline, async_fd.readable())
+                    .await
+                    .map_err(|_| {
+                        let _ = self.tpcancel(*cd);
+                        AtmiError::new(raw::TPETIME, "Tokio tpcall timed out")
+                    })?,
+                None => async_fd.readable().await,
+            }
+            .map_err(|err| {
+                AtmiError::new(
+                    raw::TPEOS,
+                    format!("Tokio wait on Enduro/X reply queue failed: {err}"),
+                )
+            })?;
+
+            guard.clear_ready();
+        }
+    }
+
+    #[cfg(endurox_epoll)]
+    fn reply_queue_fd(&self) -> AtmiResult<c_int> {
+        #[cfg(not(feature = "ctx-send"))]
+        let reply_fd = unsafe { raw::tpext_getreplyqfd() };
+
+        #[cfg(feature = "ctx-send")]
+        let reply_fd = unsafe { raw::Otpext_getreplyqfd(self.c_ctx_ptr()) };
+
+        if reply_fd < 0 {
+            Err(self.atmi_last_error())
+        } else {
+            Ok(reply_fd)
         }
     }
 

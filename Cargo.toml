@@ -23,6 +23,7 @@ exclude = [
 [dependencies]
 endurox-rs-derive = { version = "0.1.0", path = "endurox-rs-derive" }
 libc = "0.2"
+tokio = { version = "1", features = ["net", "time"], optional = true }
 
 [build-dependencies]
 bindgen = "0.70"        # pin a version for stability
@@ -31,6 +32,7 @@ cc = "1.0"
 [features]
 # default = []     # default: !Send & !Sync
 ctx-send = []      # enable to make AtmiCtx: Send & !Sync
+tokio = ["dep:tokio"] # enable Tokio-native async helpers for pollable Enduro/X builds
 
 [[test]]
 name = "atmictx_tests"
