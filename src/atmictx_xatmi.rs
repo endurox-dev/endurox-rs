@@ -9,12 +9,32 @@ use std::time::Duration;
 use std::time::Instant;
 
 impl AtmiCtx {
-    /// Synchronous RPC call.  The typed buffer is used as both input and response;
-    /// the internal pointer may be updated if the framework reallocates it.
-    pub fn tpcall(&self, svc: &str, data: &mut TypedBuffer<'_>, flags: i64) -> AtmiResult<()> {
+    /// Synchronous RPC call with separate input and output buffers.
+    ///
+    /// This mirrors the C API: `idata` is the request buffer, and `odata` is the
+    /// reply buffer. Enduro/X may reallocate `odata`; on success this wrapper is
+    /// updated to the returned pointer.
+    pub fn tpcall(
+        &self,
+        svc: &str,
+        idata: &TypedBuffer<'_>,
+        odata: &mut TypedBuffer<'_>,
+        flags: i64,
+    ) -> AtmiResult<()> {
+        let mut reply = odata.as_ptr();
+        self.tpcall_raw(svc, idata.as_ptr(), &mut reply, flags)?;
+        odata.replace_ptr(reply);
+        Ok(())
+    }
+
+    fn tpcall_raw(
+        &self,
+        svc: &str,
+        idata: *mut c_char,
+        odata: &mut *mut c_char,
+        flags: i64,
+    ) -> AtmiResult<()> {
         let c_svc = CString::new(svc).map_err(|_| self.atmi_last_error())?;
-        let idata = data.as_ptr();
-        let mut odata = data.as_ptr();
         let mut olen: c_long = 0;
 
         #[cfg(not(feature = "ctx-send"))]
@@ -23,7 +43,7 @@ impl AtmiCtx {
                 c_svc.as_ptr() as *mut c_char,
                 idata,
                 0,
-                &mut odata,
+                odata,
                 &mut olen,
                 flags as c_long,
             )
@@ -36,14 +56,13 @@ impl AtmiCtx {
                 c_svc.as_ptr() as *mut c_char,
                 idata,
                 0,
-                &mut odata,
+                odata,
                 &mut olen,
                 flags as c_long,
             )
         };
 
         if rc == raw::EXSUCCEED as c_int {
-            data.replace_ptr(odata);
             Ok(())
         } else {
             Err(self.atmi_last_error())
@@ -140,19 +159,20 @@ impl AtmiCtx {
     pub fn tpcall_polled(
         &self,
         svc: &str,
-        data: &mut TypedBuffer<'_>,
+        idata: &TypedBuffer<'_>,
+        odata: &mut TypedBuffer<'_>,
         flags: i64,
         timeout: Option<Duration>,
     ) -> AtmiResult<()> {
         #[cfg(not(endurox_epoll))]
         {
             let _ = timeout;
-            return self.tpcall(svc, data, flags);
+            return self.tpcall(svc, idata, odata, flags);
         }
 
         #[cfg(endurox_epoll)]
         {
-            return self.tpcall_epoll(svc, data, flags, timeout);
+            return self.tpcall_epoll(svc, idata, odata, flags, timeout);
         }
     }
 
@@ -160,6 +180,19 @@ impl AtmiCtx {
     fn tpcall_epoll(
         &self,
         svc: &str,
+        idata: &TypedBuffer<'_>,
+        odata: &mut TypedBuffer<'_>,
+        flags: i64,
+        timeout: Option<Duration>,
+    ) -> AtmiResult<()> {
+        let mut cd = self.tpacall(svc, idata, flags)?;
+        self.tpgetrply_polled(&mut cd, odata, flags, timeout)
+    }
+
+    #[cfg(endurox_epoll)]
+    fn tpgetrply_polled(
+        &self,
+        cd: &mut i32,
         data: &mut TypedBuffer<'_>,
         flags: i64,
         timeout: Option<Duration>,
@@ -174,17 +207,16 @@ impl AtmiCtx {
             return Err(self.atmi_last_error());
         }
 
-        let mut cd = self.tpacall(svc, data, flags)?;
         let deadline = timeout.map(|t| Instant::now() + t);
         let get_flags = flags | raw::TPNOBLOCK as i64;
 
         loop {
             if !self.poll_reply_queue(reply_fd, deadline)? {
-                let _ = self.tpcancel(cd);
+                let _ = self.tpcancel(*cd);
                 return Err(AtmiError::new(raw::TPETIME, "polled tpcall timed out"));
             }
 
-            match self.tpgetrply(&mut cd, data, get_flags) {
+            match self.tpgetrply(cd, data, get_flags) {
                 Ok(()) => return Ok(()),
                 Err(err) if err.code == raw::TPEBLOCK => continue,
                 Err(err) => return Err(err),
@@ -943,13 +975,13 @@ impl AtmiCtx {
         &self,
         qspace: &str,
         qname: &str,
-        ctl: Option<&mut crate::TpQCtl>,
+        ctl: &mut crate::TpQCtl,
         data: &TypedBuffer<'_>,
         flags: i64,
     ) -> AtmiResult<()> {
         let c_qspace = CString::new(qspace).map_err(|_| self.atmi_last_error())?;
         let c_qname = CString::new(qname).map_err(|_| self.atmi_last_error())?;
-        let ctl_ptr = ctl.map_or(ptr::null_mut(), |ctl| ctl.as_mut_ptr());
+        let ctl_ptr = ctl.as_mut_ptr();
 
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe {
@@ -984,12 +1016,12 @@ impl AtmiCtx {
         &'ctx self,
         qspace: &str,
         qname: &str,
-        ctl: Option<&mut crate::TpQCtl>,
+        ctl: &mut crate::TpQCtl,
         flags: i64,
     ) -> AtmiResult<TypedBuffer<'ctx>> {
         let c_qspace = CString::new(qspace).map_err(|_| self.atmi_last_error())?;
         let c_qname = CString::new(qname).map_err(|_| self.atmi_last_error())?;
-        let ctl_ptr = ctl.map_or(ptr::null_mut(), |ctl| ctl.as_mut_ptr());
+        let ctl_ptr = ctl.as_mut_ptr();
         let mut odata: *mut c_char = ptr::null_mut();
         let mut olen: c_long = 0;
 
@@ -1030,12 +1062,12 @@ impl AtmiCtx {
         nodeid: i16,
         srvid: i16,
         qname: &str,
-        ctl: Option<&mut crate::TpQCtl>,
+        ctl: &mut crate::TpQCtl,
         data: &TypedBuffer<'_>,
         flags: i64,
     ) -> AtmiResult<()> {
         let c_qname = CString::new(qname).map_err(|_| self.atmi_last_error())?;
-        let ctl_ptr = ctl.map_or(ptr::null_mut(), |ctl| ctl.as_mut_ptr());
+        let ctl_ptr = ctl.as_mut_ptr();
 
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe {
@@ -1073,11 +1105,11 @@ impl AtmiCtx {
         nodeid: i16,
         srvid: i16,
         qname: &str,
-        ctl: Option<&mut crate::TpQCtl>,
+        ctl: &mut crate::TpQCtl,
         flags: i64,
     ) -> AtmiResult<TypedBuffer<'ctx>> {
         let c_qname = CString::new(qname).map_err(|_| self.atmi_last_error())?;
-        let ctl_ptr = ctl.map_or(ptr::null_mut(), |ctl| ctl.as_mut_ptr());
+        let ctl_ptr = ctl.as_mut_ptr();
         let mut odata: *mut c_char = ptr::null_mut();
         let mut olen: c_long = 0;
 

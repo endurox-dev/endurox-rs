@@ -40,14 +40,14 @@ fn enqueue_str(ctx: &AtmiCtx, value: &str) -> Result<(), String> {
     buf.bchg(ubf_fields::T_STRING_FLD, 0, value, true)
         .map_err(|e| format!("bchg failed: {e}"))?;
     let mut ctl = TpQCtl::default();
-    ctx.tpenqueue(QSPACE, QNAME, Some(&mut ctl), &buf, 0)
+    ctx.tpenqueue(QSPACE, QNAME, &mut ctl, &buf, 0)
         .map_err(|e| format!("tpenqueue `{value}` failed: {e}"))
 }
 
 fn dequeue_str(ctx: &AtmiCtx) -> Result<String, String> {
     let mut ctl = TpQCtl::default();
     let buf = ctx
-        .tpdequeue(QSPACE, QNAME, Some(&mut ctl), 0)
+        .tpdequeue(QSPACE, QNAME, &mut ctl, 0)
         .map_err(|e| format!("tpdequeue failed: {e}"))?;
     let ubf = TypedUbf::from_typed(buf);
     ubf.bget_string(ubf_fields::T_STRING_FLD, 0)
@@ -83,7 +83,7 @@ fn run_corrid(ctx: &AtmiCtx) -> Result<(), String> {
         .set_corrid(&corrid)
         .map_err(|e| format!("set_corrid failed: {e}"))?;
     enq_ctl.add_flags(TPQCORRID);
-    ctx.tpenqueue(QSPACE, QNAME, Some(&mut enq_ctl), &buf, 0)
+    ctx.tpenqueue(QSPACE, QNAME, &mut enq_ctl, &buf, 0)
         .map_err(|e| format!("tpenqueue (corrid) failed: {e}"))?;
 
     let mut deq_ctl = TpQCtl::default();
@@ -92,7 +92,7 @@ fn run_corrid(ctx: &AtmiCtx) -> Result<(), String> {
         .map_err(|e| format!("set_corrid (deq) failed: {e}"))?;
     deq_ctl.add_flags(TPQGETBYCORRID);
     let dequeued = ctx
-        .tpdequeue(QSPACE, QNAME, Some(&mut deq_ctl), 0)
+        .tpdequeue(QSPACE, QNAME, &mut deq_ctl, 0)
         .map_err(|e| format!("tpdequeue (by corrid) failed: {e}"))?;
     let ubf = TypedUbf::from_typed(dequeued);
     let val = ubf

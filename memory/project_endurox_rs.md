@@ -31,8 +31,9 @@ fn my_svc(ctx: &AtmiCtx, svc: &mut TpSvcInfo) {
 ctx.tpinit()?;
 let mut buf = ctx.tpalloc_ubf(1024)?;
 buf.bchg(fld, 0, UbfValue::String("val".into()), true)?;
-ctx.tpcall("SVC", &mut buf, 0)?;
-let rsp = buf.bget_string(rsp_fld, 0)?;
+let mut rsp_buf = ctx.tpalloc_ubf(1024)?;
+ctx.tpcall("SVC", &buf, &mut rsp_buf, 0)?;
+let rsp = rsp_buf.bget_string(rsp_fld, 0)?;
 ctx.tpterm()?;
 ```
 

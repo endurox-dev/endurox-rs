@@ -21,32 +21,36 @@ fn run() -> Result<(), String> {
         .tpalloc_ubf(1024)
         .map_err(|e| format!("tpalloc_ubf failed: {e}"))?;
 
-    ctx.tpcall("RS_EXT_INSTALL", &mut buf, 0)
+    let mut rsp = ctx
+        .tpalloc_ubf(1024)
+        .map_err(|e| format!("reply tpalloc_ubf failed: {e}"))?;
+
+    ctx.tpcall("RS_EXT_INSTALL", &buf, &mut rsp, 0)
         .map_err(|e| format!("install tpcall failed: {e}"))?;
 
     let mut last_rsp = None;
     for _ in 0..10 {
         thread::sleep(Duration::from_millis(100));
 
-        ctx.tpcall("RS_EXT_STATUS", &mut buf, 0)
+        ctx.tpcall("RS_EXT_STATUS", &buf, &mut rsp, 0)
             .map_err(|e| format!("status tpcall failed: {e}"))?;
 
-        let rsp = buf
+        let status = rsp
             .bget_string(ubf_fields::T_STRING_2_FLD, 0)
             .map_err(|e| format!("failed to read extension status: {e}"))?;
 
-        if rsp.contains("ok=true") {
+        if status.contains("ok=true") {
             ctx.tpterm().map_err(|e| format!("tpterm failed: {e}"))?;
             return Ok(());
         }
 
-        last_rsp = Some(rsp);
+        last_rsp = Some(status);
     }
 
-    ctx.tpcall("RS_EXT_STATUS", &mut buf, 0)
+    ctx.tpcall("RS_EXT_STATUS", &buf, &mut rsp, 0)
         .map_err(|e| format!("final status tpcall failed: {e}"))?;
 
-    let final_rsp = buf
+    let final_rsp = rsp
         .bget_string(ubf_fields::T_STRING_2_FLD, 0)
         .map_err(|e| format!("failed to read extension status: {e}"))?;
 

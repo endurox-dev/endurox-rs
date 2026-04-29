@@ -65,12 +65,17 @@ fn run() -> Result<(), String> {
             .map_err(|e| format!("tpacall failed: {e}"))?;
         ctx.tpgetrply(&mut cd, &mut buf, 0)
             .map_err(|e| format!("tpgetrply failed: {e}"))?;
-    } else {
-        ctx.tpcall(svc, &mut buf, 0)
-            .map_err(|e| format!("tpcall failed: {e}"))?;
-    }
 
-    assert_response(&buf, rsp_fld, expected)?;
+        assert_response(&buf, rsp_fld, expected)?;
+    } else {
+        let mut rsp = ctx
+            .tpalloc_ubf(1024)
+            .map_err(|e| format!("reply tpalloc_ubf failed: {e}"))?;
+        ctx.tpcall(svc, &buf, &mut rsp, 0)
+            .map_err(|e| format!("tpcall failed: {e}"))?;
+
+        assert_response(&rsp, rsp_fld, expected)?;
+    }
 
     ctx.tpterm().map_err(|e| format!("tpterm failed: {e}"))?;
     Ok(())
