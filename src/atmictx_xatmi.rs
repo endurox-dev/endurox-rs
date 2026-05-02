@@ -539,6 +539,28 @@ impl AtmiCtx {
         self.rc_to_result(rc)
     }
 
+    /// Open the XA resource manager associated with this context.
+    pub fn tpopen(&self) -> AtmiResult<()> {
+        #[cfg(not(feature = "ctx-send"))]
+        let rc = unsafe { raw::tpopen() };
+
+        #[cfg(feature = "ctx-send")]
+        let rc = unsafe { raw::Otpopen(self.c_ctx_ptr()) };
+
+        self.rc_to_result(rc)
+    }
+
+    /// Close the XA resource manager associated with this context.
+    pub fn tpclose(&self) -> AtmiResult<()> {
+        #[cfg(not(feature = "ctx-send"))]
+        let rc = unsafe { raw::tpclose() };
+
+        #[cfg(feature = "ctx-send")]
+        let rc = unsafe { raw::Otpclose(self.c_ctx_ptr()) };
+
+        self.rc_to_result(rc)
+    }
+
     pub fn tpgetlev(&self) -> AtmiResult<i32> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpgetlev() };

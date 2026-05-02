@@ -48,7 +48,13 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LIBCLANG_PATH");
     println!("cargo:rustc-check-cfg=cfg(endurox_epoll)");
 
-    println!("cargo:rustc-link-lib=dylib=tux");
+    println!("cargo:rustc-link-lib=dylib=atmisrvinteg");
+    println!("cargo:rustc-link-lib=dylib=atmi");
+    println!("cargo:rustc-link-lib=dylib=ubf");
+    println!("cargo:rustc-link-lib=dylib=nstd");
+    println!("cargo:rustc-link-lib=dylib=pthread");
+    println!("cargo:rustc-link-lib=dylib=m");
+    println!("cargo:rustc-link-lib=dylib=dl");
 
     generate_ubf_field_constants();
 

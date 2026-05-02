@@ -55,7 +55,18 @@ fi
 
 sleep 2
 
+export NDRX_CCTAG=RM1TMQ
+
 for scenario in enqueue-dequeue corrid fifo; do
+    if ! "$PROJECT_DIR/target/debug/rs_dq_client" "$scenario"; then
+        dump_logs
+        exit 1
+    fi
+done
+
+# Transactional scenarios need the client to load XA settings from
+# the [@global/RM1TMQ] section of app.ini so tpopen()/tpbegin() succeed.
+for scenario in tx-commit tx-abort tx-suspend-resume; do
     if ! "$PROJECT_DIR/target/debug/rs_dq_client" "$scenario"; then
         dump_logs
         exit 1

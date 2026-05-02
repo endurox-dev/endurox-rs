@@ -1,7 +1,11 @@
-use endurox_rs::{ubf_fields, AtmiCtx, TpQCtl, TypedUbf, TPQCORRID, TPQGETBYCORRID};
+use endurox_rs::{ubf_fields, AtmiCtx, AtmiError, TpQCtl, TypedUbf, TPQCORRID, TPQGETBYCORRID};
 
 const QSPACE: &str = "SAMPLESPACE";
 const QNAME: &str = "TESTQ";
+
+// Diagnostic returned in TpQCtl when tpdequeue finds no message; matches
+// the C constant `QMENOMSG` from `xa_cmn.h`.
+const QMENOMSG: i64 = -11;
 
 fn main() {
     let rc = match run() {
@@ -26,6 +30,9 @@ fn run() -> Result<(), String> {
         "enqueue-dequeue" => run_enqueue_dequeue(&ctx),
         "corrid" => run_corrid(&ctx),
         "fifo" => run_fifo(&ctx),
+        "tx-commit" => run_tx_commit(&ctx),
+        "tx-abort" => run_tx_abort(&ctx),
+        "tx-suspend-resume" => run_tx_suspend_resume(&ctx),
         other => Err(format!("unknown scenario `{other}`")),
     };
 
@@ -118,5 +125,118 @@ fn run_fifo(ctx: &AtmiCtx) -> Result<(), String> {
             ));
         }
     }
+    Ok(())
+}
+
+fn expect_empty_queue(ctx: &AtmiCtx, label: &str) -> Result<(), String> {
+    let mut ctl = TpQCtl::default();
+    match ctx.tpdequeue(QSPACE, QNAME, &mut ctl, 0) {
+        Ok(_) => Err(format!("{label}: expected empty queue, but got a message")),
+        Err(e) if e.code == AtmiError::TPEDIAGNOSTIC && ctl.diagnostic() == QMENOMSG => Ok(()),
+        Err(e) => Err(format!(
+            "{label}: expected TPEDIAGNOSTIC/QMENOMSG, got code={} diag={} ({e})",
+            e.code,
+            ctl.diagnostic()
+        )),
+    }
+}
+
+fn run_tx_commit(ctx: &AtmiCtx) -> Result<(), String> {
+    ctx.tpopen().map_err(|e| format!("tpopen failed: {e}"))?;
+
+    expect_empty_queue(ctx, "tx-commit precondition")?;
+
+    ctx.tpbegin(60, 0)
+        .map_err(|e| format!("tpbegin failed: {e}"))?;
+    if let Err(e) = enqueue_str(ctx, "TX-COMMIT-MSG") {
+        let _ = ctx.tpabort(0);
+        let _ = ctx.tpclose();
+        return Err(e);
+    }
+    ctx.tpcommit(0)
+        .map_err(|e| format!("tpcommit failed: {e}"))?;
+
+    let val = dequeue_str(ctx)?;
+    if val != "TX-COMMIT-MSG" {
+        let _ = ctx.tpclose();
+        return Err(format!(
+            "tx-commit: expected `TX-COMMIT-MSG`, got `{val}`"
+        ));
+    }
+
+    expect_empty_queue(ctx, "tx-commit postcondition")?;
+    ctx.tpclose()
+        .map_err(|e| format!("tpclose failed: {e}"))?;
+    Ok(())
+}
+
+fn run_tx_abort(ctx: &AtmiCtx) -> Result<(), String> {
+    ctx.tpopen().map_err(|e| format!("tpopen failed: {e}"))?;
+
+    expect_empty_queue(ctx, "tx-abort precondition")?;
+
+    ctx.tpbegin(60, 0)
+        .map_err(|e| format!("tpbegin failed: {e}"))?;
+    if let Err(e) = enqueue_str(ctx, "TX-ABORT-MSG") {
+        let _ = ctx.tpabort(0);
+        let _ = ctx.tpclose();
+        return Err(e);
+    }
+    ctx.tpabort(0)
+        .map_err(|e| format!("tpabort failed: {e}"))?;
+
+    expect_empty_queue(ctx, "tx-abort postcondition")?;
+    ctx.tpclose()
+        .map_err(|e| format!("tpclose failed: {e}"))?;
+    Ok(())
+}
+
+fn run_tx_suspend_resume(ctx: &AtmiCtx) -> Result<(), String> {
+    ctx.tpopen().map_err(|e| format!("tpopen failed: {e}"))?;
+
+    expect_empty_queue(ctx, "tx-suspend-resume precondition")?;
+
+    // Outer tx: enqueue OUTER-MSG, then suspend.
+    ctx.tpbegin(60, 0)
+        .map_err(|e| format!("outer tpbegin failed: {e}"))?;
+    if let Err(e) = enqueue_str(ctx, "OUTER-MSG") {
+        let _ = ctx.tpabort(0);
+        let _ = ctx.tpclose();
+        return Err(format!("outer enqueue failed: {e}"));
+    }
+    let outer = ctx
+        .tpsuspend(0)
+        .map_err(|e| format!("tpsuspend failed: {e}"))?;
+
+    // Inner tx (no current tx after suspend): enqueue INNER-MSG, commit.
+    ctx.tpbegin(60, 0)
+        .map_err(|e| format!("inner tpbegin failed: {e}"))?;
+    if let Err(e) = enqueue_str(ctx, "INNER-MSG") {
+        let _ = ctx.tpabort(0);
+        let _ = ctx.tpresume(&outer, 0);
+        let _ = ctx.tpabort(0);
+        let _ = ctx.tpclose();
+        return Err(format!("inner enqueue failed: {e}"));
+    }
+    ctx.tpcommit(0)
+        .map_err(|e| format!("inner tpcommit failed: {e}"))?;
+
+    // Resume outer and abort it — OUTER-MSG must NOT be visible.
+    ctx.tpresume(&outer, 0)
+        .map_err(|e| format!("tpresume failed: {e}"))?;
+    ctx.tpabort(0)
+        .map_err(|e| format!("outer tpabort failed: {e}"))?;
+
+    let val = dequeue_str(ctx)?;
+    if val != "INNER-MSG" {
+        let _ = ctx.tpclose();
+        return Err(format!(
+            "tx-suspend-resume: expected `INNER-MSG`, got `{val}`"
+        ));
+    }
+
+    expect_empty_queue(ctx, "tx-suspend-resume postcondition")?;
+    ctx.tpclose()
+        .map_err(|e| format!("tpclose failed: {e}"))?;
     Ok(())
 }
