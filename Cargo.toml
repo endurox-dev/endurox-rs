@@ -28,6 +28,7 @@ tokio = { version = "1", features = ["net", "time"], optional = true }
 [build-dependencies]
 bindgen = "0.70"        # pin a version for stability
 cc = "1.0"
+pkg-config = "0.3"
 
 [features]
 # default = []     # default: !Send & !Sync

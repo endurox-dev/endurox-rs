@@ -141,10 +141,8 @@ mkdir -p log
 find log -type f -exec rm -f {} +
 xadmin provision -d -vaddubf="$NDRX_RS_UNIT_UBF_FILE" >/dev/null
 . conf/settest1
-#export LANG=en_UK.UTF-8
 unset NDRX_DEBUG_CONF
-export NDRX_DEBUG_STR="file=$NDRX_RS_UNIT_TEST_DIR/log/unittest.log ndrx=5"
-# print the env to load later by rust bin
+export NDRX_DEBUG_STR="file=$NDRX_RS_UNIT_TEST_DIR/log/atmi-tests.log ndrx=5"
 env
 "#,
             )

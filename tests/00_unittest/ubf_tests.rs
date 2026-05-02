@@ -808,8 +808,7 @@ with open('conf/app.ini', 'w') as f:
 export NDRX_CONFIG="$NDRX_RS_UNIT_TEST_DIR/conf/ndrxconfig.xml"
 export FLDTBLDIR="$(dirname "$NDRX_RS_UNIT_UBF_FILE")"
 export FIELDTBLS="$(basename "$NDRX_RS_UNIT_UBF_FILE")"
-unset NDRX_DEBUG_CONF
-#export NDRX_DEBUG_STR="file=$NDRX_RS_UNIT_TEST_DIR/log/ubf-tests.log ndrx=5"
+export NDRX_DEBUG_STR="file=$NDRX_RS_UNIT_TEST_DIR/log/ubf-tests.log ndrx=5"
 env
 "#,
             )

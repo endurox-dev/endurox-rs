@@ -3,6 +3,7 @@
 set -euo pipefail
 
 THIS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TEST_DIR="$THIS_DIR"
 CONF_DIR="$THIS_DIR/conf"
 BIN_DIR="$THIS_DIR/bin"
 PROJECT_DIR="$(cd "$THIS_DIR/../.." && pwd)"
@@ -27,7 +28,6 @@ popd >/dev/null
 
 pushd "$CONF_DIR" >/dev/null
 . ./settest1
-. ./setndrx
 popd >/dev/null
 
 cargo build --manifest-path "$TEST_DIR/Cargo.toml" --target-dir "$PROJECT_DIR/target" --bin rs_it_ext_server --bin rs_it_ext_client

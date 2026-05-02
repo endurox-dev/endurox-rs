@@ -46,15 +46,21 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CFLAGS");
     println!("cargo:rerun-if-env-changed=LDFLAGS");
     println!("cargo:rerun-if-env-changed=LIBCLANG_PATH");
+    println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
     println!("cargo:rustc-check-cfg=cfg(endurox_epoll)");
 
-    println!("cargo:rustc-link-lib=dylib=atmisrvinteg");
-    println!("cargo:rustc-link-lib=dylib=atmi");
-    println!("cargo:rustc-link-lib=dylib=ubf");
-    println!("cargo:rustc-link-lib=dylib=nstd");
-    println!("cargo:rustc-link-lib=dylib=pthread");
-    println!("cargo:rustc-link-lib=dylib=m");
-    println!("cargo:rustc-link-lib=dylib=dl");
+    // Resolve Enduro/X libs and include paths via pkg-config (atmisrvinteg.pc).
+    // This emits the appropriate cargo:rustc-link-lib / rustc-link-search lines.
+    let library = pkg_config::Config::new()
+        .probe("atmisrvinteg")
+        .expect("pkg-config failed to find atmisrvinteg.pc; set PKG_CONFIG_PATH to the directory containing it");
+
+    for path in &library.include_paths {
+        let path_str = path.to_string_lossy().into_owned();
+        if !include_dirs.iter().any(|d| d == &path_str) {
+            include_dirs.push(path_str);
+        }
+    }
 
     generate_ubf_field_constants();
 
