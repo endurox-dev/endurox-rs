@@ -125,7 +125,7 @@ fn rs_it_control(ctx: &AtmiCtx, svc: &mut TpSvcInfo<'_>) {
     ctx.tpreturn_ubf(TpReturnStatus::Success, 0, ubf, 0);
 }
 
-fn rs_it_init(ctx: &AtmiCtx) -> AtmiResult<()> {
+fn rs_it_init(ctx: &AtmiCtx, _args: &[String]) -> AtmiResult<()> {
     ctx.tpadvertise("RS_IT_ECHO", rs_it_echo)?;
     ctx.tpadvertise("RS_IT_FORWARD", rs_it_forward)?;
     ctx.tpadvertise("RS_IT_FORWARD_FINAL", rs_it_forward_final)?;

@@ -105,7 +105,7 @@ fn rs_ext_status(ctx: &AtmiCtx, svc: &mut TpSvcInfo<'_>) {
     ctx.tpreturn_ubf(TpReturnStatus::Success, 0, ubf, 0);
 }
 
-fn rs_ext_init(ctx: &AtmiCtx) -> AtmiResult<()> {
+fn rs_ext_init(ctx: &AtmiCtx, _args: &[String]) -> AtmiResult<()> {
     let mut fds = [-1; 2];
     let pipe_rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
     if pipe_rc != 0 {

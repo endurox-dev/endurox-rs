@@ -1,6 +1,6 @@
 use crate::{raw, AtmiCtx, AtmiError, AtmiResult, TpSvcInfo, TypedBuffer, TypedUbf};
 use core::ffi::{c_char, c_int, c_long};
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::{
     collections::HashMap,
     panic::{catch_unwind, AssertUnwindSafe},
@@ -17,8 +17,14 @@ type ServerDoneHook = unsafe extern "C" fn();
 
 /// High-level server init callback.
 ///
+/// Receives the server's command-line arguments as Enduro/X delivers them
+/// to the C-level `tpsvrinit(int argc, char **argv)` — i.e. only the user
+/// arguments after the framework's own option processing (typically what
+/// follows the `--` separator in `CLOPT`). The first element is the program
+/// name when present.
+///
 /// Returning `Err(...)` aborts server startup.
-pub type RustServerInitHook = fn(&AtmiCtx) -> AtmiResult<()>;
+pub type RustServerInitHook = fn(&AtmiCtx, &[String]) -> AtmiResult<()>;
 
 /// High-level server shutdown callback.
 pub type RustServerDoneHook = fn(&AtmiCtx);
@@ -220,7 +226,7 @@ unsafe extern "C" fn rust_before_poll_dispatch() -> c_int {
     }
 }
 
-unsafe extern "C" fn rust_server_init(_argc: c_int, _argv: *mut *mut c_char) -> c_int {
+unsafe extern "C" fn rust_server_init(argc: c_int, argv: *mut *mut c_char) -> c_int {
     let (ctx_addr, init_hook) = match server_runtime().lock() {
         Ok(rt) => (rt.ctx_addr, rt.init_hook),
         Err(_) => return raw::EXFAIL as c_int,
@@ -234,8 +240,23 @@ unsafe extern "C" fn rust_server_init(_argc: c_int, _argv: *mut *mut c_char) -> 
         return raw::EXFAIL as c_int;
     };
 
+    let args: Vec<String> = if argv.is_null() || argc <= 0 {
+        Vec::new()
+    } else {
+        (0..argc as usize)
+            .filter_map(|i| {
+                let p = *argv.add(i);
+                if p.is_null() {
+                    None
+                } else {
+                    Some(CStr::from_ptr(p).to_string_lossy().into_owned())
+                }
+            })
+            .collect()
+    };
+
     let ctx = &*(ctx_addr as *const AtmiCtx);
-    match catch_unwind(AssertUnwindSafe(|| init_cb(ctx))) {
+    match catch_unwind(AssertUnwindSafe(|| init_cb(ctx, &args))) {
         Ok(Ok(())) => raw::EXSUCCEED as c_int,
         Ok(Err(err)) => {
             if let Ok(mut rt) = server_runtime().lock() {
