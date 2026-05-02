@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use endurox_rs::{ubf_fields, AtmiCtx, TypedUbf, UbfValue, TPGETANY};
+use endurox_rs::{ubf_fields, AtmiCtx, AtmiError, TypedUbf, UbfValue, TPGETANY};
 
 fn main() {
     let rc = match run() {
@@ -27,6 +27,7 @@ fn run() -> Result<(), String> {
         "inner-ubf" => ("RS_IT_INNER_UBF", "RUST-INNER:HELLO-INNER"),
         "tpacall" => ("RS_IT_ECHO", "RUST-SERVER:HELLO"),
         "tpacall-getany" => return run_tpacall_getany(&ctx),
+        "dynamic-advertise" => return run_dynamic_advertise(&ctx),
         other => return Err(format!("unknown integration scenario `{other}`")),
     };
 
@@ -124,6 +125,105 @@ fn run_tpacall_getany(ctx: &AtmiCtx) -> Result<(), String> {
 
     ctx.tpterm().map_err(|e| format!("tpterm failed: {e}"))?;
     Ok(())
+}
+
+fn run_dynamic_advertise(ctx: &AtmiCtx) -> Result<(), String> {
+    const TARGET: &str = "RS_IT_DYNAMIC";
+    let rsp_fld = ubf_fields::T_STRING_2_FLD;
+
+    expect_no_entry(ctx, TARGET, "before advertise")?;
+
+    let status = control_call(ctx, "advertise", TARGET)?;
+    if status != "OK" {
+        return Err(format!("control advertise failed with status `{status}`"));
+    }
+
+    let mut req = build_echo_request(ctx, "HELLO-DYN")?;
+    let mut rsp = ctx
+        .tpalloc_ubf(1024)
+        .map_err(|e| format!("reply tpalloc_ubf failed: {e}"))?;
+    ctx.tpcall(TARGET, &req, &mut rsp, 0)
+        .map_err(|e| format!("tpcall to dynamically advertised service failed: {e}"))?;
+    assert_response(&rsp, rsp_fld, "RUST-DYNAMIC:HELLO-DYN")?;
+
+    let status = control_call(ctx, "unadvertise", TARGET)?;
+    if status != "OK" {
+        return Err(format!("control unadvertise failed with status `{status}`"));
+    }
+
+    expect_no_entry(ctx, TARGET, "after unadvertise")?;
+
+    // sanity: re-advertise to confirm idempotency on re-entry
+    let status = control_call(ctx, "advertise", TARGET)?;
+    if status != "OK" {
+        return Err(format!("re-advertise failed with status `{status}`"));
+    }
+    req.bchg(
+        ubf_fields::T_STRING_FLD,
+        0,
+        UbfValue::String("AGAIN".to_string()),
+        true,
+    )
+    .map_err(|e| format!("failed to reset request field: {e}"))?;
+    ctx.tpcall(TARGET, &req, &mut rsp, 0)
+        .map_err(|e| format!("tpcall after re-advertise failed: {e}"))?;
+    assert_response(&rsp, rsp_fld, "RUST-DYNAMIC:AGAIN")?;
+
+    let status = control_call(ctx, "unadvertise", TARGET)?;
+    if status != "OK" {
+        return Err(format!("final unadvertise failed with status `{status}`"));
+    }
+
+    ctx.tpterm().map_err(|e| format!("tpterm failed: {e}"))?;
+    Ok(())
+}
+
+fn control_call(ctx: &AtmiCtx, cmd: &str, target: &str) -> Result<String, String> {
+    let mut req = ctx
+        .tpalloc_ubf(512)
+        .map_err(|e| format!("control tpalloc_ubf failed: {e}"))?;
+    req.bchg(
+        ubf_fields::T_STRING_FLD,
+        0,
+        UbfValue::String(cmd.to_string()),
+        true,
+    )
+    .map_err(|e| format!("failed to set control command: {e}"))?;
+    req.bchg(
+        ubf_fields::T_STRING_2_FLD,
+        0,
+        UbfValue::String(target.to_string()),
+        true,
+    )
+    .map_err(|e| format!("failed to set control target: {e}"))?;
+
+    let mut rsp = ctx
+        .tpalloc_ubf(512)
+        .map_err(|e| format!("control reply tpalloc_ubf failed: {e}"))?;
+    ctx.tpcall("RS_IT_CONTROL", &req, &mut rsp, 0)
+        .map_err(|e| format!("RS_IT_CONTROL tpcall failed for `{cmd}`: {e}"))?;
+
+    rsp.bget_string(ubf_fields::T_STRING_3_FLD, 0)
+        .map_err(|e| format!("failed to read control result field: {e}"))
+}
+
+fn expect_no_entry(ctx: &AtmiCtx, svc: &str, phase: &str) -> Result<(), String> {
+    let req = ctx
+        .tpalloc_ubf(256)
+        .map_err(|e| format!("tpalloc_ubf for negative tpcall failed: {e}"))?;
+    let mut rsp = ctx
+        .tpalloc_ubf(256)
+        .map_err(|e| format!("reply tpalloc_ubf for negative tpcall failed: {e}"))?;
+    match ctx.tpcall(svc, &req, &mut rsp, 0) {
+        Ok(()) => Err(format!(
+            "expected `{svc}` to be unadvertised {phase}, but tpcall succeeded"
+        )),
+        Err(e) if e.code == AtmiError::TPENOENT => Ok(()),
+        Err(e) => Err(format!(
+            "expected TPENOENT for `{svc}` {phase}, got code {} ({e})",
+            e.code
+        )),
+    }
 }
 
 fn build_echo_request<'a>(ctx: &'a AtmiCtx, value: &str) -> Result<TypedUbf<'a>, String> {
