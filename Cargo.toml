@@ -42,3 +42,7 @@ path = "tests/00_unittest/atmictx_tests.rs"
 [[test]]
 name = "ubf_tests"
 path = "tests/00_unittest/ubf_tests.rs"
+
+[[test]]
+name = "nstd_tests"
+path = "tests/00_unittest/nstd_tests.rs"

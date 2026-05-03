@@ -24,6 +24,7 @@ mod atmictx_ubf;
 mod atmictx_xatmi;
 mod errors;
 mod flags;
+mod nstdutil;
 mod tpsvcinfo;
 mod typed_buf;
 mod typed_ubf;
@@ -39,6 +40,7 @@ pub use atmictx_srv::{
 };
 pub use atmictx_ubf::{BFldLocInfo, UbfExprCallback, UbfExprCallback2, UbfExprTree, UbfFieldType};
 pub use errors::{AtmiError, AtmiResult, NstdError, NstdResult, UbfError, UbfResult};
+pub use nstdutil::NdrxStdCfgStr;
 pub use flags::{
     TPCONV, TPGETANY, TPNOBLOCK, TPNOCHANGE, TPNOREPLY, TPNOTIME, TPNOTRAN, TPRECVONLY, TPSENDONLY,
     TPSIGRSTRT, TPTRAN, TPTRANSUSPEND,
