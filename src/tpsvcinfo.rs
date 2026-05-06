@@ -5,7 +5,7 @@ use std::ffi::CStr;
 /// Safe Rust wrapper for TPSVCINFO passed into a service callback.
 ///
 /// Owns the service buffer until the handler calls `take_data()` /
-/// `take_data_ubf()` and passes it to `tpreturn_ubf`.  If the handler
+/// `take_data_ubf()` and passes it to `tpreturn`.  If the handler
 /// returns without taking the data the buffer is freed automatically via
 /// the `TypedBuffer` Drop impl (correct: service must either return or free it).
 #[derive(Debug)]
@@ -25,7 +25,8 @@ impl<'ctx> TpSvcInfo<'ctx> {
         let data = if data_ptr.is_null() {
             None
         } else {
-            Some(TypedBuffer::from_raw(ctx, data_ptr))
+            let len = (*raw).len.max(0) as usize;
+            Some(TypedBuffer::from_raw_with_len(ctx, data_ptr, len))
         };
         TpSvcInfo { raw, ctx, data }
     }
@@ -98,7 +99,7 @@ impl<'ctx> TpSvcInfo<'ctx> {
     ///
     /// Returns `None` if the buffer was already taken or was originally null.
     /// After calling this, the caller is responsible for passing the buffer
-    /// to `tpreturn_buffer` (or freeing it before calling `tpreturn`).
+    /// to `tpreturn` (or freeing it before calling the raw API).
     pub fn take_data(&mut self) -> Option<TypedBuffer<'ctx>> {
         self.data.take()
     }

@@ -21,29 +21,18 @@ impl AtmiCtx {
         odata: &mut TypedBuffer<'_>,
         flags: i64,
     ) -> AtmiResult<()> {
-        let mut reply = odata.as_ptr();
-        self.tpcall_raw(svc, idata.as_ptr(), &mut reply, flags)?;
-        odata.replace_ptr(reply);
-        Ok(())
-    }
-
-    fn tpcall_raw(
-        &self,
-        svc: &str,
-        idata: *mut c_char,
-        odata: &mut *mut c_char,
-        flags: i64,
-    ) -> AtmiResult<()> {
         let c_svc = CString::new(svc).map_err(|_| self.atmi_last_error())?;
+        let ilen = idata.len() as c_long;
+        let mut reply = odata.as_ptr();
         let mut olen: c_long = 0;
 
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe {
             raw::tpcall(
                 c_svc.as_ptr() as *mut c_char,
-                idata,
-                0,
-                odata,
+                idata.as_ptr(),
+                ilen,
+                &mut reply,
                 &mut olen,
                 flags as c_long,
             )
@@ -54,15 +43,17 @@ impl AtmiCtx {
             raw::Otpcall(
                 self.c_ctx_ptr(),
                 c_svc.as_ptr() as *mut c_char,
-                idata,
-                0,
-                odata,
+                idata.as_ptr(),
+                ilen,
+                &mut reply,
                 &mut olen,
                 flags as c_long,
             )
         };
 
         if rc == raw::EXSUCCEED as c_int {
+            odata.replace_ptr(reply);
+            odata.set_len(olen as usize);
             Ok(())
         } else {
             Err(self.atmi_last_error())
@@ -72,13 +63,14 @@ impl AtmiCtx {
     /// Asynchronous RPC call.  Returns a call descriptor used with `tpgetrply`.
     pub fn tpacall(&self, svc: &str, data: &TypedBuffer<'_>, flags: i64) -> AtmiResult<i32> {
         let c_svc = CString::new(svc).map_err(|_| self.atmi_last_error())?;
+        let ilen = data.len() as c_long;
 
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe {
             raw::tpacall(
                 c_svc.as_ptr() as *mut c_char,
                 data.as_ptr(),
-                0,
+                ilen,
                 flags as c_long,
             )
         };
@@ -89,7 +81,7 @@ impl AtmiCtx {
                 self.c_ctx_ptr(),
                 c_svc.as_ptr() as *mut c_char,
                 data.as_ptr(),
-                0,
+                ilen,
                 flags as c_long,
             )
         };
@@ -131,6 +123,7 @@ impl AtmiCtx {
         if rc == raw::EXSUCCEED as c_int {
             *cd = c_cd as i32;
             data.replace_ptr(odata);
+            data.set_len(olen as usize);
             Ok(())
         } else {
             Err(self.atmi_last_error())

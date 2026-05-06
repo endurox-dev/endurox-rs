@@ -46,7 +46,7 @@ pub use flags::{
     TPSIGRSTRT, TPTRAN, TPTRANSUSPEND,
 };
 pub use tpsvcinfo::TpSvcInfo;
-pub use typed_buf::TypedBuffer;
+pub use typed_buf::{TpTypeInfo, TypedBuffer};
 pub use typed_ubf::{
     BorrowedUbf, IntoUbfValue, TypedUbf, UbfField, UbfGetValue, UbfIterator, UbfValue,
 };

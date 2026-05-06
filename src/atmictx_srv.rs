@@ -50,7 +50,7 @@ pub type RustPeriodCallback = fn() -> i32;
 /// High-level before-poll callback used by [`AtmiCtx::tpext_addb4pollcb`].
 pub type RustBeforePollCallback = fn() -> i32;
 
-/// Service return status for [`AtmiCtx::tpreturn_buffer`].
+/// Service return status for [`AtmiCtx::tpreturn`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TpReturnStatus {
     Success,
@@ -166,7 +166,7 @@ unsafe extern "C" fn rust_service_dispatch(svc_ptr: *mut raw::TPSVCINFO) {
                         .map(|u| u.into_inner().into_raw())
                         .unwrap_or(std::ptr::null_mut()),
                 };
-                ctx.tpreturn(TpReturnStatus::Fail.to_raw(), 0, err_ptr, 0, 0);
+                ctx.tpreturn_raw(TpReturnStatus::Fail.to_raw(), 0, err_ptr, 0, 0);
             }
         }
         None => {
@@ -174,7 +174,7 @@ unsafe extern "C" fn rust_service_dispatch(svc_ptr: *mut raw::TPSVCINFO) {
                 .take_data()
                 .map(|b| b.into_raw())
                 .unwrap_or(std::ptr::null_mut());
-            ctx.tpreturn(TpReturnStatus::Fail.to_raw(), 0, err_ptr, 0, 0);
+            ctx.tpreturn_raw(TpReturnStatus::Fail.to_raw(), 0, err_ptr, 0, 0);
         }
     }
 }
@@ -374,7 +374,7 @@ impl AtmiCtx {
         Ok(())
     }
 
-    pub(crate) unsafe fn tpreturn(
+    pub(crate) unsafe fn tpreturn_raw(
         &self,
         rval: i32,
         rcode: i64,
@@ -771,22 +771,25 @@ impl AtmiCtx {
     /// Return a typed buffer from a service callback.
     ///
     /// Consumes `data` so its `Drop` is **not** called — ownership is
-    /// transferred to the XATMI framework via `tpreturn`.
-    pub fn tpreturn_buffer(
+    /// transferred to the XATMI framework. The buffer's tracked `len()` is
+    /// forwarded as the `tpreturn` length argument (relevant for CARRAY/STRING;
+    /// ignored for self-describing buffer types).
+    pub fn tpreturn(
         &self,
         status: TpReturnStatus,
         rcode: i64,
         data: TypedBuffer<'_>,
         flags: i64,
     ) {
+        let len = data.len();
         let ptr = data.into_raw();
-        unsafe { self.tpreturn(status.to_raw(), rcode, ptr, 0, flags) };
+        unsafe { self.tpreturn_raw(status.to_raw(), rcode, ptr, len, flags) };
     }
 
     /// Return a UBF buffer from a service callback.
     ///
-    /// Convenience wrapper over [`AtmiCtx::tpreturn_buffer`] for the common UBF case.
+    /// Convenience wrapper over [`AtmiCtx::tpreturn`] for the common UBF case.
     pub fn tpreturn_ubf(&self, status: TpReturnStatus, rcode: i64, data: TypedUbf<'_>, flags: i64) {
-        self.tpreturn_buffer(status, rcode, data.into_inner(), flags);
+        self.tpreturn(status, rcode, data.into_inner(), flags);
     }
 }

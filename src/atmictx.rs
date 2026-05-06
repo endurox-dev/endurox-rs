@@ -143,6 +143,24 @@ impl AtmiCtx {
         }
     }
 
+    /// Allocate a CARRAY (binary array) buffer tied to this context, copy the
+    /// provided bytes in, and set `len()` to `bytes.len()`.
+    pub fn tpalloc_carray<'ctx>(&'ctx self, bytes: &[u8]) -> AtmiResult<TypedBuffer<'ctx>> {
+        let size = bytes.len().max(1);
+        let mut buf = self.tpalloc("CARRAY", "", size)?;
+        if !bytes.is_empty() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    buf.as_ptr() as *mut u8,
+                    bytes.len(),
+                );
+            }
+        }
+        buf.set_len(bytes.len());
+        Ok(buf)
+    }
+
     /// Allocate a UBF buffer tied to this context.
     pub fn tpalloc_ubf<'ctx>(&'ctx self, size: usize) -> AtmiResult<TypedUbf<'ctx>> {
         let type_c = CString::new("UBF").unwrap();
