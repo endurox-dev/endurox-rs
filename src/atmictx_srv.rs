@@ -374,7 +374,7 @@ impl AtmiCtx {
         Ok(())
     }
 
-    pub(crate) unsafe fn tpreturn_raw(
+    unsafe fn tpreturn_raw(
         &self,
         rval: i32,
         rcode: i64,
