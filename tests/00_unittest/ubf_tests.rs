@@ -685,8 +685,6 @@ fn ubf_boolean_expression_compile_eval_and_print() {
 
     let printed = ctx.bboolpr(&tree).expect("Bboolpr failed");
     assert!(!printed.is_empty());
-    let printed_via_cb = ctx.bboolprcb(&tree).expect("Bboolprcb failed");
-    assert!(!printed_via_cb.is_empty());
     assert_eq!(ubf.bfloatev(&tree), 1.0);
 
     ctx.btreefree(tree);

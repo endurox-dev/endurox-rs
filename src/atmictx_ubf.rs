@@ -73,25 +73,6 @@ fn expr_callbacks2() -> &'static Mutex<HashMap<String, UbfExprCallback2>> {
 }
 
 
-unsafe extern "C" fn output_callback(
-    buffer: *mut c_char,
-    datalen: c_long,
-    dataptr1: *mut c_void,
-) -> c_int {
-    if buffer.is_null() || dataptr1.is_null() || datalen < 0 {
-        return raw::EXFAIL;
-    }
-
-    let state = &mut *(dataptr1 as *mut OutputState);
-    let mut len = datalen as usize;
-    let data = std::slice::from_raw_parts(buffer as *const u8, len);
-    if len > 0 && data[len - 1] == 0 {
-        len -= 1;
-    }
-    state.bytes.extend_from_slice(&data[..len]);
-    raw::EXSUCCEED as c_int
-}
-
 unsafe extern "C" fn bfprint_output_callback(
     buffer: *mut *mut c_char,
     datalen: c_long,
@@ -636,32 +617,6 @@ impl AtmiCtx {
             .map_err(|e| crate::UbfError::new(crate::UbfError::BEUNIX, e.to_string()))
     }
 
-    pub(crate) fn bboolprcb_value(&self, tree: &UbfExprTree<'_>) -> UbfResult<String> {
-        let mut state = OutputState { bytes: Vec::new() };
-
-        #[cfg(not(feature = "ctx-send"))]
-        unsafe {
-            raw::Bboolprcb(
-                tree.as_ptr(),
-                Some(output_callback),
-                &mut state as *mut OutputState as *mut c_void,
-            )
-        };
-
-        #[cfg(feature = "ctx-send")]
-        unsafe {
-            raw::OBboolprcb(
-                self.c_ctx_ptr(),
-                tree.as_ptr(),
-                Some(output_callback),
-                &mut state as *mut OutputState as *mut c_void,
-            )
-        };
-
-        String::from_utf8(state.bytes)
-            .map_err(|e| crate::UbfError::new(crate::UbfError::BEUNIX, e.to_string()))
-    }
-
     pub(crate) fn bwritecb_value(&self, ubf: &TypedUbf<'_>) -> UbfResult<Vec<u8>> {
         let mut state = OutputState { bytes: Vec::new() };
 
@@ -1164,13 +1119,46 @@ impl AtmiCtx {
     }
 
     /// Print a compiled boolean expression tree to a string.
+    ///
+    /// Wraps the C `Bboolpr`/`OBboolpr` `FILE*` API by capturing its output via
+    /// an in-memory stream from `open_memstream(3)`.
     pub fn bboolpr(&self, tree: &UbfExprTree<'_>) -> UbfResult<String> {
-        self.bboolprcb_value(tree)
-    }
+        let mut buf_ptr: *mut c_char = std::ptr::null_mut();
+        let mut buf_size: libc::size_t = 0;
+        let file = unsafe { libc::open_memstream(&mut buf_ptr, &mut buf_size) };
+        if file.is_null() {
+            return Err(crate::UbfError::new(
+                crate::UbfError::BEUNIX,
+                "failed to open memory stream",
+            ));
+        }
 
-    /// Print a compiled boolean expression tree to a string using callback I/O.
-    pub fn bboolprcb(&self, tree: &UbfExprTree<'_>) -> UbfResult<String> {
-        self.bboolprcb_value(tree)
+        #[cfg(not(feature = "ctx-send"))]
+        unsafe {
+            raw::Bboolpr(tree.as_ptr(), file as *mut raw::FILE);
+        }
+
+        #[cfg(feature = "ctx-send")]
+        unsafe {
+            raw::OBboolpr(self.c_ctx_ptr(), tree.as_ptr(), file as *mut raw::FILE);
+        }
+
+        unsafe {
+            libc::fclose(file);
+        }
+
+        if buf_ptr.is_null() {
+            return Ok(String::new());
+        }
+
+        let bytes =
+            unsafe { std::slice::from_raw_parts(buf_ptr as *const u8, buf_size) }.to_vec();
+        unsafe {
+            libc::free(buf_ptr as *mut c_void);
+        }
+
+        String::from_utf8(bytes)
+            .map_err(|e| crate::UbfError::new(crate::UbfError::BEUNIX, e.to_string()))
     }
 
     /// Register a Rust callback for UBF boolean expression evaluation.

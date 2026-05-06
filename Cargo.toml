@@ -46,3 +46,7 @@ path = "tests/00_unittest/ubf_tests.rs"
 [[test]]
 name = "nstd_tests"
 path = "tests/00_unittest/nstd_tests.rs"
+
+[[test]]
+name = "boolexpr_print_tests"
+path = "tests/00_unittest/boolexpr_print_tests.rs"
