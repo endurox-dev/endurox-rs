@@ -12,3 +12,8 @@ pub const TPCONV: i64 = raw::TPCONV as i64;
 pub const TPSENDONLY: i64 = raw::TPSENDONLY as i64;
 pub const TPRECVONLY: i64 = raw::TPRECVONLY as i64;
 pub const TPTRANSUSPEND: i64 = raw::TPTRANSUSPEND as i64;
+
+/// `tpsblktime`/`tpgblktime`: apply the timeout to the next call only.
+pub const TPBLK_NEXT: i64 = raw::TPBLK_NEXT as i64;
+/// `tpsblktime`/`tpgblktime`: apply the timeout to every call on this thread.
+pub const TPBLK_ALL: i64 = raw::TPBLK_ALL as i64;

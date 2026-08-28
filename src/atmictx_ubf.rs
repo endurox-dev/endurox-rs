@@ -72,7 +72,6 @@ fn expr_callbacks2() -> &'static Mutex<HashMap<String, UbfExprCallback2>> {
     CALLBACKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-
 unsafe extern "C" fn bfprint_output_callback(
     buffer: *mut *mut c_char,
     datalen: c_long,
@@ -1151,8 +1150,7 @@ impl AtmiCtx {
             return Ok(String::new());
         }
 
-        let bytes =
-            unsafe { std::slice::from_raw_parts(buf_ptr as *const u8, buf_size) }.to_vec();
+        let bytes = unsafe { std::slice::from_raw_parts(buf_ptr as *const u8, buf_size) }.to_vec();
         unsafe {
             libc::free(buf_ptr as *mut c_void);
         }

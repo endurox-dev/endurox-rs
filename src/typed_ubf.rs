@@ -178,6 +178,45 @@ pub struct UbfIterator<'a, 'ctx> {
     field_id: raw::BFLDID,
 }
 
+/// Borrowed, non-reallocatable view of a buffer owned by another buffer.
+///
+/// Returned by [`TypedUbf::bget_ptr`] for a `BFLD_PTR` target. The target stays
+/// owned by the parent, which frees it via Enduro/X's cascade, so this wrapper
+/// never frees anything.
+///
+/// It derefs to [`TypedBuffer`] for read-only use but deliberately implements
+/// no `DerefMut`. Every method that can relocate the allocation --
+/// `tprealloc`, `set_bytes`, `as_bytes_mut`, `set_len` -- takes `&mut self` and
+/// is therefore unreachable through this type. That matters for memory safety
+/// rather than tidiness: relocating the target would leave the pointer stored
+/// in the parent dangling, and a doc warning cannot prevent that from safe
+/// code. Use [`TypedUbf::bextract_ptr`] to obtain a mutable, standalone buffer.
+#[derive(Debug)]
+pub struct BorrowedBuffer<'a, 'ctx> {
+    inner: TypedBuffer<'ctx>,
+    _borrow: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a, 'ctx> BorrowedBuffer<'a, 'ctx> {
+    /// # Safety
+    /// `inner` must wrap a buffer owned by another party that outlives `'a`,
+    /// and must have been built as unowned so that dropping it frees nothing.
+    pub(crate) unsafe fn from_unowned(inner: TypedBuffer<'ctx>) -> Self {
+        Self {
+            inner,
+            _borrow: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'ctx> Deref for BorrowedBuffer<'_, 'ctx> {
+    type Target = TypedBuffer<'ctx>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
 /// Borrowed read-only view of an embedded UBF field.
 ///
 /// This does not own the underlying buffer and must not free it. Its lifetime is
@@ -403,6 +442,13 @@ impl<'ctx> TypedUbf<'ctx> {
 
             let mut _string_storage: Option<CString> = None;
             let mut empty_carray = [0u8; 1];
+            // CBchg/CBadd take a pointer *to* the value. For BFLD_PTR the value
+            // is itself a pointer, so it must be handed the address of a
+            // variable holding the target address -- passing the target address
+            // directly makes Enduro/X copy the first bytes of the target's
+            // contents into the field instead. Enduro/X's own tests show the
+            // same shape on the way out: Bget(.., (char *)&ptr, ..).
+            let mut _ptr_storage: *mut c_char = std::ptr::null_mut();
 
             let (ptr, len, ftype) = match &mut v {
                 UbfValue::Short(val) => (val as *mut i16 as *mut c_char, 0, raw::BFLD_SHORT),
@@ -425,8 +471,24 @@ impl<'ctx> TypedUbf<'ctx> {
                     };
                     (p, v.len() as raw::BFLDLEN, raw::BFLD_CARRAY)
                 }
-                UbfValue::Ptr(buf) => (buf.as_ptr() as *mut c_char, 0, raw::BFLD_PTR),
+                UbfValue::Ptr(buf) => {
+                    _ptr_storage = buf.as_ptr();
+                    (
+                        &mut _ptr_storage as *mut *mut c_char as *mut c_char,
+                        std::mem::size_of::<*mut c_char>() as raw::BFLDLEN,
+                        raw::BFLD_PTR,
+                    )
+                }
                 UbfValue::Ubf(_) => unreachable!("handled before typed write"),
+            };
+            let stores_ptr = matches!(v, UbfValue::Ptr(_));
+            // A replacing write to an occupied BFLD_PTR occurrence orphans the
+            // target that was there. Note it now, free it once the write has
+            // actually succeeded. `add` appends, so it never replaces.
+            let replaced_ptr = if stores_ptr && !add {
+                self.read_ptr_field(bfldid, occ).ok()
+            } else {
+                None
             };
 
             let rc = if add {
@@ -445,6 +507,26 @@ impl<'ctx> TypedUbf<'ctx> {
             };
 
             if rc == 0 {
+                if let Some(previous) = replaced_ptr {
+                    // Overwriting a BFLD_PTR occurrence dropped the only
+                    // reference to the old target, so Enduro/X's free cascade
+                    // will never reach it. Reclaim it here rather than leak.
+                    //
+                    // Safe to free: this method takes `&mut self`, so no
+                    // `bget_ptr` borrow of the old target can still be alive.
+                    // SAFETY: the pointer came from a BFLD_PTR field of this
+                    // buffer, so it is an owned ATMI buffer of this context.
+                    drop(unsafe { TypedBuffer::from_raw(self.inner.ctx, previous) });
+                }
+                if stores_ptr {
+                    // Ownership of the target transfers to this buffer.
+                    // Enduro/X frees BFLD_PTR targets when the owning buffer is
+                    // freed (ndrx_tpfree_scan_ptrs, libatmi/typed_buf.c), so
+                    // dropping our wrapper here would free it a second time and
+                    // leave the stored pointer dangling. Recover it later with
+                    // `bget_ptr` (borrowed) or `bextract_ptr` (owned).
+                    std::mem::forget(v);
+                }
                 return Ok(());
             }
 
@@ -467,6 +549,13 @@ impl<'ctx> TypedUbf<'ctx> {
         loop {
             let mut _string_storage: Option<CString> = None;
             let mut empty_carray = [0u8; 1];
+            // CBchg/CBadd take a pointer *to* the value. For BFLD_PTR the value
+            // is itself a pointer, so it must be handed the address of a
+            // variable holding the target address -- passing the target address
+            // directly makes Enduro/X copy the first bytes of the target's
+            // contents into the field instead. Enduro/X's own tests show the
+            // same shape on the way out: Bget(.., (char *)&ptr, ..).
+            let mut _ptr_storage: *mut c_char = std::ptr::null_mut();
 
             let (ptr, len, ftype) = match &mut v {
                 UbfValue::Short(val) => (val as *mut i16 as *mut c_char, 0, raw::BFLD_SHORT),
@@ -489,7 +578,14 @@ impl<'ctx> TypedUbf<'ctx> {
                     };
                     (p, v.len() as raw::BFLDLEN, raw::BFLD_CARRAY)
                 }
-                UbfValue::Ptr(buf) => (buf.as_ptr() as *mut c_char, 0, raw::BFLD_PTR),
+                UbfValue::Ptr(buf) => {
+                    _ptr_storage = buf.as_ptr();
+                    (
+                        &mut _ptr_storage as *mut *mut c_char as *mut c_char,
+                        std::mem::size_of::<*mut c_char>() as raw::BFLDLEN,
+                        raw::BFLD_PTR,
+                    )
+                }
                 UbfValue::Ubf(_) => {
                     return Err(UbfError::new(
                         UbfError::BEINVAL,
@@ -508,6 +604,13 @@ impl<'ctx> TypedUbf<'ctx> {
             );
 
             if rc == 0 {
+                if matches!(v, UbfValue::Ptr(_)) {
+                    // Same ownership transfer as the normal write path: the
+                    // target now belongs to this buffer and is freed by
+                    // Enduro/X's cascade. Dropping the wrapper here would free
+                    // it immediately and leave the field dangling.
+                    std::mem::forget(v);
+                }
                 return Ok(());
             }
 
@@ -704,6 +807,123 @@ impl<'ctx> TypedUbf<'ctx> {
             return Err(self.inner.ctx.ubf_last_error());
         }
         Ok(unsafe { BorrowedUbf::from_raw(self.inner.ctx, ptr as *mut raw::UBFH) })
+    }
+
+    /// Read the pointer stored in a `BFLD_PTR` occurrence.
+    ///
+    /// Uses `Bfind` and dereferences the field data, which is how Enduro/X
+    /// itself reads these fields (`lptr=(char **)d_ptr` in
+    /// `ndrx_tpfree_scan_ptrs`). `CBget` is not usable here: it runs the
+    /// BFLD_PTR conversion table rather than handing back the stored address.
+    fn read_ptr_field(&self, bfldid: i32, occ: i32) -> UbfResult<*mut c_char> {
+        let mut len: raw::BFLDLEN = 0;
+        let field =
+            self.inner
+                .ctx
+                .bfind_value(self, bfldid as raw::BFLDID, occ as raw::BFLDOCC, &mut len);
+        if field.is_null() {
+            return Err(self.inner.ctx.ubf_last_error());
+        }
+        // SAFETY: a BFLD_PTR field's data is exactly one stored `char *`.
+        // UBF packs field data, so the address is not pointer-aligned -- the C
+        // side gets away with a plain deref, Rust needs the unaligned read.
+        let target = unsafe { std::ptr::read_unaligned(field as *const *mut c_char) };
+        if target.is_null() {
+            return Err(UbfError::new(
+                UbfError::BNOTPRES,
+                "BFLD_PTR field holds a NULL buffer pointer",
+            ));
+        }
+        Ok(target)
+    }
+
+    /// Borrow the buffer referenced by a `BFLD_PTR` occurrence.
+    ///
+    /// The target stays owned by this buffer: Enduro/X frees `BFLD_PTR` targets
+    /// when the owning buffer is freed, recursing through embedded `BFLD_UBF`
+    /// fields as it goes (`ndrx_tpfree_scan_ptrs`, `libatmi/typed_buf.c`). The
+    /// returned wrapper therefore does not free anything, and its lifetime is
+    /// tied to this borrow, so it cannot outlive a mutation of the parent.
+    ///
+    /// The result derefs to [`TypedBuffer`] for reading but cannot be
+    /// reallocated: that would move the allocation and leave the pointer stored
+    /// here dangling, so [`BorrowedBuffer`] withholds those methods rather than
+    /// relying on the caller to avoid them.
+    ///
+    /// When you need more than raw reads:
+    ///
+    /// - [`Self::bget_ptr_ubf`] for a read-only UBF view of a UBF target;
+    /// - [`Self::bextract_ptr`] to take the target out of this buffer entirely,
+    ///   after which it is standalone, mutable and free to grow.
+    pub fn bget_ptr<'a>(&'a self, bfldid: i32, occ: i32) -> UbfResult<BorrowedBuffer<'a, 'ctx>>
+    where
+        'ctx: 'a,
+    {
+        let target = self.read_ptr_field(bfldid, occ)?;
+        // SAFETY: the pointer came from a BFLD_PTR field of this buffer, so it
+        // is an ATMI buffer of this context. `borrowed_from_raw` marks it
+        // unowned, leaving the parent responsible for freeing it, and
+        // `BorrowedBuffer` withholds every reallocating method.
+        let unowned = unsafe { TypedBuffer::borrowed_from_raw(self.inner.ctx, target) };
+        Ok(unsafe { BorrowedBuffer::from_unowned(unowned) })
+    }
+
+    /// Borrow the buffer referenced by a `BFLD_PTR` occurrence as a read-only
+    /// UBF view.
+    ///
+    /// Use this instead of [`Self::bget_ptr`] whenever the target is a UBF and
+    /// you only need to read it. [`BorrowedUbf`] exposes no mutators, so it
+    /// cannot trigger the reallocation that would leave the pointer held by
+    /// this buffer stale -- the restriction is enforced by the type rather than
+    /// left to the caller.
+    ///
+    /// Fails with `BTYPERR` if the target is not a UBF buffer, so a `CARRAY` or
+    /// `STRING` target cannot be reinterpreted as one by accident.
+    pub fn bget_ptr_ubf<'a>(&'a self, bfldid: i32, occ: i32) -> UbfResult<BorrowedUbf<'a, 'ctx>>
+    where
+        'ctx: 'a,
+    {
+        let target = self.read_ptr_field(bfldid, occ)?;
+
+        // SAFETY: `target` came from a BFLD_PTR field of this buffer, so it is
+        // an ATMI buffer of this context. The wrapper is unowned and is dropped
+        // before returning, so it never frees anything.
+        let probe = unsafe { TypedBuffer::borrowed_from_raw(self.inner.ctx, target) };
+        let info = probe.tptypes().map_err(|err| {
+            UbfError::new(
+                UbfError::BTYPERR,
+                format!("BFLD_PTR target is not a live ATMI buffer: {err}"),
+            )
+        })?;
+        if info.type_name != "UBF" {
+            return Err(UbfError::new(
+                UbfError::BTYPERR,
+                format!(
+                    "BFLD_PTR target is a {} buffer, not UBF; use bget_ptr instead",
+                    info.type_name
+                ),
+            ));
+        }
+
+        // SAFETY: verified above to be a live UBF owned by this buffer, and the
+        // returned view is bounded by the borrow of `self`.
+        Ok(unsafe { BorrowedUbf::from_raw(self.inner.ctx, target as *mut raw::UBFH) })
+    }
+
+    /// Remove a `BFLD_PTR` occurrence and take ownership of the buffer it
+    /// referenced.
+    ///
+    /// The occurrence is deleted from this buffer first, so freeing the parent
+    /// no longer cascades into the target (`Bdel` drops only the reference; it
+    /// does not free the target). The returned buffer owns its allocation and
+    /// may be modified and reallocated freely.
+    pub fn bextract_ptr(&mut self, bfldid: i32, occ: i32) -> UbfResult<TypedBuffer<'ctx>> {
+        let target = self.read_ptr_field(bfldid, occ)?;
+        let ctx = self.inner.ctx;
+        ctx.bdel(self, bfldid as raw::BFLDID, occ as raw::BFLDOCC)?;
+        // SAFETY: the field no longer references `target`, so the parent will
+        // not free it and this wrapper becomes its sole owner.
+        Ok(unsafe { TypedBuffer::from_raw(ctx, target) })
     }
 
     /// Evaluate a compiled boolean expression against this UBF.

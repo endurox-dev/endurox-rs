@@ -29,7 +29,73 @@ pub type RustServerInitHook = fn(&AtmiCtx, &[String]) -> AtmiResult<()>;
 /// High-level server shutdown callback.
 pub type RustServerDoneHook = fn(&AtmiCtx);
 
+/// Per-worker-thread init callback, mirroring C `tpsvrthrinit`.
+///
+/// Runs once on each libatmisrv dispatch thread, after Enduro/X has opened that
+/// worker's ATMI session and before it takes any request, so the supplied
+/// context is that worker's own. Use it for per-thread resources -- a database
+/// handle, a thread-local cache -- which have nowhere else to live: the context
+/// a service handler receives is built per dispatch, not per thread.
+///
+/// Only called when dispatch threading is active (`maxdispatchthreads > 1`).
+/// Returning `Err(...)` aborts that worker's startup.
+pub type RustServerThreadInitHook = fn(&AtmiCtx, &[String]) -> AtmiResult<()>;
+
+/// Per-worker-thread shutdown callback, mirroring C `tpsvrthrdone`.
+///
+/// Runs on the worker thread before Enduro/X terminates its ATMI session, so
+/// the context is still usable.
+pub type RustServerThreadDoneHook = fn(&AtmiCtx);
+
+/// The four C server lifecycle hooks, as one value.
+///
+/// Only `tpsvrinit` is mandatory; the rest default to absent. Enduro/X's own
+/// `tpsvrthrinit`/`tpsvrthrdone` defaults still run either way -- they perform
+/// the worker's `tx_open()`/`tx_close()` -- and a Rust thread hook runs in
+/// addition to them, not instead.
+#[derive(Debug, Clone, Copy)]
+pub struct ServerHooks {
+    init: RustServerInitHook,
+    done: Option<RustServerDoneHook>,
+    thread_init: Option<RustServerThreadInitHook>,
+    thread_done: Option<RustServerThreadDoneHook>,
+}
+
+impl ServerHooks {
+    /// Start from the mandatory `tpsvrinit` hook.
+    pub fn new(init: RustServerInitHook) -> Self {
+        Self {
+            init,
+            done: None,
+            thread_init: None,
+            thread_done: None,
+        }
+    }
+
+    /// Set the `tpsvrdone` hook.
+    pub fn done(mut self, done: RustServerDoneHook) -> Self {
+        self.done = Some(done);
+        self
+    }
+
+    /// Set the per-worker-thread `tpsvrthrinit` hook.
+    pub fn thread_init(mut self, thread_init: RustServerThreadInitHook) -> Self {
+        self.thread_init = Some(thread_init);
+        self
+    }
+
+    /// Set the per-worker-thread `tpsvrthrdone` hook.
+    pub fn thread_done(mut self, thread_done: RustServerThreadDoneHook) -> Self {
+        self.thread_done = Some(thread_done);
+        self
+    }
+}
+
 /// High-level service callback used by [`AtmiCtx::tpadvertise`].
+///
+/// When Enduro/X dispatch threading is configured, the same function may be
+/// invoked concurrently on several libatmisrv worker threads. Any application
+/// state accessed by the handler must therefore be thread-safe.
 pub type RustServiceCallback = for<'ctx> fn(&'ctx AtmiCtx, &mut TpSvcInfo<'ctx>);
 
 /// Event delivered to a Rust poller callback registered with
@@ -42,13 +108,17 @@ pub struct PollerEvent {
 }
 
 /// High-level poller callback used by [`AtmiCtx::tpext_addpollerfd`].
-pub type RustPollerCallback = fn(PollerEvent) -> i32;
+/// The context is the owning main server context because extension events are
+/// always dispatched by the main poll loop, never by service workers.
+pub type RustPollerCallback = for<'ctx> fn(&'ctx AtmiCtx, PollerEvent) -> i32;
 
 /// High-level periodic callback used by [`AtmiCtx::tpext_addperiodcb`].
-pub type RustPeriodCallback = fn() -> i32;
+/// The callback receives the owning main server context.
+pub type RustPeriodCallback = for<'ctx> fn(&'ctx AtmiCtx) -> i32;
 
 /// High-level before-poll callback used by [`AtmiCtx::tpext_addb4pollcb`].
-pub type RustBeforePollCallback = fn() -> i32;
+/// The callback receives the owning main server context.
+pub type RustBeforePollCallback = for<'ctx> fn(&'ctx AtmiCtx) -> i32;
 
 /// Service return status for [`AtmiCtx::tpreturn`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,18 +140,28 @@ impl TpReturnStatus {
 #[derive(Default)]
 struct ServerRuntime {
     ctx_addr: usize,
+    main_thread_id: Option<std::thread::ThreadId>,
     init_hook: Option<RustServerInitHook>,
     done_hook: Option<RustServerDoneHook>,
+    thread_init_hook: Option<RustServerThreadInitHook>,
+    thread_done_hook: Option<RustServerThreadDoneHook>,
     init_error: Option<AtmiError>,
+    /// First worker-thread init failure, kept so a startup abort is
+    /// diagnosable rather than surfacing as a bare EXFAIL.
+    thread_init_error: Option<AtmiError>,
     services: HashMap<String, RustServiceCallback>,
 }
 
 impl ServerRuntime {
     fn reset(&mut self) {
         self.ctx_addr = 0;
+        self.main_thread_id = None;
         self.init_hook = None;
         self.done_hook = None;
+        self.thread_init_hook = None;
+        self.thread_done_hook = None;
         self.init_error = None;
+        self.thread_init_error = None;
         self.services.clear();
     }
 }
@@ -122,21 +202,86 @@ impl Drop for ServerRuntimeGuard {
     }
 }
 
+struct ServerThreadModeGuard {
+    previous: c_int,
+    previous_thread_init: Option<ServerInitHook>,
+    previous_thread_done: Option<ServerDoneHook>,
+}
+
+impl ServerThreadModeGuard {
+    unsafe fn enable() -> Self {
+        let previous = raw::_tmbuilt_with_thread_option;
+        let previous_thread_init = raw::ndrx_G_tpsvrthrinit;
+        let previous_thread_done = raw::ndrx_G_tpsvrthrdone;
+        raw::_tmbuilt_with_thread_option = 1;
+        // Always our own trampolines: they chain to Enduro/X's defaults for
+        // tx_open()/tx_close() and additionally dispatch any Rust thread hook.
+        raw::ndrx_G_tpsvrthrinit = Some(rust_thread_init);
+        raw::ndrx_G_tpsvrthrdone = Some(rust_thread_done);
+        Self {
+            previous,
+            previous_thread_init,
+            previous_thread_done,
+        }
+    }
+}
+
+impl Drop for ServerThreadModeGuard {
+    fn drop(&mut self) {
+        unsafe {
+            raw::_tmbuilt_with_thread_option = self.previous;
+            raw::ndrx_G_tpsvrthrinit = self.previous_thread_init;
+            raw::ndrx_G_tpsvrthrdone = self.previous_thread_done;
+        }
+    }
+}
+
+unsafe fn fail_current_service(svc_ptr: *mut raw::TPSVCINFO) {
+    let data = (*svc_ptr).data;
+    let len = (*svc_ptr).len.max(0) as c_long;
+    raw::tpreturn(TpReturnStatus::Fail.to_raw(), 0, data, len, 0);
+}
+
 unsafe extern "C" fn rust_service_dispatch(svc_ptr: *mut raw::TPSVCINFO) {
     if svc_ptr.is_null() {
         return;
     }
 
-    let ctx_addr = match server_runtime().lock() {
-        Ok(rt) => rt.ctx_addr,
-        Err(_) => return,
+    let current_thread = std::thread::current().id();
+    let (ctx_addr, is_main_thread) = match server_runtime().lock() {
+        Ok(rt) => (
+            rt.ctx_addr,
+            rt.main_thread_id
+                .as_ref()
+                .is_some_and(|thread_id| *thread_id == current_thread),
+        ),
+        Err(_) => {
+            fail_current_service(svc_ptr);
+            return;
+        }
     };
-
     if ctx_addr == 0 {
+        fail_current_service(svc_ptr);
         return;
     }
 
-    let ctx = &*(ctx_addr as *const AtmiCtx);
+    // Single-threaded servers dispatch on the tp_run thread, where the owning
+    // context is already correct. Threaded servers dispatch on initialized
+    // libatmisrv workers and need a callback-scoped worker context instead.
+    let worker_ctx = if is_main_thread {
+        None
+    } else {
+        match AtmiCtx::borrow_current_worker() {
+            Ok(ctx) => Some(ctx),
+            Err(_) => {
+                fail_current_service(svc_ptr);
+                return;
+            }
+        }
+    };
+    let ctx = worker_ctx
+        .as_ref()
+        .unwrap_or_else(|| &*(ctx_addr as *const AtmiCtx));
     let mut svc = TpSvcInfo::from_raw(ctx, svc_ptr);
 
     let key = if svc.fname().is_empty() {
@@ -184,6 +329,10 @@ unsafe extern "C" fn rust_poller_dispatch(
     events: u32,
     _ptr1: *mut ::std::os::raw::c_void,
 ) -> c_int {
+    let ctx = match main_extension_context() {
+        Some(ctx) => ctx,
+        None => return -1,
+    };
     let (cb, user_data) = match extension_runtime().lock() {
         Ok(rt) => match rt.pollers.get(&(fd as i32)).copied() {
             Some(v) => v,
@@ -193,37 +342,191 @@ unsafe extern "C" fn rust_poller_dispatch(
     };
 
     catch_unwind(AssertUnwindSafe(|| {
-        cb(PollerEvent {
-            fd: fd as i32,
-            events,
-            user_data,
-        })
+        cb(
+            ctx,
+            PollerEvent {
+                fd: fd as i32,
+                events,
+                user_data,
+            },
+        )
     }))
     .unwrap_or(-1)
 }
 
 unsafe extern "C" fn rust_period_dispatch() -> c_int {
+    let ctx = match main_extension_context() {
+        Some(ctx) => ctx,
+        None => return -1,
+    };
     let cb = match extension_runtime().lock() {
         Ok(rt) => rt.period_cb,
         Err(_) => return -1,
     };
 
     match cb {
-        Some(cb) => catch_unwind(AssertUnwindSafe(cb)).unwrap_or(-1),
+        Some(cb) => catch_unwind(AssertUnwindSafe(|| cb(ctx))).unwrap_or(-1),
         None => 0,
     }
 }
 
 unsafe extern "C" fn rust_before_poll_dispatch() -> c_int {
+    let ctx = match main_extension_context() {
+        Some(ctx) => ctx,
+        None => return -1,
+    };
     let cb = match extension_runtime().lock() {
         Ok(rt) => rt.before_poll_cb,
         Err(_) => return -1,
     };
 
     match cb {
-        Some(cb) => catch_unwind(AssertUnwindSafe(cb)).unwrap_or(-1),
+        Some(cb) => catch_unwind(AssertUnwindSafe(|| cb(ctx))).unwrap_or(-1),
         None => 0,
     }
+}
+
+/// Resolve the `tp_run` context for an extension callback, or `None` when it is
+/// unavailable or the caller is not the main poll-loop thread.
+///
+/// # Safety
+///
+/// The returned `'static` lifetime is wider than the context actually lives:
+/// `ctx_addr` points at a stack local owned by [`AtmiCtx::tp_run`]. Two
+/// invariants keep it from escaping. `ServerRuntimeGuard` clears `ctx_addr`
+/// before `tp_run` returns, so a stale address is never resolved, and the
+/// extension callback types are higher-ranked (`for<'ctx> fn(&'ctx AtmiCtx,
+/// ..)`), so a callback cannot store the reference it receives. Callers must
+/// therefore only narrow this lifetime into a callback invocation and never
+/// retain the reference past that call.
+/// Reject a poll-extension mutation issued from anywhere but the main thread.
+///
+/// Enduro/X keeps these in one unsynchronised global list that the main
+/// dispatch thread walks on every poll iteration, so mutating it from a worker
+/// corrupts the poll set and wedges the server. That is a documented
+/// constraint, but documentation cannot stop a safe method being called from a
+/// service handler under `maxdispatchthreads > 1` -- so it is checked.
+///
+/// Only enforced while a server is actually running: outside `tp_run` there is
+/// no main thread to compare against and no poll loop to race.
+fn require_main_thread(what: &str) -> AtmiResult<()> {
+    let current = std::thread::current().id();
+    let main = match server_runtime().lock() {
+        Ok(rt) => rt.main_thread_id,
+        Err(_) => return Err(runtime_lock_err()),
+    };
+    match main {
+        Some(main) if main != current => Err(AtmiError::new(
+            raw::TPEPROTO,
+            format!(
+                "{what} must be called from the main server thread; calling it                  from a dispatch worker races Enduro/X's global poll-extension                  list and can wedge the server"
+            ),
+        )),
+        _ => Ok(()),
+    }
+}
+
+unsafe fn main_extension_context() -> Option<&'static AtmiCtx> {
+    let current_thread = std::thread::current().id();
+    let ctx_addr = match server_runtime().lock() {
+        Ok(rt)
+            if rt.ctx_addr != 0
+                && rt
+                    .main_thread_id
+                    .as_ref()
+                    .is_some_and(|thread_id| *thread_id == current_thread) =>
+        {
+            rt.ctx_addr
+        }
+        _ => return None,
+    };
+    Some(&*(ctx_addr as *const AtmiCtx))
+}
+
+/// Collect `argc`/`argv` as Enduro/X hands them to a C hook.
+unsafe fn hook_args(argc: c_int, argv: *mut *mut c_char) -> Vec<String> {
+    if argv.is_null() || argc <= 0 {
+        return Vec::new();
+    }
+    (0..argc as usize)
+        .filter_map(|i| {
+            let p = *argv.add(i);
+            if p.is_null() {
+                None
+            } else {
+                Some(CStr::from_ptr(p).to_string_lossy().into_owned())
+            }
+        })
+        .collect()
+}
+
+/// `tpsvrthrinit` trampoline, run on each dispatch thread.
+///
+/// Enduro/X calls this from `ndrx_call_tpsvrthrinit`, which has already done
+/// `tpinit(NULL)` for the worker, so the thread has a usable ATMI context. The
+/// library default runs first for its `tx_open()`; a Rust hook runs after it and
+/// on top of it, never instead.
+unsafe extern "C" fn rust_thread_init(argc: c_int, argv: *mut *mut c_char) -> c_int {
+    /// Keep the first failure only: later workers may fail for knock-on
+    /// reasons, and the first one is the useful diagnosis.
+    fn record(err: AtmiError) -> c_int {
+        if let Ok(mut rt) = server_runtime().lock() {
+            if rt.thread_init_error.is_none() {
+                rt.thread_init_error = Some(err);
+            }
+        }
+        raw::EXFAIL as c_int
+    }
+
+    if raw::tpsvrthrinit(argc, argv) < 0 {
+        return record(AtmiError::new(
+            raw::TPESYSTEM,
+            "Enduro/X default tpsvrthrinit() failed for a dispatch thread",
+        ));
+    }
+
+    let hook = match server_runtime().lock() {
+        Ok(rt) => rt.thread_init_hook,
+        Err(_) => return record(runtime_lock_err()),
+    };
+    let Some(hook) = hook else {
+        return raw::EXSUCCEED as c_int;
+    };
+
+    let ctx = match AtmiCtx::borrow_current_worker() {
+        Ok(ctx) => ctx,
+        Err(err) => return record(err),
+    };
+    let args = hook_args(argc, argv);
+
+    match catch_unwind(AssertUnwindSafe(|| hook(&ctx, &args))) {
+        Ok(Ok(())) => raw::EXSUCCEED as c_int,
+        Ok(Err(err)) => record(err),
+        Err(_) => record(AtmiError::new(
+            raw::TPESYSTEM,
+            "server thread init hook panicked",
+        )),
+    }
+}
+
+/// `tpsvrthrdone` trampoline, run on each dispatch thread.
+///
+/// `ndrx_call_tpsvrthrdone` invokes this *before* `tpterm()`, so the worker
+/// context is still live. The Rust hook runs first, then the library default
+/// for its `tx_close()`.
+unsafe extern "C" fn rust_thread_done() {
+    let hook = match server_runtime().lock() {
+        Ok(rt) => rt.thread_done_hook,
+        Err(_) => None,
+    };
+
+    if let Some(hook) = hook {
+        if let Ok(ctx) = AtmiCtx::borrow_current_worker() {
+            let _ = catch_unwind(AssertUnwindSafe(|| hook(&ctx)));
+        }
+    }
+
+    raw::tpsvrthrdone();
 }
 
 unsafe extern "C" fn rust_server_init(argc: c_int, argv: *mut *mut c_char) -> c_int {
@@ -497,6 +800,19 @@ impl AtmiCtx {
         self.rc_to_result(rc)
     }
 
+    /// # Main-thread only
+    ///
+    /// Enduro/X keeps the poller extensions in a single global list
+    /// (`ndrx_G_pollext`) and mirrors them into the shared `epollfd`, with no
+    /// locking anywhere (`libatmisrv/pollextension.c`). The main dispatch
+    /// thread walks that list on every poll iteration.
+    ///
+    /// Calling this from a service handler is therefore only safe while
+    /// `maxdispatchthreads` is 1, where handlers run on the main thread. Under
+    /// dispatch threading a handler runs on a worker, and mutating the list
+    /// there races the poll loop -- which in practice wedges the server and
+    /// makes it stop answering requests. Register extensions from a callback
+    /// that already runs on the main poll thread instead.
     pub fn tpext_addpollerfd(
         &self,
         fd: i32,
@@ -504,6 +820,7 @@ impl AtmiCtx {
         user_data: usize,
         callback: RustPollerCallback,
     ) -> AtmiResult<()> {
+        require_main_thread("tpext_addpollerfd")?;
         {
             let mut rt = extension_runtime().lock().map_err(|_| runtime_lock_err())?;
             rt.pollers.insert(fd, (callback, user_data));
@@ -540,7 +857,21 @@ impl AtmiCtx {
         }
     }
 
+    /// # Main-thread only
+    ///
+    /// Enduro/X keeps the poller extensions in a single global list
+    /// (`ndrx_G_pollext`) and mirrors them into the shared `epollfd`, with no
+    /// locking anywhere (`libatmisrv/pollextension.c`). The main dispatch
+    /// thread walks that list on every poll iteration.
+    ///
+    /// Calling this from a service handler is therefore only safe while
+    /// `maxdispatchthreads` is 1, where handlers run on the main thread. Under
+    /// dispatch threading a handler runs on a worker, and mutating the list
+    /// there races the poll loop -- which in practice wedges the server and
+    /// makes it stop answering requests. Register extensions from a callback
+    /// that already runs on the main poll thread instead.
     pub fn tpext_delpollerfd(&self, fd: i32) -> AtmiResult<()> {
+        require_main_thread("tpext_delpollerfd")?;
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpext_delpollerfd(fd as c_int) };
 
@@ -557,7 +888,21 @@ impl AtmiCtx {
         }
     }
 
+    /// # Main-thread only
+    ///
+    /// Enduro/X keeps the poller extensions in a single global list
+    /// (`ndrx_G_pollext`) and mirrors them into the shared `epollfd`, with no
+    /// locking anywhere (`libatmisrv/pollextension.c`). The main dispatch
+    /// thread walks that list on every poll iteration.
+    ///
+    /// Calling this from a service handler is therefore only safe while
+    /// `maxdispatchthreads` is 1, where handlers run on the main thread. Under
+    /// dispatch threading a handler runs on a worker, and mutating the list
+    /// there races the poll loop -- which in practice wedges the server and
+    /// makes it stop answering requests. Register extensions from a callback
+    /// that already runs on the main poll thread instead.
     pub fn tpext_addperiodcb(&self, secs: i32, callback: RustPeriodCallback) -> AtmiResult<()> {
+        require_main_thread("tpext_addperiodcb")?;
         {
             let mut rt = extension_runtime().lock().map_err(|_| runtime_lock_err())?;
             rt.period_cb = Some(callback);
@@ -581,7 +926,21 @@ impl AtmiCtx {
         }
     }
 
+    /// # Main-thread only
+    ///
+    /// Enduro/X keeps the poller extensions in a single global list
+    /// (`ndrx_G_pollext`) and mirrors them into the shared `epollfd`, with no
+    /// locking anywhere (`libatmisrv/pollextension.c`). The main dispatch
+    /// thread walks that list on every poll iteration.
+    ///
+    /// Calling this from a service handler is therefore only safe while
+    /// `maxdispatchthreads` is 1, where handlers run on the main thread. Under
+    /// dispatch threading a handler runs on a worker, and mutating the list
+    /// there races the poll loop -- which in practice wedges the server and
+    /// makes it stop answering requests. Register extensions from a callback
+    /// that already runs on the main poll thread instead.
     pub fn tpext_delperiodcb(&self) -> AtmiResult<()> {
+        require_main_thread("tpext_delperiodcb")?;
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpext_delperiodcb() };
 
@@ -598,7 +957,21 @@ impl AtmiCtx {
         }
     }
 
+    /// # Main-thread only
+    ///
+    /// Enduro/X keeps the poller extensions in a single global list
+    /// (`ndrx_G_pollext`) and mirrors them into the shared `epollfd`, with no
+    /// locking anywhere (`libatmisrv/pollextension.c`). The main dispatch
+    /// thread walks that list on every poll iteration.
+    ///
+    /// Calling this from a service handler is therefore only safe while
+    /// `maxdispatchthreads` is 1, where handlers run on the main thread. Under
+    /// dispatch threading a handler runs on a worker, and mutating the list
+    /// there races the poll loop -- which in practice wedges the server and
+    /// makes it stop answering requests. Register extensions from a callback
+    /// that already runs on the main poll thread instead.
     pub fn tpext_addb4pollcb(&self, callback: RustBeforePollCallback) -> AtmiResult<()> {
+        require_main_thread("tpext_addb4pollcb")?;
         {
             let mut rt = extension_runtime().lock().map_err(|_| runtime_lock_err())?;
             rt.before_poll_cb = Some(callback);
@@ -621,7 +994,21 @@ impl AtmiCtx {
         }
     }
 
+    /// # Main-thread only
+    ///
+    /// Enduro/X keeps the poller extensions in a single global list
+    /// (`ndrx_G_pollext`) and mirrors them into the shared `epollfd`, with no
+    /// locking anywhere (`libatmisrv/pollextension.c`). The main dispatch
+    /// thread walks that list on every poll iteration.
+    ///
+    /// Calling this from a service handler is therefore only safe while
+    /// `maxdispatchthreads` is 1, where handlers run on the main thread. Under
+    /// dispatch threading a handler runs on a worker, and mutating the list
+    /// there races the poll loop -- which in practice wedges the server and
+    /// makes it stop answering requests. Register extensions from a callback
+    /// that already runs on the main poll thread instead.
     pub fn tpext_delb4pollcb(&self) -> AtmiResult<()> {
+        require_main_thread("tpext_delb4pollcb")?;
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpext_delb4pollcb() };
 
@@ -696,27 +1083,29 @@ impl AtmiCtx {
         }
     }
 
-    /// High-level server runner, analogous to Go `TpRun(init, uninit)`.
+    /// High-level server runner: hands the four C lifecycle hooks to Enduro/X
+    /// and does not return until the server shuts down.
     ///
-    /// This handles argv conversion and low-level C callback wiring.
-    pub fn tp_run(
-        &self,
-        init_hook: RustServerInitHook,
-        done_hook: RustServerDoneHook,
-    ) -> AtmiResult<()> {
-        self.tp_run_inner(init_hook, Some(done_hook))
+    /// Handles argv conversion and the low-level C callback wiring.
+    ///
+    /// ```no_run
+    /// # use endurox_rs::{AtmiCtx, AtmiResult, ServerHooks};
+    /// # fn my_init(_: &AtmiCtx, _: &[String]) -> AtmiResult<()> { Ok(()) }
+    /// # fn my_done(_: &AtmiCtx) {}
+    /// # fn my_thread_init(_: &AtmiCtx, _: &[String]) -> AtmiResult<()> { Ok(()) }
+    /// # fn run(ctx: &AtmiCtx) -> AtmiResult<()> {
+    /// ctx.tp_run(
+    ///     ServerHooks::new(my_init)
+    ///         .done(my_done)
+    ///         .thread_init(my_thread_init),
+    /// )
+    /// # }
+    /// ```
+    pub fn tp_run(&self, hooks: ServerHooks) -> AtmiResult<()> {
+        self.tp_run_inner(hooks)
     }
 
-    /// Variant of [`AtmiCtx::tp_run`] without a shutdown callback.
-    pub fn tp_run_no_uninit(&self, init_hook: RustServerInitHook) -> AtmiResult<()> {
-        self.tp_run_inner(init_hook, None)
-    }
-
-    fn tp_run_inner(
-        &self,
-        init_hook: RustServerInitHook,
-        done_hook: Option<RustServerDoneHook>,
-    ) -> AtmiResult<()> {
+    fn tp_run_inner(&self, hooks: ServerHooks) -> AtmiResult<()> {
         let self_addr = self as *const AtmiCtx as usize;
         {
             let mut rt = server_runtime().lock().map_err(|_| runtime_lock_err())?;
@@ -728,11 +1117,15 @@ impl AtmiCtx {
             }
             rt.reset();
             rt.ctx_addr = self_addr;
-            rt.init_hook = Some(init_hook);
-            rt.done_hook = done_hook;
+            rt.main_thread_id = Some(std::thread::current().id());
+            rt.init_hook = Some(hooks.init);
+            rt.done_hook = hooks.done;
+            rt.thread_init_hook = hooks.thread_init;
+            rt.thread_done_hook = hooks.thread_done;
         }
 
         let _runtime_guard = ServerRuntimeGuard;
+        let _thread_mode_guard = unsafe { ServerThreadModeGuard::enable() };
 
         let args: Vec<String> = std::env::args().collect();
         let mut cargs: Vec<CString> = args
@@ -753,17 +1146,20 @@ impl AtmiCtx {
                 argv.as_mut_ptr(),
                 Some(rust_server_init),
                 Some(rust_server_done),
-                0,
+                raw::ATMI_SRVLIB_NOLONGJUMP as i64,
             )
         };
 
         if rc == raw::EXSUCCEED as c_int {
             Ok(())
         } else {
-            let init_error = server_runtime()
-                .lock()
-                .ok()
-                .and_then(|rt| rt.init_error.clone());
+            let init_error = server_runtime().lock().ok().and_then(|rt| {
+                // Prefer the main init hook's error; fall back to the first
+                // worker-thread failure, which is otherwise invisible.
+                rt.init_error
+                    .clone()
+                    .or_else(|| rt.thread_init_error.clone())
+            });
             Err(init_error.unwrap_or_else(|| AtmiError::new(raw::TPESYSTEM, "ATMI server failed")))
         }
     }
@@ -774,13 +1170,7 @@ impl AtmiCtx {
     /// transferred to the XATMI framework. The buffer's tracked `len()` is
     /// forwarded as the `tpreturn` length argument (relevant for CARRAY/STRING;
     /// ignored for self-describing buffer types).
-    pub fn tpreturn(
-        &self,
-        status: TpReturnStatus,
-        rcode: i64,
-        data: TypedBuffer<'_>,
-        flags: i64,
-    ) {
+    pub fn tpreturn(&self, status: TpReturnStatus, rcode: i64, data: TypedBuffer<'_>, flags: i64) {
         let len = data.len();
         let ptr = data.into_raw();
         unsafe { self.tpreturn_raw(status.to_raw(), rcode, ptr, len, flags) };

@@ -735,6 +735,313 @@ fn rust_long_arg(ubf: &TypedUbf<'_>, _funcname: &str, arg: &str) -> i64 {
     (ubf.bget_long(ubf_fields::T_LONG_FLD, 0).ok() == Some(expected)) as i64
 }
 
+/// A `BFLD_PTR` field must store the target's *address*, not the first bytes of
+/// its contents, and the target must survive the write.
+///
+/// `CBchg` takes a pointer to the value; for `BFLD_PTR` the value is itself a
+/// pointer. Passing the target address directly used to store the target's
+/// payload bytes as if they were an address.
+#[test]
+fn ubf_ptr_field_round_trips_the_target_buffer() {
+    let _guard = endurox_test_env();
+    let ctx = AtmiCtx::new().expect("failed to create AtmiCtx");
+    ctx.tpinit().expect("tpinit failed");
+
+    let mut master = ctx.tpalloc_ubf(1024).expect("tpalloc_ubf failed");
+    let target = ctx
+        .tpalloc_carray(b"PAYLOAD")
+        .expect("tpalloc_carray failed");
+
+    master
+        .bchg(ubf_fields::T_PTR_FLD, 0, UbfValue::Ptr(target), true)
+        .expect("storing a BFLD_PTR field failed");
+
+    // tptypes only succeeds for a buffer Enduro/X still has registered, so this
+    // proves both that the address round-tripped and that the target was not
+    // freed when `bchg` consumed the wrapper.
+    let borrowed = master
+        .bget_ptr(ubf_fields::T_PTR_FLD, 0)
+        .expect("bget_ptr failed");
+    let info = borrowed
+        .tptypes()
+        .expect("target is not a live ATMI buffer");
+    assert_eq!(info.type_name, "CARRAY");
+    assert_eq!(info.size, 7);
+
+    drop(borrowed);
+    // Dropping `master` frees the target through Enduro/X's cascade
+    // (ndrx_tpfree_scan_ptrs). Freeing it here as well would be a double free.
+    drop(master);
+    ctx.tpterm().expect("tpterm failed");
+}
+
+/// Extracting a `BFLD_PTR` removes the reference, so the master no longer
+/// cascades into it and the caller becomes its sole owner.
+#[test]
+fn ubf_ptr_field_extraction_transfers_ownership() {
+    let _guard = endurox_test_env();
+    let ctx = AtmiCtx::new().expect("failed to create AtmiCtx");
+    ctx.tpinit().expect("tpinit failed");
+
+    let mut master = ctx.tpalloc_ubf(1024).expect("master");
+    let target = ctx.tpalloc_ubf(512).expect("target").into_inner();
+    master
+        .bchg(ubf_fields::T_PTR_2_FLD, 0, UbfValue::Ptr(target), true)
+        .expect("storing a BFLD_PTR field failed");
+
+    let extracted = master
+        .bextract_ptr(ubf_fields::T_PTR_2_FLD, 0)
+        .expect("bextract_ptr failed");
+    assert!(
+        master.bget_ptr(ubf_fields::T_PTR_2_FLD, 0).is_err(),
+        "extraction must remove the occurrence from the master"
+    );
+
+    // The master must not free the extracted buffer.
+    drop(master);
+
+    // Still live, and writable -- extraction hands over a standalone buffer.
+    let mut owned = TypedUbf::from_typed(extracted);
+    owned
+        .bchg(
+            ubf_fields::T_STRING_FLD,
+            0,
+            UbfValue::String("ALIVE".to_string()),
+            true,
+        )
+        .expect("extracted buffer should be writable after the master is gone");
+    assert_eq!(
+        owned
+            .bget_string(ubf_fields::T_STRING_FLD, 0)
+            .expect("read back"),
+        "ALIVE"
+    );
+
+    drop(owned);
+    ctx.tpterm().expect("tpterm failed");
+}
+
+/// `BFLD_PTR` is a normal multi-occurrence field: each occurrence holds its own
+/// target, and extracting one must not disturb the others.
+#[test]
+fn ubf_ptr_field_supports_multiple_occurrences() {
+    let _guard = endurox_test_env();
+    let ctx = AtmiCtx::new().expect("failed to create AtmiCtx");
+    ctx.tpinit().expect("tpinit failed");
+
+    let mut master = ctx.tpalloc_ubf(4096).expect("master");
+
+    // Distinct sizes so each occurrence is identifiable via tptypes().
+    for size in [3usize, 5, 9] {
+        let target = ctx
+            .tpalloc_carray(&vec![b'x'; size])
+            .expect("tpalloc_carray failed");
+        master
+            .badd(ubf_fields::T_PTR_FLD, UbfValue::Ptr(target), true)
+            .expect("badd BFLD_PTR occurrence failed");
+    }
+
+    for (occ, expect) in [(0, 3usize), (1, 5), (2, 9)] {
+        let got = master
+            .bget_ptr(ubf_fields::T_PTR_FLD, occ)
+            .expect("bget_ptr on occurrence failed")
+            .tptypes()
+            .expect("occurrence target is not a live ATMI buffer");
+        assert_eq!(got.type_name, "CARRAY");
+        assert_eq!(
+            got.size, expect,
+            "occurrence {occ} resolved to the wrong target"
+        );
+    }
+
+    // Extract the middle one; UBF closes the gap, so occ 1 becomes the old occ 2.
+    let extracted = master
+        .bextract_ptr(ubf_fields::T_PTR_FLD, 1)
+        .expect("bextract_ptr failed");
+    assert_eq!(extracted.tptypes().expect("extracted live").size, 5);
+
+    assert_eq!(
+        master
+            .bget_ptr(ubf_fields::T_PTR_FLD, 0)
+            .expect("occ 0 survives")
+            .tptypes()
+            .expect("live")
+            .size,
+        3
+    );
+    assert_eq!(
+        master
+            .bget_ptr(ubf_fields::T_PTR_FLD, 1)
+            .expect("occ 2 shifted down to occ 1")
+            .tptypes()
+            .expect("live")
+            .size,
+        9
+    );
+    assert!(
+        master.bget_ptr(ubf_fields::T_PTR_FLD, 2).is_err(),
+        "only two occurrences should remain"
+    );
+
+    // master frees occurrences 0 and 1; `extracted` frees itself.
+    drop(master);
+    drop(extracted);
+    ctx.tpterm().expect("tpterm failed");
+}
+
+/// `bget_ptr_ubf` gives a read-only view of a UBF target and refuses to
+/// reinterpret a target of any other buffer type as UBF.
+#[test]
+fn ubf_ptr_field_read_only_ubf_view() {
+    let _guard = endurox_test_env();
+    let ctx = AtmiCtx::new().expect("failed to create AtmiCtx");
+    ctx.tpinit().expect("tpinit failed");
+
+    let mut master = ctx.tpalloc_ubf(4096).expect("master");
+
+    // occ 0: a UBF target carrying a known field.
+    let mut inner = ctx.tpalloc_ubf(1024).expect("inner ubf");
+    inner
+        .bchg(
+            ubf_fields::T_STRING_FLD,
+            0,
+            UbfValue::String("NESTED".to_string()),
+            true,
+        )
+        .expect("write into the target");
+    master
+        .badd(
+            ubf_fields::T_PTR_FLD,
+            UbfValue::Ptr(inner.into_inner()),
+            true,
+        )
+        .expect("badd ubf target");
+
+    // occ 1: a CARRAY target, which must not pass as UBF.
+    let carray = ctx.tpalloc_carray(b"NOTUBF").expect("carray target");
+    master
+        .badd(ubf_fields::T_PTR_FLD, UbfValue::Ptr(carray), true)
+        .expect("badd carray target");
+
+    let view = master
+        .bget_ptr_ubf(ubf_fields::T_PTR_FLD, 0)
+        .expect("bget_ptr_ubf on a UBF target failed");
+    assert_eq!(
+        view.bget_string(ubf_fields::T_STRING_FLD, 0)
+            .expect("read through the read-only view"),
+        "NESTED"
+    );
+    // `view` borrows `master`; letting it fall out of scope here releases the
+    // borrow. An explicit drop() is redundant -- BorrowedUbf owns nothing.
+
+    let err = master
+        .bget_ptr_ubf(ubf_fields::T_PTR_FLD, 1)
+        .expect_err("a CARRAY target must not be handed out as a UBF view");
+    assert_eq!(err.code, endurox_rs::UbfError::BTYPERR);
+
+    // bget_ptr still reaches the same CARRAY target.
+    assert_eq!(
+        master
+            .bget_ptr(ubf_fields::T_PTR_FLD, 1)
+            .expect("bget_ptr on the carray target")
+            .tptypes()
+            .expect("live")
+            .type_name,
+        "CARRAY"
+    );
+
+    drop(master);
+    ctx.tpterm().expect("tpterm failed");
+}
+
+/// `badd_fast` must transfer `BFLD_PTR` ownership exactly like the normal write
+/// path. It returns early on success, so it needs its own `mem::forget`;
+/// without it the target is freed the moment the call returns and the field is
+/// left pointing at freed memory.
+#[test]
+fn ubf_ptr_field_fast_add_transfers_ownership() {
+    let _guard = endurox_test_env();
+    let ctx = AtmiCtx::new().expect("failed to create AtmiCtx");
+    ctx.tpinit().expect("tpinit failed");
+
+    let mut master = ctx.tpalloc_ubf(4096).expect("master");
+    let mut loc = BFldLocInfo::default();
+
+    let first = ctx.tpalloc_carray(b"FAST-1").expect("first target");
+    master
+        .badd_fast(
+            ubf_fields::T_PTR_FLD,
+            UbfValue::Ptr(first),
+            &mut loc,
+            true,
+            true,
+        )
+        .expect("badd_fast BFLD_PTR failed");
+
+    let second = ctx.tpalloc_carray(b"FAST-22").expect("second target");
+    master
+        .badd_fast(
+            ubf_fields::T_PTR_FLD,
+            UbfValue::Ptr(second),
+            &mut loc,
+            false,
+            true,
+        )
+        .expect("second badd_fast BFLD_PTR failed");
+
+    // tptypes only succeeds while Enduro/X still has the buffer registered, so
+    // this fails loudly if either target was freed by the fast path.
+    for (occ, size) in [(0, 6usize), (1, 7)] {
+        let info = master
+            .bget_ptr(ubf_fields::T_PTR_FLD, occ)
+            .expect("bget_ptr after badd_fast")
+            .tptypes()
+            .expect("fast-added target was freed while still referenced");
+        assert_eq!(info.type_name, "CARRAY");
+        assert_eq!(info.size, size);
+    }
+
+    drop(master);
+    ctx.tpterm().expect("tpterm failed");
+}
+
+/// Overwriting an occupied `BFLD_PTR` occurrence must reclaim the target it
+/// displaces. Nothing else references it afterwards, so Enduro/X's free cascade
+/// would never reach it and it would leak for the life of the process.
+#[test]
+fn ubf_ptr_field_replacement_reclaims_the_old_target() {
+    let _guard = endurox_test_env();
+    let ctx = AtmiCtx::new().expect("failed to create AtmiCtx");
+    ctx.tpinit().expect("tpinit failed");
+
+    let mut master = ctx.tpalloc_ubf(4096).expect("master");
+
+    let first = ctx.tpalloc_carray(b"OLD").expect("first target");
+    master
+        .bchg(ubf_fields::T_PTR_FLD, 0, UbfValue::Ptr(first), true)
+        .expect("initial bchg failed");
+
+    // Replace it. The displaced target must be freed, not orphaned.
+    let second = ctx.tpalloc_carray(b"REPLACEMENT").expect("second target");
+    master
+        .bchg(ubf_fields::T_PTR_FLD, 0, UbfValue::Ptr(second), true)
+        .expect("replacing bchg failed");
+
+    // The field now resolves to the replacement, still live.
+    let info = master
+        .bget_ptr(ubf_fields::T_PTR_FLD, 0)
+        .expect("bget_ptr after replacement")
+        .tptypes()
+        .expect("replacement target should be live");
+    assert_eq!(info.type_name, "CARRAY");
+    assert_eq!(info.size, 11);
+
+    // Dropping the master frees only the replacement; the displaced buffer was
+    // already reclaimed, so this must not double-free.
+    drop(master);
+    ctx.tpterm().expect("tpterm failed");
+}
+
 #[test]
 fn atmictx_ubf_error_paths_set_ubf_error() {
     let _guard = endurox_test_env();

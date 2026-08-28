@@ -24,6 +24,33 @@ fn atmictx_init_integration() {
     ctx.tpterm().expect("tpterm failed");
 }
 
+#[cfg(feature = "ctx-send")]
+#[test]
+fn ctx_send_context_can_move_to_another_thread() {
+    fn assert_send<T: Send>() {}
+    assert_send::<AtmiCtx>();
+
+    let _guard = endurox_test_env();
+    let ctx = AtmiCtx::new().expect("failed to create detached AtmiCtx");
+    std::thread::spawn(move || {
+        ctx.tpinit().expect("Object API tpinit failed after move");
+        let buffer = ctx
+            .tpalloc_carray(b"moved context")
+            .expect("Object API tpalloc failed after move");
+        drop(buffer);
+        ctx.tpterm().expect("Object API tpterm failed after move");
+    })
+    .join()
+    .expect("moved context thread panicked");
+}
+
+#[cfg(all(feature = "ctx-send", feature = "async-io"))]
+#[test]
+fn async_io_adapter_preserves_movable_context_type() {
+    fn assert_send<T: Send>() {}
+    assert_send::<endurox_rs::AsyncIoAtmiCtx>();
+}
+
 #[test]
 fn tpalloc_generic_and_cast_to_ubf() {
     let _guard = endurox_test_env();
@@ -58,6 +85,38 @@ fn tpalloc_ubf() {
     endurox_rs::ndrx_error!(ctx, ">>>>> About to free UBF...");
     drop(buf);
     drop(ctx);
+}
+
+#[cfg(all(feature = "async", not(endurox_pollable)))]
+#[test]
+fn async_adapters_report_non_pollable_endurox_backend() {
+    let _guard = endurox_test_env();
+    assert!(!AtmiCtx::ASYNC_SUPPORTED);
+
+    #[cfg(feature = "tokio")]
+    {
+        assert!(!AtmiCtx::TOKIO_ASYNC_SUPPORTED);
+        let ctx = AtmiCtx::new().expect("failed to create Tokio AtmiCtx");
+        ctx.tpinit().expect("Tokio context tpinit failed");
+        let error = match ctx.into_tokio() {
+            Ok(_) => panic!("non-pollable Enduro/X backend accepted Tokio adapter"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, endurox_rs::AtmiError::TPEINVAL);
+        assert!(error.message.contains("EX_USE_EPOLL"));
+    }
+
+    #[cfg(feature = "async-io")]
+    {
+        let ctx = AtmiCtx::new().expect("failed to create async-io AtmiCtx");
+        ctx.tpinit().expect("async-io context tpinit failed");
+        let error = match ctx.into_async_io() {
+            Ok(_) => panic!("non-pollable Enduro/X backend accepted async-io adapter"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, endurox_rs::AtmiError::TPEINVAL);
+        assert!(error.message.contains("EX_USE_EPOLL"));
+    }
 }
 
 #[test]

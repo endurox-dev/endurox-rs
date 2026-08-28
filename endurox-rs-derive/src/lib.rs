@@ -119,13 +119,10 @@ fn expand_ubf_deserialize(input: DeriveInput) -> Result<proc_macro2::TokenStream
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let skipped = fields
-        .iter()
-        .filter(|field| field.attr.skip)
-        .map(|field| {
-            let ident = &field.ident;
-            quote! { #ident: ::std::default::Default::default(), }
-        });
+    let skipped = fields.iter().filter(|field| field.attr.skip).map(|field| {
+        let ident = &field.ident;
+        quote! { #ident: ::std::default::Default::default(), }
+    });
 
     Ok(quote! {
         impl #impl_generics ::endurox_rs::UbfDeserialize for #name #ty_generics #where_clause {

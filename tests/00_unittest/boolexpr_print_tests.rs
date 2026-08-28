@@ -22,10 +22,7 @@ fn bboolpr_prints_simple_field_comparison() {
         printed.contains("T_LONG_FLD"),
         "expected field name in {printed:?}"
     );
-    assert!(
-        printed.contains("42"),
-        "expected literal in {printed:?}"
-    );
+    assert!(printed.contains("42"), "expected literal in {printed:?}");
 
     ctx.btreefree(tree);
 }
@@ -66,7 +63,9 @@ fn bboolpr_roundtrips_through_bboolco() {
     let _guard = endurox_test_env();
     let ctx = AtmiCtx::new().expect("failed to create AtmiCtx");
 
-    let tree1 = ctx.bboolco("T_LONG_FLD == 7").expect("first Bboolco failed");
+    let tree1 = ctx
+        .bboolco("T_LONG_FLD == 7")
+        .expect("first Bboolco failed");
     let printed1 = ctx.bboolpr(&tree1).expect("first Bboolpr failed");
     ctx.btreefree(tree1);
 

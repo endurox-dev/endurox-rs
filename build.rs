@@ -47,7 +47,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LDFLAGS");
     println!("cargo:rerun-if-env-changed=LIBCLANG_PATH");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
-    println!("cargo:rustc-check-cfg=cfg(endurox_epoll)");
+    println!("cargo:rustc-check-cfg=cfg(endurox_pollable)");
 
     // Resolve Enduro/X libs and include paths via pkg-config (atmisrvinteg.pc).
     // This emits the appropriate cargo:rustc-link-lib / rustc-link-search lines.
@@ -64,8 +64,8 @@ fn main() {
 
     generate_ubf_field_constants();
 
-    if endurox_config_is_epoll(&include_dirs) {
-        println!("cargo:rustc-cfg=endurox_epoll");
+    if endurox_config_has_pollable_reply_queue(&include_dirs) {
+        println!("cargo:rustc-cfg=endurox_pollable");
     }
 
     // --- 3) Generate bindings with bindgen -----------------------------------
@@ -145,7 +145,7 @@ fn find_mkfldhdr(manifest_dir: &Path) -> PathBuf {
     PathBuf::from("mkfldhdr")
 }
 
-fn endurox_config_is_epoll(include_dirs: &[String]) -> bool {
+fn endurox_config_has_pollable_reply_queue(include_dirs: &[String]) -> bool {
     for dir in include_dirs {
         let cfg = PathBuf::from(dir).join("ndrx_config.h");
         let Ok(contents) = fs::read_to_string(cfg) else {
@@ -153,6 +153,8 @@ fn endurox_config_is_epoll(include_dirs: &[String]) -> bool {
         };
         if config_define_enabled(&contents, "EX_USE_EPOLL")
             || config_string_define_eq(&contents, "EX_POLLER_STR", "EPOLL")
+            || config_define_enabled(&contents, "EX_USE_KQUEUE")
+            || config_string_define_eq(&contents, "EX_POLLER_STR", "KQUEUE")
         {
             return true;
         }
@@ -173,6 +175,6 @@ fn config_string_define_eq(contents: &str, name: &str, expected: &str) -> bool {
         let line = line.trim();
         line.strip_prefix(&prefix)
             .and_then(|value| value.trim().trim_matches('"').split_whitespace().next())
-            == Some(expected)
+            .is_some_and(|value| value.eq_ignore_ascii_case(expected))
     })
 }

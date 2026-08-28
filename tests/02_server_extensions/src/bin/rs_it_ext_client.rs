@@ -29,7 +29,7 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("install tpcall failed: {e}"))?;
 
     let mut last_rsp = None;
-    for _ in 0..10 {
+    for _ in 0..30 {
         thread::sleep(Duration::from_millis(100));
 
         ctx.tpcall("RS_EXT_STATUS", &buf, &mut rsp, 0)

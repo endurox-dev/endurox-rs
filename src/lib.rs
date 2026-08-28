@@ -17,6 +17,8 @@ pub mod ubf_fields {
     include!(concat!(env!("OUT_DIR"), "/test.rs"));
 }
 
+#[cfg(feature = "async")]
+mod async_atmi;
 mod atmictx;
 mod atmictx_log;
 mod atmictx_srv;
@@ -32,23 +34,31 @@ mod typed_view;
 mod types;
 mod ubf_serde;
 
+#[cfg(feature = "async")]
+pub use async_atmi::{AsyncAtmiCtx, AsyncReplyDriver};
+#[cfg(feature = "async-io")]
+pub use async_atmi::{AsyncIoAtmiCtx, AsyncIoReplyDriver};
+#[cfg(feature = "tokio")]
+pub use async_atmi::{TokioAtmiCtx, TokioReplyDriver};
 pub use atmictx::AtmiCtx;
 pub use atmictx_log::LogLevel;
 pub use atmictx_srv::{
     PollerEvent, RustBeforePollCallback, RustPeriodCallback, RustPollerCallback,
-    RustServerDoneHook, RustServerInitHook, RustServiceCallback, TpReturnStatus,
+    RustServerDoneHook, RustServerInitHook, RustServerThreadDoneHook, RustServerThreadInitHook,
+    RustServiceCallback, ServerHooks, TpReturnStatus,
 };
 pub use atmictx_ubf::{BFldLocInfo, UbfExprCallback, UbfExprCallback2, UbfExprTree, UbfFieldType};
 pub use errors::{AtmiError, AtmiResult, NstdError, NstdResult, UbfError, UbfResult};
-pub use nstdutil::NdrxStdCfgStr;
 pub use flags::{
-    TPCONV, TPGETANY, TPNOBLOCK, TPNOCHANGE, TPNOREPLY, TPNOTIME, TPNOTRAN, TPRECVONLY, TPSENDONLY,
-    TPSIGRSTRT, TPTRAN, TPTRANSUSPEND,
+    TPBLK_ALL, TPBLK_NEXT, TPCONV, TPGETANY, TPNOBLOCK, TPNOCHANGE, TPNOREPLY, TPNOTIME, TPNOTRAN,
+    TPRECVONLY, TPSENDONLY, TPSIGRSTRT, TPTRAN, TPTRANSUSPEND,
 };
+pub use nstdutil::NdrxStdCfgStr;
 pub use tpsvcinfo::TpSvcInfo;
 pub use typed_buf::{TpTypeInfo, TypedBuffer};
 pub use typed_ubf::{
-    BorrowedUbf, IntoUbfValue, TypedUbf, UbfField, UbfGetValue, UbfIterator, UbfValue,
+    BorrowedBuffer, BorrowedUbf, IntoUbfValue, TypedUbf, UbfField, UbfGetValue, UbfIterator,
+    UbfValue,
 };
 pub use typed_view::{BvNextState, IntoViewValue, TypedView, ViewValue, BVACCESS_NOTNULL};
 pub use types::{ClientId, TpContext, TpTranId};

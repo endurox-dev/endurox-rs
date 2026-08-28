@@ -23,8 +23,8 @@ impl AtmiCtx {
     /// `ndrx_stdcfgstr_free` before returning, so the caller only sees plain
     /// owned Rust values.
     pub fn ndrx_stdcfgstr_parse(&self, input: &str) -> NstdResult<Vec<NdrxStdCfgStr>> {
-        let input_c = CString::new(input)
-            .map_err(|_| NstdError::new(0, "input contains NUL byte"))?;
+        let input_c =
+            CString::new(input).map_err(|_| NstdError::new(0, "input contains NUL byte"))?;
 
         let mut parsed: *mut raw::ndrx_stdcfgstr_t = ptr::null_mut();
 

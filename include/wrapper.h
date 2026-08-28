@@ -8,3 +8,9 @@
 #include <oubf.h>
 #include <nerror.h>
 #include <nstdutil.h>
+
+/* libatmisrvinteg exports these worker lifecycle hooks but public headers do
+ * not declare the variables. Language integrations must install the default
+ * hooks when enabling dispatch-thread mode. */
+extern int (*ndrx_G_tpsvrthrinit)(int argc, char **argv);
+extern void (*ndrx_G_tpsvrthrdone)(void);

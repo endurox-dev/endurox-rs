@@ -1,12 +1,12 @@
+#[path = "common/endurox_domain_lock.rs"]
+mod endurox_domain_lock;
+use endurox_domain_lock::lock_endurox_domain;
+
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
 
 #[test]
 fn durable_queue_enqueue_dequeue_corrid_fifo() {
-    let _guard = match integration_test_lock().lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let _guard = lock_endurox_domain();
     let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let test_dir = manifest_dir.join("tests").join("07_basic_durable_queue");
     let run_sh = test_dir.join("run.sh");
@@ -31,9 +31,4 @@ fn durable_queue_enqueue_dequeue_corrid_fifo() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-}
-
-fn integration_test_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
 }

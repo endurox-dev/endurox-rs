@@ -211,7 +211,12 @@ impl<'ctx> TypedBuffer<'ctx> {
     /// On success, `self` will point to the new buffer.
     /// On failure, `self` remains valid and unchanged, and the error is returned.
     pub fn tprealloc(&mut self, new_size: usize) -> AtmiResult<()> {
+        #[cfg(not(feature = "ctx-send"))]
         let new_ptr = unsafe { raw::tprealloc(self.ptr as *mut c_char, new_size as c_long) };
+
+        #[cfg(feature = "ctx-send")]
+        let new_ptr =
+            unsafe { raw::Otprealloc(self.ctx.c_ctx_ptr(), self.ptr, new_size as c_long) };
 
         if new_ptr.is_null() {
             Err(self.ctx.atmi_last_error())
@@ -225,8 +230,15 @@ impl<'ctx> TypedBuffer<'ctx> {
 impl<'ctx> Drop for TypedBuffer<'ctx> {
     fn drop(&mut self) {
         if self.owned && !self.ptr.is_null() {
-            unsafe { raw::tpfree(self.ptr) }
+            #[cfg(not(feature = "ctx-send"))]
+            unsafe {
+                raw::tpfree(self.ptr)
+            }
+
+            #[cfg(feature = "ctx-send")]
+            unsafe {
+                raw::Otpfree(self.ctx.c_ctx_ptr(), self.ptr)
+            }
         }
     }
 }
-

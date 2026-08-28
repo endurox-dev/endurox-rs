@@ -96,5 +96,9 @@ fn ndrx_stdcfgstr_parse_rejects_nul_byte() {
         .ndrx_stdcfgstr_parse("KEY=val\0ue")
         .expect_err("expected NUL-byte error");
 
-    assert!(err.message.contains("NUL"), "unexpected message: {}", err.message);
+    assert!(
+        err.message.contains("NUL"),
+        "unexpected message: {}",
+        err.message
+    );
 }

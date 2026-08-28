@@ -120,9 +120,7 @@ fn run_fifo(ctx: &AtmiCtx) -> Result<(), String> {
     for expected in &messages {
         let val = dequeue_str(ctx)?;
         if &val != expected {
-            return Err(format!(
-                "fifo order: expected `{expected}`, got `{val}`"
-            ));
+            return Err(format!("fifo order: expected `{expected}`, got `{val}`"));
         }
     }
     Ok(())
@@ -159,14 +157,11 @@ fn run_tx_commit(ctx: &AtmiCtx) -> Result<(), String> {
     let val = dequeue_str(ctx)?;
     if val != "TX-COMMIT-MSG" {
         let _ = ctx.tpclose();
-        return Err(format!(
-            "tx-commit: expected `TX-COMMIT-MSG`, got `{val}`"
-        ));
+        return Err(format!("tx-commit: expected `TX-COMMIT-MSG`, got `{val}`"));
     }
 
     expect_empty_queue(ctx, "tx-commit postcondition")?;
-    ctx.tpclose()
-        .map_err(|e| format!("tpclose failed: {e}"))?;
+    ctx.tpclose().map_err(|e| format!("tpclose failed: {e}"))?;
     Ok(())
 }
 
@@ -182,12 +177,10 @@ fn run_tx_abort(ctx: &AtmiCtx) -> Result<(), String> {
         let _ = ctx.tpclose();
         return Err(e);
     }
-    ctx.tpabort(0)
-        .map_err(|e| format!("tpabort failed: {e}"))?;
+    ctx.tpabort(0).map_err(|e| format!("tpabort failed: {e}"))?;
 
     expect_empty_queue(ctx, "tx-abort postcondition")?;
-    ctx.tpclose()
-        .map_err(|e| format!("tpclose failed: {e}"))?;
+    ctx.tpclose().map_err(|e| format!("tpclose failed: {e}"))?;
     Ok(())
 }
 
@@ -236,7 +229,6 @@ fn run_tx_suspend_resume(ctx: &AtmiCtx) -> Result<(), String> {
     }
 
     expect_empty_queue(ctx, "tx-suspend-resume postcondition")?;
-    ctx.tpclose()
-        .map_err(|e| format!("tpclose failed: {e}"))?;
+    ctx.tpclose().map_err(|e| format!("tpclose failed: {e}"))?;
     Ok(())
 }

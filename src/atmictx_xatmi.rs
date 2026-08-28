@@ -1,12 +1,39 @@
-#[cfg(endurox_epoll)]
-use crate::AtmiError;
-use crate::{raw, AtmiCtx, AtmiResult, TpContext, TpTranId, TypedBuffer, TypedUbf};
+use crate::{raw, AtmiCtx, AtmiError, AtmiResult, TpContext, TpTranId, TypedBuffer, TypedUbf};
 use core::ffi::{c_char, c_int, c_long};
 use std::ffi::{CStr, CString};
 use std::ptr;
-use std::time::Duration;
-#[cfg(endurox_epoll)]
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+#[cfg(endurox_pollable)]
+struct PendingCall<'ctx> {
+    ctx: &'ctx AtmiCtx,
+    cd: i32,
+    armed: bool,
+}
+
+#[cfg(endurox_pollable)]
+impl<'ctx> PendingCall<'ctx> {
+    fn new(ctx: &'ctx AtmiCtx, cd: i32) -> Self {
+        Self {
+            ctx,
+            cd,
+            armed: true,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(endurox_pollable)]
+impl Drop for PendingCall<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.ctx.tpcancel(self.cd);
+        }
+    }
+}
 
 impl AtmiCtx {
     /// Synchronous RPC call with separate input and output buffers.
@@ -120,10 +147,17 @@ impl AtmiCtx {
             )
         };
 
+        // Adopt the descriptor and buffer on *every* path, not just on success.
+        // `ndrx_tpgetrply` assigns `*cd = rply->cd` and runs
+        // `ndrx_mbuf_prepare_incoming(.., char **odata, long *olen, ..)` -- which
+        // may reallocate -- before it raises TPESVCFAIL or TPETIME. Keeping the
+        // old pointer on those paths leaves it dangling and leaks the
+        // replacement, and drops the descriptor that says which call failed.
+        *cd = c_cd as i32;
+        data.replace_ptr(odata);
+        data.set_len(olen.max(0) as usize);
+
         if rc == raw::EXSUCCEED as c_int {
-            *cd = c_cd as i32;
-            data.replace_ptr(odata);
-            data.set_len(olen as usize);
             Ok(())
         } else {
             Err(self.atmi_last_error())
@@ -141,120 +175,103 @@ impl AtmiCtx {
         self.rc_to_result(rc)
     }
 
+    /// Deadline for one reply wait, taken from Enduro/X's own effective call
+    /// timeout rather than from a caller-supplied duration.
+    ///
+    /// `tpgblktime(0)` resolves `tpsblktime(TPBLK_NEXT)`, then `tpsblktime`/
+    /// `tptoutset` thread settings, then `NDRX_TOUT`. Read it **before**
+    /// `tpacall`: a `TPBLK_NEXT` setting is one-shot and the call consumes it.
+    ///
+    /// The deadline matters beyond reporting `TPETIME`. Enduro/X only expires
+    /// call descriptors inside `tpgetrply` (`call_scan_tout`), so a poll loop
+    /// with no timer would never wake to let that run and would wait forever.
+    pub(crate) fn reply_deadline(&self) -> AtmiResult<Option<Instant>> {
+        let secs = self.tpgblktime(0)?;
+        if secs <= 0 {
+            return Ok(None);
+        }
+        Instant::now()
+            .checked_add(Duration::from_secs(secs as u64))
+            .ok_or_else(|| {
+                AtmiError::new(raw::TPEINVAL, "Enduro/X call timeout exceeds Instant range")
+            })
+            .map(Some)
+    }
+
     /// Synchronous call that uses the async/reply-queue path only on pollable
     /// Enduro/X builds.
     ///
-    /// On `EX_USE_EPOLL` builds this performs `tpacall`, waits for readiness on
-    /// the internal reply queue descriptor, then drains the requested call
-    /// descriptor with `tpgetrply(TPNOBLOCK)`. Other queue backends are not
-    /// externally pollable, so this falls back to the normal blocking `tpcall`
-    /// path (`Otpcall` when `ctx-send` is enabled).
+    /// On `EX_USE_EPOLL` and `EX_USE_KQUEUE` builds this performs `tpacall`,
+    /// waits for readiness on the internal reply queue descriptor, then drains
+    /// the requested call descriptor with `tpgetrply(TPNOBLOCK)`. Other queue
+    /// backends are not externally pollable, so this falls back to the normal
+    /// blocking `tpcall` path (`Otpcall` when `ctx-send` is enabled).
+    ///
+    /// Timeouts come from `NDRX_TOUT` / `tptoutset` / `tpsblktime`, exactly as
+    /// for [`AtmiCtx::tpcall`]. There is no per-call timeout argument.
     pub fn tpcall_polled(
         &self,
         svc: &str,
         idata: &TypedBuffer<'_>,
         odata: &mut TypedBuffer<'_>,
         flags: i64,
-        timeout: Option<Duration>,
     ) -> AtmiResult<()> {
-        #[cfg(not(endurox_epoll))]
+        #[cfg(not(endurox_pollable))]
         {
-            let _ = timeout;
-            return self.tpcall(svc, idata, odata, flags);
+            self.tpcall(svc, idata, odata, flags)
         }
 
-        #[cfg(endurox_epoll)]
+        #[cfg(endurox_pollable)]
         {
-            return self.tpcall_epoll(svc, idata, odata, flags, timeout);
+            self.tpcall_pollable(svc, idata, odata, flags)
         }
     }
 
-    #[cfg(endurox_epoll)]
-    fn tpcall_epoll(
+    #[cfg(endurox_pollable)]
+    fn tpcall_pollable(
         &self,
         svc: &str,
         idata: &TypedBuffer<'_>,
         odata: &mut TypedBuffer<'_>,
         flags: i64,
-        timeout: Option<Duration>,
     ) -> AtmiResult<()> {
-        let mut cd = self.tpacall(svc, idata, flags)?;
-        self.tpgetrply_polled(&mut cd, odata, flags, timeout)
+        if flags & raw::TPNOREPLY as i64 != 0 {
+            // The public tpcall() rejects this (libatmi/atmi.c:330), so the
+            // polled variant must too rather than silently returning without a
+            // reply. tpacall would hand back descriptor 0, which can never be
+            // collected.
+            return Err(AtmiError::new(
+                raw::TPEINVAL,
+                "TPNOREPLY cannot be used with tpcall()",
+            ));
+        }
+
+        // TPNOTIME disables Enduro/X's own call timeout, so imposing the
+        // tpgblktime deadline here would cancel a call the caller asked to wait
+        // on indefinitely.
+        let deadline = if flags & raw::TPNOTIME as i64 != 0 {
+            None
+        } else {
+            self.reply_deadline()?
+        };
+        let cd = self.tpacall(svc, idata, flags)?;
+        let mut pending = PendingCall::new(self, cd);
+        let result = self.tpgetrply_polled(&mut pending.cd, odata, flags, deadline);
+        if result.is_ok() {
+            pending.complete();
+        }
+        result
     }
 
-    /// Tokio-native variant of [`AtmiCtx::tpcall_polled`].
-    ///
-    /// This uses Enduro/X's pollable reply queue fd with `tokio::io::unix::AsyncFd`
-    /// instead of blocking the current thread in `poll(2)`.
-    #[cfg(all(endurox_epoll, feature = "tokio"))]
-    pub async fn tpcall_async(
-        &self,
-        svc: &str,
-        idata: &TypedBuffer<'_>,
-        odata: &mut TypedBuffer<'_>,
-        flags: i64,
-        timeout: Option<Duration>,
-    ) -> AtmiResult<()> {
-        let mut cd = self.tpacall(svc, idata, flags)?;
-        self.tpgetrply_async(&mut cd, odata, flags, timeout).await
-    }
-
-    #[cfg(endurox_epoll)]
+    #[cfg(endurox_pollable)]
     fn tpgetrply_polled(
         &self,
         cd: &mut i32,
         data: &mut TypedBuffer<'_>,
         flags: i64,
-        timeout: Option<Duration>,
-    ) -> AtmiResult<()> {
-        #[cfg(not(feature = "ctx-send"))]
-        let reply_fd = unsafe { raw::tpext_getreplyqfd() };
-
-        #[cfg(feature = "ctx-send")]
-        let reply_fd = unsafe { raw::Otpext_getreplyqfd(self.c_ctx_ptr()) };
-
-        if reply_fd < 0 {
-            return Err(self.atmi_last_error());
-        }
-
-        let deadline = timeout.map(|t| Instant::now() + t);
-        let get_flags = flags | raw::TPNOBLOCK as i64;
-
-        loop {
-            if !self.poll_reply_queue(reply_fd, deadline)? {
-                let _ = self.tpcancel(*cd);
-                return Err(AtmiError::new(raw::TPETIME, "polled tpcall timed out"));
-            }
-
-            match self.tpgetrply(cd, data, get_flags) {
-                Ok(()) => return Ok(()),
-                Err(err) if err.code == raw::TPEBLOCK => continue,
-                Err(err) => return Err(err),
-            }
-        }
-    }
-
-    /// Tokio-native reply wait for a call descriptor returned by [`AtmiCtx::tpacall`].
-    ///
-    /// The method first attempts `tpgetrply(TPNOBLOCK)`, then awaits readiness on
-    /// the Enduro/X reply queue fd and retries. `timeout` is a total deadline for
-    /// the whole wait, not a per-readiness timeout.
-    #[cfg(all(endurox_epoll, feature = "tokio"))]
-    pub async fn tpgetrply_async(
-        &self,
-        cd: &mut i32,
-        data: &mut TypedBuffer<'_>,
-        flags: i64,
-        timeout: Option<Duration>,
+        deadline: Option<Instant>,
     ) -> AtmiResult<()> {
         let reply_fd = self.reply_queue_fd()?;
-        let async_fd = tokio::io::unix::AsyncFd::new(reply_fd).map_err(|err| {
-            AtmiError::new(
-                raw::TPEOS,
-                format!("failed to register Enduro/X reply queue fd with Tokio: {err}"),
-            )
-        })?;
-        let deadline = timeout.map(|t| tokio::time::Instant::now() + t);
         let get_flags = flags | raw::TPNOBLOCK as i64;
 
         loop {
@@ -264,51 +281,48 @@ impl AtmiCtx {
                 Err(err) => return Err(err),
             }
 
-            let mut guard = match deadline {
-                Some(deadline) => tokio::time::timeout_at(deadline, async_fd.readable())
-                    .await
-                    .map_err(|_| {
-                        let _ = self.tpcancel(*cd);
-                        AtmiError::new(raw::TPETIME, "Tokio tpcall timed out")
-                    })?,
-                None => async_fd.readable().await,
+            if !self.poll_reply_queue(reply_fd, deadline)? {
+                // The timer fired. Give Enduro/X one more chance to expire the
+                // descriptor itself so the caller sees its bookkeeping, and only
+                // synthesize TPETIME if it still reports nothing.
+                match self.tpgetrply(cd, data, get_flags) {
+                    Ok(()) => return Ok(()),
+                    Err(err) if err.code == raw::TPEBLOCK => {
+                        return Err(AtmiError::new(raw::TPETIME, "polled tpcall timed out"))
+                    }
+                    Err(err) => return Err(err),
+                }
             }
-            .map_err(|err| {
-                AtmiError::new(
-                    raw::TPEOS,
-                    format!("Tokio wait on Enduro/X reply queue failed: {err}"),
-                )
-            })?;
-
-            guard.clear_ready();
         }
     }
 
-    #[cfg(endurox_epoll)]
-    fn reply_queue_fd(&self) -> AtmiResult<c_int> {
-        #[cfg(not(feature = "ctx-send"))]
-        let reply_fd = unsafe { raw::tpext_getreplyqfd() };
+    pub(crate) fn reply_queue_fd(&self) -> AtmiResult<c_int> {
+        #[cfg(not(endurox_pollable))]
+        {
+            Err(AtmiError::new(
+                raw::TPEINVAL,
+                "async integration requires an Enduro/X EX_USE_EPOLL or EX_USE_KQUEUE build",
+            ))
+        }
 
-        #[cfg(feature = "ctx-send")]
-        let reply_fd = unsafe { raw::Otpext_getreplyqfd(self.c_ctx_ptr()) };
+        #[cfg(endurox_pollable)]
+        {
+            #[cfg(not(feature = "ctx-send"))]
+            let reply_fd = unsafe { raw::tpext_getreplyqfd() };
 
-        if reply_fd < 0 {
-            Err(self.atmi_last_error())
-        } else {
-            Ok(reply_fd)
+            #[cfg(feature = "ctx-send")]
+            let reply_fd = unsafe { raw::Otpext_getreplyqfd(self.c_ctx_ptr()) };
+
+            if reply_fd < 0 {
+                Err(self.atmi_last_error())
+            } else {
+                Ok(reply_fd)
+            }
         }
     }
 
-    #[cfg(endurox_epoll)]
+    #[cfg(endurox_pollable)]
     fn poll_reply_queue(&self, reply_fd: c_int, deadline: Option<Instant>) -> AtmiResult<bool> {
-        let timeout_ms = match deadline {
-            Some(d) => d
-                .checked_duration_since(Instant::now())
-                .map(|remaining| remaining.as_millis().min(c_int::MAX as u128) as c_int)
-                .unwrap_or(0),
-            None => -1,
-        };
-
         let mut pfd = libc::pollfd {
             fd: reply_fd,
             events: libc::POLLIN,
@@ -316,9 +330,37 @@ impl AtmiCtx {
         };
 
         loop {
+            let timeout_ms = match deadline {
+                Some(d) => d
+                    .checked_duration_since(Instant::now())
+                    .map(|remaining| {
+                        let millis = remaining.as_millis();
+                        if remaining.is_zero() {
+                            0
+                        } else {
+                            millis.max(1).min(c_int::MAX as u128) as c_int
+                        }
+                    })
+                    .unwrap_or(0),
+                None => -1,
+            };
+            pfd.revents = 0;
             let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
             if rc > 0 {
-                return Ok((pfd.revents & libc::POLLIN) != 0);
+                if (pfd.revents & libc::POLLIN) != 0 {
+                    return Ok(true);
+                }
+                let error_events = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
+                if (pfd.revents & error_events) != 0 {
+                    return Err(AtmiError::new(
+                        raw::TPEOS,
+                        format!(
+                            "poll on Enduro/X reply queue returned events {:#x}",
+                            pfd.revents
+                        ),
+                    ));
+                }
+                continue;
             }
             if rc == 0 {
                 return Ok(false);
@@ -1254,10 +1296,17 @@ impl AtmiCtx {
         #[cfg(feature = "ctx-send")]
         let rc = unsafe { raw::Otpgetctxt(self.c_ctx_ptr(), &mut out, 0) };
 
-        if rc == raw::EXSUCCEED as c_int {
+        if rc == raw::TPMULTICONTEXTS as c_int {
             Ok(TpContext(out))
-        } else {
+        } else if rc == raw::EXFAIL as c_int {
             Err(self.atmi_last_error())
+        } else {
+            // TPNULLCONTEXT. Enduro/X reports "no context" without setting
+            // tperrno, so atmi_last_error() would report a stale code here.
+            Err(AtmiError::new(
+                raw::TPEPROTO,
+                "no ATMI context is associated with the current thread",
+            ))
         }
     }
 

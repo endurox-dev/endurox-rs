@@ -27,6 +27,7 @@ fn run() -> Result<(), String> {
         "inner-ubf" => ("RS_IT_INNER_UBF", "RUST-INNER:HELLO-INNER"),
         "tpacall" => ("RS_IT_ECHO", "RUST-SERVER:HELLO"),
         "tpacall-getany" => return run_tpacall_getany(&ctx),
+        "dispatch-threads" => return run_dispatch_threads(&ctx),
         "dynamic-advertise" => return run_dynamic_advertise(&ctx),
         other => return Err(format!("unknown integration scenario `{other}`")),
     };
@@ -122,6 +123,61 @@ fn run_tpacall_getany(ctx: &AtmiCtx) -> Result<(), String> {
             "async replies incomplete: pending={pending:?}, expected={expected:?}"
         ));
     }
+
+    ctx.tpterm().map_err(|e| format!("tpterm failed: {e}"))?;
+    Ok(())
+}
+
+fn run_dispatch_threads(ctx: &AtmiCtx) -> Result<(), String> {
+    let rsp_fld = ubf_fields::T_STRING_2_FLD;
+    let mut first = build_echo_request(ctx, "FIRST")?;
+    let second = build_echo_request(ctx, "SECOND")?;
+
+    ctx.tpacall("RS_IT_THREAD", &first, 0)
+        .map_err(|e| format!("first threaded tpacall failed: {e}"))?;
+    ctx.tpacall("RS_IT_THREAD", &second, 0)
+        .map_err(|e| format!("second threaded tpacall failed: {e}"))?;
+
+    let mut worker_threads = HashSet::new();
+    for _ in 0..2 {
+        let mut cd = 0;
+        ctx.tpgetrply(&mut cd, &mut first, TPGETANY)
+            .map_err(|e| format!("threaded tpgetrply failed: {e}"))?;
+        let response = first
+            .bget_string(rsp_fld, 0)
+            .map_err(|e| format!("failed to read worker thread response: {e}"))?;
+        let worker = response
+            .split_once(':')
+            .map(|(worker, _)| worker.to_owned())
+            .ok_or_else(|| format!("invalid worker response `{response}`"))?;
+        worker_threads.insert(worker);
+    }
+
+    if worker_threads.len() != 2 {
+        return Err(format!(
+            "expected two libatmisrv worker threads, got {worker_threads:?}"
+        ));
+    }
+
+    // Each of those workers must also have run the Rust tpsvrthrinit hook, on
+    // its own thread, with a usable worker context.
+    let mut info = build_echo_request(ctx, "THRINFO")?;
+    let mut rsp = ctx
+        .tpalloc_ubf(1024)
+        .map_err(|e| format!("tpalloc for thread info failed: {e}"))?;
+    ctx.tpcall("RS_IT_THRINFO", &info, &mut rsp, 0)
+        .map_err(|e| format!("RS_IT_THRINFO tpcall failed: {e}"))?;
+    let report = rsp
+        .bget_string(rsp_fld, 0)
+        .map_err(|e| format!("failed to read thread info: {e}"))?;
+    for expect in ["thrinit=2", "thrinitctx=2"] {
+        if !report.contains(expect) {
+            return Err(format!(
+                "expected `{expect}` in thread-hook report, got `{report}`"
+            ));
+        }
+    }
+    drop(info);
 
     ctx.tpterm().map_err(|e| format!("tpterm failed: {e}"))?;
     Ok(())

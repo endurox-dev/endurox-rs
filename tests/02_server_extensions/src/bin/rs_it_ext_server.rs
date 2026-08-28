@@ -1,39 +1,56 @@
 use endurox_rs::{
-    ubf_fields, AtmiCtx, AtmiResult, PollerEvent, TpReturnStatus, TpSvcInfo, UbfValue,
+    ubf_fields, AtmiCtx, AtmiResult, PollerEvent, ServerHooks, TpReturnStatus, TpSvcInfo, UbfValue,
 };
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
-static mut READ_FD: i32 = -1;
-static mut WRITE_FD: i32 = -1;
-static mut B4POLL_COUNT: usize = 0;
-static mut POLLER_COUNT: usize = 0;
-static mut WRITE_PENDING: bool = false;
-static mut INSTALLED: bool = false;
+static READ_FD: AtomicI32 = AtomicI32::new(-1);
+static WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+static B4POLL_COUNT: AtomicUsize = AtomicUsize::new(0);
+static POLLER_COUNT: AtomicUsize = AtomicUsize::new(0);
+static PERIOD_COUNT: AtomicUsize = AtomicUsize::new(0);
+static B4POLL_CTX_COUNT: AtomicUsize = AtomicUsize::new(0);
+static POLLER_CTX_COUNT: AtomicUsize = AtomicUsize::new(0);
+static PERIOD_CTX_COUNT: AtomicUsize = AtomicUsize::new(0);
+static WRITE_PENDING: AtomicBool = AtomicBool::new(false);
+static INSTALLED: AtomicBool = AtomicBool::new(false);
 
-fn rs_ext_b4poll_cb() -> i32 {
-    unsafe {
-        B4POLL_COUNT += 1;
+fn rs_ext_b4poll_cb(ctx: &AtmiCtx) -> i32 {
+    B4POLL_COUNT.fetch_add(1, Ordering::SeqCst);
+    if ctx.tpgetsrvid().is_ok() {
+        B4POLL_CTX_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
 
-        if !WRITE_PENDING {
-            WRITE_PENDING = true;
-            if WRITE_FD >= 0 {
-                let byte = [1_u8; 1];
-                let _ = libc::write(WRITE_FD, byte.as_ptr().cast(), byte.len());
-            }
+    if !WRITE_PENDING.swap(true, Ordering::SeqCst) {
+        let write_fd = WRITE_FD.load(Ordering::SeqCst);
+        if write_fd >= 0 {
+            let byte = [1_u8; 1];
+            let _ = unsafe { libc::write(write_fd, byte.as_ptr().cast(), byte.len()) };
         }
     }
 
     0
 }
 
-fn rs_ext_poller_cb(_event: PollerEvent) -> i32 {
-    unsafe {
-        POLLER_COUNT += 1;
+fn rs_ext_poller_cb(ctx: &AtmiCtx, _event: PollerEvent) -> i32 {
+    POLLER_COUNT.fetch_add(1, Ordering::SeqCst);
+    if ctx.tpgetsrvid().is_ok() {
+        POLLER_CTX_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
 
-        if READ_FD >= 0 {
-            let mut byte = [0_u8; 1];
-            let _ = libc::read(READ_FD, byte.as_mut_ptr().cast(), byte.len());
-        }
-        WRITE_PENDING = false;
+    let read_fd = READ_FD.load(Ordering::SeqCst);
+    if read_fd >= 0 {
+        let mut byte = [0_u8; 1];
+        let _ = unsafe { libc::read(read_fd, byte.as_mut_ptr().cast(), byte.len()) };
+    }
+    WRITE_PENDING.store(false, Ordering::SeqCst);
+
+    0
+}
+
+fn rs_ext_period_cb(ctx: &AtmiCtx) -> i32 {
+    PERIOD_COUNT.fetch_add(1, Ordering::SeqCst);
+    if ctx.tpgetsrvid().is_ok() {
+        PERIOD_CTX_COUNT.fetch_add(1, Ordering::SeqCst);
     }
 
     0
@@ -45,22 +62,17 @@ fn rs_ext_install(ctx: &AtmiCtx, svc: &mut TpSvcInfo<'_>) {
         None => return,
     };
 
-    let should_install = unsafe {
-        let was_installed = INSTALLED;
-        INSTALLED = true;
-        !was_installed
-    };
+    let should_install = !INSTALLED.swap(true, Ordering::SeqCst);
 
     if should_install {
-        let read_fd = unsafe { READ_FD };
+        let read_fd = READ_FD.load(Ordering::SeqCst);
         if ctx
             .tpext_addpollerfd(read_fd, libc::POLLIN as u32, 0, rs_ext_poller_cb)
             .and_then(|_| ctx.tpext_addb4pollcb(rs_ext_b4poll_cb))
+            .and_then(|_| ctx.tpext_addperiodcb(1, rs_ext_period_cb))
             .is_err()
         {
-            unsafe {
-                INSTALLED = false;
-            }
+            INSTALLED.store(false, Ordering::SeqCst);
             ctx.tpreturn_ubf(TpReturnStatus::Fail, 1, ubf, 0);
             return;
         }
@@ -75,24 +87,32 @@ fn rs_ext_status(ctx: &AtmiCtx, svc: &mut TpSvcInfo<'_>) {
         None => return,
     };
 
-    let (b4poll, poller) = unsafe { (B4POLL_COUNT, POLLER_COUNT) };
-    let ok = b4poll > 0 && poller > 0;
+    let b4poll = B4POLL_COUNT.load(Ordering::SeqCst);
+    let poller = POLLER_COUNT.load(Ordering::SeqCst);
+    let period = PERIOD_COUNT.load(Ordering::SeqCst);
+    let b4poll_ctx = B4POLL_CTX_COUNT.load(Ordering::SeqCst);
+    let poller_ctx = POLLER_CTX_COUNT.load(Ordering::SeqCst);
+    let period_ctx = PERIOD_CTX_COUNT.load(Ordering::SeqCst);
+    let ok = b4poll > 0
+        && poller > 0
+        && period > 0
+        && b4poll_ctx > 0
+        && poller_ctx > 0
+        && period_ctx > 0;
 
-    let should_uninstall = unsafe {
-        let was_installed = INSTALLED;
-        if ok {
-            INSTALLED = false;
-        }
-        ok && was_installed
-    };
+    let should_uninstall = ok && INSTALLED.swap(false, Ordering::SeqCst);
 
     if should_uninstall {
         let _ = ctx.tpext_delb4pollcb();
-        let read_fd = unsafe { READ_FD };
+        let _ = ctx.tpext_delperiodcb();
+        let read_fd = READ_FD.load(Ordering::SeqCst);
         let _ = ctx.tpext_delpollerfd(read_fd);
     }
 
-    let rsp = format!("b4poll={b4poll};poller={poller};ok={ok}");
+    let rsp = format!(
+        "b4poll={b4poll};poller={poller};period={period};b4ctx={b4poll_ctx};\
+pollerctx={poller_ctx};periodctx={period_ctx};ok={ok}"
+    );
 
     if ubf
         .bchg(ubf_fields::T_STRING_2_FLD, 0, UbfValue::String(rsp), true)
@@ -112,14 +132,16 @@ fn rs_ext_init(ctx: &AtmiCtx, _args: &[String]) -> AtmiResult<()> {
         return Err(ctx.atmi_last_error());
     }
 
-    unsafe {
-        READ_FD = fds[0];
-        WRITE_FD = fds[1];
-        B4POLL_COUNT = 0;
-        POLLER_COUNT = 0;
-        WRITE_PENDING = false;
-        INSTALLED = false;
-    }
+    READ_FD.store(fds[0], Ordering::SeqCst);
+    WRITE_FD.store(fds[1], Ordering::SeqCst);
+    B4POLL_COUNT.store(0, Ordering::SeqCst);
+    POLLER_COUNT.store(0, Ordering::SeqCst);
+    PERIOD_COUNT.store(0, Ordering::SeqCst);
+    B4POLL_CTX_COUNT.store(0, Ordering::SeqCst);
+    POLLER_CTX_COUNT.store(0, Ordering::SeqCst);
+    PERIOD_CTX_COUNT.store(0, Ordering::SeqCst);
+    WRITE_PENDING.store(false, Ordering::SeqCst);
+    INSTALLED.store(false, Ordering::SeqCst);
 
     ctx.tpadvertise("RS_EXT_INSTALL", rs_ext_install)?;
     ctx.tpadvertise("RS_EXT_STATUS", rs_ext_status)?;
@@ -128,20 +150,12 @@ fn rs_ext_init(ctx: &AtmiCtx, _args: &[String]) -> AtmiResult<()> {
 }
 
 fn rs_ext_done(_ctx: &AtmiCtx) {
-    let read_fd = unsafe {
-        let fd = READ_FD;
-        READ_FD = -1;
-        fd
-    };
+    let read_fd = READ_FD.swap(-1, Ordering::SeqCst);
     if read_fd >= 0 {
         let _ = unsafe { libc::close(read_fd) };
     }
 
-    let write_fd = unsafe {
-        let fd = WRITE_FD;
-        WRITE_FD = -1;
-        fd
-    };
+    let write_fd = WRITE_FD.swap(-1, Ordering::SeqCst);
     if write_fd >= 0 {
         let _ = unsafe { libc::close(write_fd) };
     }
@@ -156,7 +170,7 @@ fn main() {
         }
     };
 
-    if let Err(e) = ctx.tp_run(rs_ext_init, rs_ext_done) {
+    if let Err(e) = ctx.tp_run(ServerHooks::new(rs_ext_init).done(rs_ext_done)) {
         eprintln!("extension server failed: {e}");
         std::process::exit(1);
     }

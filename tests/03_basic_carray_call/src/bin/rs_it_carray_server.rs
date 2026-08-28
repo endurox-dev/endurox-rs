@@ -1,4 +1,4 @@
-use endurox_rs::{AtmiCtx, AtmiResult, TpReturnStatus, TpSvcInfo};
+use endurox_rs::{AtmiCtx, AtmiResult, ServerHooks, TpReturnStatus, TpSvcInfo};
 
 const RESPONSE_BYTES: [u8; 11] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
@@ -67,7 +67,7 @@ fn main() {
         }
     };
 
-    if let Err(e) = ctx.tp_run(rs_it_init, rs_it_done) {
+    if let Err(e) = ctx.tp_run(ServerHooks::new(rs_it_init).done(rs_it_done)) {
         eprintln!("server failed: {e}");
         std::process::exit(1);
     }

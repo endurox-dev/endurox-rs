@@ -21,9 +21,15 @@ exclude = [
 ]
 
 [dependencies]
+async-io = { version = "2", optional = true }
 endurox-rs-derive = { version = "0.1.0", path = "endurox-rs-derive" }
 libc = "0.2"
-tokio = { version = "1", features = ["net", "time"], optional = true }
+tokio = { version = "1", features = ["net", "rt", "time"], optional = true }
+
+[dev-dependencies]
+# Integration suites share one Enduro/X domain and must exclude each other
+# across processes; see tests/common/endurox_domain_lock.rs.
+libc = "0.2"
 
 [build-dependencies]
 bindgen = "0.70"        # pin a version for stability
@@ -33,7 +39,9 @@ pkg-config = "0.3"
 [features]
 # default = []     # default: !Send & !Sync
 ctx-send = []      # enable to make AtmiCtx: Send & !Sync
-tokio = ["dep:tokio"] # enable Tokio-native async helpers for pollable Enduro/X builds
+async = ["ctx-send"] # runtime-neutral reply demux; needs a driver feature to be useful
+async-io = ["async", "dep:async-io"] # executor-independent async-io adapter
+tokio = ["async", "dep:tokio"] # Tokio-native reply-fd adapter
 
 [[test]]
 name = "atmictx_tests"

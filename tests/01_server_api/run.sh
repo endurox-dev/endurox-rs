@@ -8,6 +8,8 @@ CONF_DIR="$THIS_DIR/conf"
 BIN_DIR="$THIS_DIR/bin"
 PROJECT_DIR="$(cd "$THIS_DIR/../.." && pwd)"
 SCENARIO="${1:-tpcall}"
+CRATE_FEATURE="${2:-}"
+DISPATCH_MODE="${3:-multi}"
 
 mkdir -p "$BIN_DIR"
 
@@ -31,7 +33,21 @@ pushd "$CONF_DIR" >/dev/null
 . ./settest1
 popd >/dev/null
 
-cargo build --manifest-path "$TEST_DIR/Cargo.toml" --target-dir "$PROJECT_DIR/target" --bin rs_it_server --bin rs_it_client
+if [ "$DISPATCH_MODE" = "single" ]; then
+    export NDRX_CONFIG="$CONF_DIR/ndrxconfig-single.xml"
+fi
+
+# Worker tpsvrthrdone hooks run only at shutdown, so they record themselves here
+# and are checked once the domain has stopped.
+THRDONE_MARKER="$THIS_DIR/log/thrdone.marker"
+export NDRX_RS_THRDONE_MARKER="$THRDONE_MARKER"
+rm -f "$THRDONE_MARKER"
+
+if [ -n "$CRATE_FEATURE" ]; then
+    cargo build --manifest-path "$TEST_DIR/Cargo.toml" --target-dir "$PROJECT_DIR/target" --features "$CRATE_FEATURE" --bin rs_it_server --bin rs_it_client
+else
+    cargo build --manifest-path "$TEST_DIR/Cargo.toml" --target-dir "$PROJECT_DIR/target" --bin rs_it_server --bin rs_it_client
+fi
 cp "$PROJECT_DIR/target/debug/rs_it_server" "$BIN_DIR/rs_it_server"
 chmod +x "$BIN_DIR/rs_it_server"
 
@@ -67,5 +83,21 @@ fi
 xadmin psc
 xadmin stop -c -y
 trap - EXIT
+
+# Only the threaded scenario configures dispatch threads worth checking.
+if [ "$SCENARIO" = "dispatch-threads" ] && [ "$DISPATCH_MODE" != "single" ]; then
+    lines=$(wc -l < "$THRDONE_MARKER" 2>/dev/null || echo 0)
+    if [ "$lines" -lt 2 ]; then
+        echo "expected >=2 tpsvrthrdone hook invocations, got $lines" >&2
+        cat "$THRDONE_MARKER" 2>/dev/null >&2 || true
+        exit 1
+    fi
+    if grep -q "srvid=-1" "$THRDONE_MARKER"; then
+        echo "tpsvrthrdone hook ran without a usable worker context" >&2
+        cat "$THRDONE_MARKER" >&2
+        exit 1
+    fi
+    echo "tpsvrthrdone verified: $lines worker(s)"
+fi
 
 echo "Test OK: $SCENARIO"

@@ -7,7 +7,6 @@ TEST_DIR="$THIS_DIR"
 CONF_DIR="$THIS_DIR/conf"
 BIN_DIR="$THIS_DIR/bin"
 PROJECT_DIR="$(cd "$THIS_DIR/../.." && pwd)"
-CRATE_FEATURE="${1:-}"
 
 mkdir -p "$BIN_DIR"
 
@@ -31,13 +30,9 @@ pushd "$CONF_DIR" >/dev/null
 . ./settest1
 popd >/dev/null
 
-if [ -n "$CRATE_FEATURE" ]; then
-    cargo build --manifest-path "$TEST_DIR/Cargo.toml" --target-dir "$PROJECT_DIR/target" --features "$CRATE_FEATURE" --bin rs_it_ext_server --bin rs_it_ext_client
-else
-    cargo build --manifest-path "$TEST_DIR/Cargo.toml" --target-dir "$PROJECT_DIR/target" --bin rs_it_ext_server --bin rs_it_ext_client
-fi
-cp "$PROJECT_DIR/target/debug/rs_it_ext_server" "$BIN_DIR/rs_it_ext_server"
-chmod +x "$BIN_DIR/rs_it_ext_server"
+cargo build --manifest-path "$TEST_DIR/Cargo.toml" --target-dir "$PROJECT_DIR/target" --bin rs_it_demux_server --bin rs_it_demux_client
+cp "$PROJECT_DIR/target/debug/rs_it_demux_server" "$BIN_DIR/rs_it_demux_server"
+chmod +x "$BIN_DIR/rs_it_demux_server"
 
 cleanup() {
     xadmin stop -c -y >/dev/null 2>&1 || true
@@ -63,7 +58,7 @@ fi
 
 sleep 2
 
-if ! "$PROJECT_DIR/target/debug/rs_it_ext_client"; then
+if ! "$PROJECT_DIR/target/debug/rs_it_demux_client"; then
     dump_logs
     exit 1
 fi
@@ -72,4 +67,4 @@ xadmin psc
 xadmin stop -c -y
 trap - EXIT
 
-echo "Test OK: xatmi server extensions"
+echo "Test OK: async-demux"
