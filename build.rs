@@ -78,6 +78,13 @@ fn main() {
         let mut builder = bindgen::Builder::default()
             .header(wrapper.to_string_lossy())
             .layout_tests(false)
+            // <string.h> arrives transitively through the Enduro/X headers, so
+            // bindgen would redeclare libc's mem*/str* symbols. Rust code calls
+            // std or libc for those and never these, and rustc's
+            // suspicious_runtime_symbol_definitions lint objects to the
+            // redeclaration: bindgen emits c_ulong where the compiler expects
+            // usize. Same layout on a 64-bit target, a real mismatch on 32-bit.
+            .blocklist_function("mem(cmp|cpy|move|set)|bcmp|strlen")
             .formatter(bindgen::Formatter::Rustfmt);
 
         // Forward include dirs and defines to clang so <angled> includes resolve.
