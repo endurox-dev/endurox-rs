@@ -15,6 +15,11 @@ fn xatmi_server_client_tpacall_ubf_roundtrip() {
 }
 
 #[test]
+fn xatmi_expression_callbacks_preserve_pending_reply_with_oapi() {
+    run_xatmi_server_client_scenario_with_feature("tpacall", "ctx-send");
+}
+
+#[test]
 fn xatmi_server_client_tpacall_getany_ubf_roundtrip() {
     run_xatmi_server_client_scenario("tpacall-getany");
 }

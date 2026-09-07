@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
@@ -6,7 +7,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use endurox_rs::{
     ubf_fields, ubf_read_adhoc, ubf_read_nested, ubf_write_nested, AtmiCtx, BFldLocInfo,
     TypedBuffer, TypedUbf, UbfCarray, UbfDeserialize, UbfFieldDeserialize, UbfFieldSerialize,
-    UbfFieldType, UbfGetValue, UbfResult, UbfSerialize, UbfValue,
+    UbfFieldType, UbfGetValue, UbfResult, UbfSerialize, UbfValue, TPBLK_ALL,
 };
 
 #[test]
@@ -688,6 +689,148 @@ fn ubf_boolean_expression_compile_eval_and_print() {
     assert_eq!(ubf.bfloatev(&tree), 1.0);
 
     ctx.btreefree(tree);
+}
+
+thread_local! {
+    static EXPECTED_CTX: Cell<*const AtmiCtx> = const { Cell::new(std::ptr::null()) };
+    static EXPECTED_TIMEOUT: Cell<i32> = const { Cell::new(0) };
+}
+
+fn ctx_identity_probe(ubf: &TypedUbf<'_>, _name: &str) -> i64 {
+    EXPECTED_CTX.with(|expected| assert_eq!(ubf.ctx() as *const AtmiCtx, expected.get()));
+    // Exercise both UBF and ATMI Object API calls from inside the callback.
+    assert_eq!(ubf.bget_long(ubf_fields::T_LONG_FLD, 0).unwrap(), 77);
+    assert!(ubf.bget_string(ubf_fields::T_STRING_FLD, 0).is_err());
+    EXPECTED_TIMEOUT
+        .with(|expected| assert_eq!(ubf.ctx().tpgblktime(TPBLK_ALL).unwrap(), expected.get()));
+    let buffer = ubf.ctx().tpalloc_carray(b"callback allocation").unwrap();
+    assert_eq!(buffer.as_bytes(), b"callback allocation");
+    1
+}
+
+fn ctx_identity_probe2(ubf: &TypedUbf<'_>, name: &str, arg: &str) -> i64 {
+    assert_eq!(arg, "probe");
+    ctx_identity_probe(ubf, name)
+}
+
+fn register_context_probes() -> AtmiCtx {
+    let ctx = AtmiCtx::new().unwrap();
+    ctx.bboolsetcbf("rust_ctx_identity", ctx_identity_probe)
+        .unwrap();
+    ctx.bboolsetcbf2("rust_ctx_identity2", ctx_identity_probe2)
+        .unwrap();
+    ctx
+}
+
+fn check_context_probes(ctx: &AtmiCtx, timeout: i32) {
+    EXPECTED_CTX.with(|expected| expected.set(ctx));
+    EXPECTED_TIMEOUT.with(|expected| expected.set(timeout));
+    ctx.tpsblktime(timeout, TPBLK_ALL).unwrap();
+    let mut ubf = ctx.tpalloc_ubf(4096).unwrap();
+    ubf.bchg(ubf_fields::T_LONG_FLD, 0, 77_i64, false).unwrap();
+    for expr in ["rust_ctx_identity()", "rust_ctx_identity2('probe')"] {
+        let tree = ctx.bboolco(expr).unwrap();
+        assert!(ubf.bboolev(&tree));
+        assert_eq!(ubf.bfloatev(&tree), 1.0);
+        assert!(ubf.bqboolev(expr).unwrap());
+    }
+    assert_eq!(ctx.tpgblktime(TPBLK_ALL).unwrap(), timeout);
+    EXPECTED_CTX.with(|expected| expected.set(std::ptr::null()));
+}
+
+#[test]
+fn ubf_expression_callbacks_use_the_evaluating_context() {
+    let _guard = endurox_test_env();
+    let registering = register_context_probes();
+    let evaluating = AtmiCtx::new().unwrap();
+    check_context_probes(&evaluating, 31);
+    check_context_probes(&registering, 32);
+}
+
+#[test]
+fn ubf_expression_registration_survives_context_move_and_drop() {
+    let _guard = endurox_test_env();
+    let moved = Box::new(register_context_probes());
+    check_context_probes(&moved, 33);
+    drop(moved);
+    let evaluating = AtmiCtx::new().unwrap();
+    check_context_probes(&evaluating, 34);
+}
+
+#[test]
+fn ubf_expression_callbacks_use_each_evaluating_thread() {
+    let _guard = endurox_test_env();
+    let _registering = register_context_probes();
+    let barrier = std::sync::Barrier::new(4);
+    std::thread::scope(|scope| {
+        for index in 0..4 {
+            let barrier = &barrier;
+            scope.spawn(move || {
+                let ctx = AtmiCtx::new().unwrap();
+                barrier.wait();
+                for _ in 0..10 {
+                    check_context_probes(&ctx, 40 + index);
+                }
+            });
+        }
+    });
+}
+
+#[cfg(feature = "ctx-send")]
+#[test]
+fn ubf_expression_registration_survives_thread_migration() {
+    let _guard = endurox_test_env();
+    let ctx = register_context_probes();
+    std::thread::spawn(move || check_context_probes(&ctx, 51))
+        .join()
+        .unwrap();
+}
+
+fn panicking_expr_callback(_: &TypedUbf<'_>, _: &str) -> i64 {
+    panic!("intentional expression callback panic");
+}
+
+fn nested_expr_callback(ubf: &TypedUbf<'_>, _: &str) -> i64 {
+    // Registration inside a callback must not retain the registry mutex or
+    // reacquire native TLS that is still locked by the outer evaluation.
+    ubf.ctx()
+        .bboolsetcbf("rust_registered_inside", ctx_identity_probe)
+        .unwrap();
+    assert!(ubf.bqboolev("rust_registered_inside()").unwrap());
+    assert!(!ubf.bqboolev("rust_expr_panics()").unwrap());
+
+    #[cfg(feature = "ctx-send")]
+    {
+        let saved_timeout = EXPECTED_TIMEOUT.with(Cell::get);
+        let nested = AtmiCtx::new().unwrap();
+        check_context_probes(&nested, 61);
+        EXPECTED_CTX.with(|expected| expected.set(ubf.ctx()));
+        EXPECTED_TIMEOUT.with(|expected| expected.set(saved_timeout));
+    }
+
+    ctx_identity_probe(ubf, "after nested evaluation")
+}
+
+#[test]
+fn ubf_expression_callbacks_restore_context_after_nesting_and_panic() {
+    let _guard = endurox_test_env();
+    let ctx = register_context_probes();
+    ctx.bboolsetcbf("rust_expr_nested", nested_expr_callback)
+        .unwrap();
+    ctx.bboolsetcbf("rust_expr_panics", panicking_expr_callback)
+        .unwrap();
+    EXPECTED_CTX.with(|expected| expected.set(&ctx));
+    EXPECTED_TIMEOUT.with(|expected| expected.set(60));
+    ctx.tpsblktime(60, TPBLK_ALL).unwrap();
+    let mut ubf = ctx.tpalloc_ubf(4096).unwrap();
+    ubf.bchg(ubf_fields::T_LONG_FLD, 0, 77_i64, false).unwrap();
+    assert!(ubf
+        .bqboolev("rust_expr_nested() && rust_ctx_identity()")
+        .unwrap());
+    assert!(ubf
+        .bqboolev("rust_expr_panics() || rust_ctx_identity2('probe')")
+        .unwrap());
+    check_context_probes(&ctx, 62);
 }
 
 #[test]

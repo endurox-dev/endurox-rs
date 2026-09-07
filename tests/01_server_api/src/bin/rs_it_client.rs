@@ -62,9 +62,23 @@ fn run() -> Result<(), String> {
     }
 
     if scenario == "tpacall" {
+        ctx.bboolsetcbf("rust_pending_reply", pending_reply_callback)
+            .map_err(|e| format!("callback registration failed: {e}"))?;
+        ctx.bboolsetcbf2("rust_pending_reply2", pending_reply_callback2)
+            .map_err(|e| format!("callback registration failed: {e}"))?;
+        let tree = ctx
+            .bboolco("rust_pending_reply() && rust_pending_reply2('HELLO')")
+            .map_err(|e| format!("callback expression compilation failed: {e}"))?;
         let mut cd = ctx
             .tpacall(svc, &buf, 0)
             .map_err(|e| format!("tpacall failed: {e}"))?;
+
+        // A callback must not terminate the client's session. Receiving an
+        // already pending reply detects this even if later ATMI calls would
+        // silently initialize a new session. Merely checking TLS cannot.
+        if !buf.bboolev(&tree) || buf.bfloatev(&tree) != 1.0 {
+            return Err("pending-reply callback evaluation failed".to_string());
+        }
         ctx.tpgetrply(&mut cd, &mut buf, 0)
             .map_err(|e| format!("tpgetrply failed: {e}"))?;
 
@@ -81,6 +95,17 @@ fn run() -> Result<(), String> {
 
     ctx.tpterm().map_err(|e| format!("tpterm failed: {e}"))?;
     Ok(())
+}
+
+fn pending_reply_callback(ubf: &TypedUbf<'_>, _: &str) -> i64 {
+    i64::from(
+        ubf.bget_string(ubf_fields::T_STRING_FLD, 0)
+            .is_ok_and(|value| value == "HELLO"),
+    )
+}
+
+fn pending_reply_callback2(ubf: &TypedUbf<'_>, name: &str, arg: &str) -> i64 {
+    i64::from(arg == "HELLO") * pending_reply_callback(ubf, name)
 }
 
 fn run_tpacall_getany(ctx: &AtmiCtx) -> Result<(), String> {

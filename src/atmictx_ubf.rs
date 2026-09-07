@@ -1,6 +1,7 @@
 use crate::raw::*;
 use crate::{raw, AtmiCtx, BorrowedUbf, TypedUbf, UbfResult};
 use core::ffi::{c_char, c_int, c_long, c_void};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -70,6 +71,88 @@ fn expr_callbacks() -> &'static Mutex<HashMap<String, UbfExprCallback>> {
 fn expr_callbacks2() -> &'static Mutex<HashMap<String, UbfExprCallback2>> {
     static CALLBACKS: OnceLock<Mutex<HashMap<String, UbfExprCallback2>>> = OnceLock::new();
     CALLBACKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+thread_local! {
+    static EXPR_CONTEXT: Cell<*const AtmiCtx> = const { Cell::new(std::ptr::null()) };
+}
+
+/// Keep the evaluator's borrow alive while C synchronously calls back into Rust.
+/// Restoring the previous pointer also supports nested evaluations on another
+/// context, including when a callback panics.
+struct ExprEvaluation<'ctx> {
+    _ctx: &'ctx AtmiCtx,
+    previous: *const AtmiCtx,
+}
+
+impl<'ctx> ExprEvaluation<'ctx> {
+    fn enter(ctx: &'ctx AtmiCtx) -> Self {
+        Self {
+            _ctx: ctx,
+            previous: EXPR_CONTEXT.with(|current| current.replace(ctx)),
+        }
+    }
+}
+
+impl Drop for ExprEvaluation<'_> {
+    fn drop(&mut self) {
+        EXPR_CONTEXT.with(|current| current.set(self.previous));
+    }
+}
+
+/// OUBF attaches and locks NSTD/UBF TLS without attaching ATMI TLS. Detach
+/// those locks during user code so nested Object API calls can acquire them,
+/// then restore them before returning to the native evaluator. ATMI TLS must
+/// be saved separately: a server dispatcher may already have it attached,
+/// whereas an ordinary OUBF call need not have any ATMI TLS attached at all.
+#[cfg(feature = "ctx-send")]
+struct ExprCallbackTls<'ctx> {
+    ctx: &'ctx AtmiCtx,
+    previous_atmi: raw::TPCONTEXT_T,
+    ubf_detached: bool,
+}
+
+#[cfg(feature = "ctx-send")]
+impl<'ctx> ExprCallbackTls<'ctx> {
+    const ATMI_FLAGS: c_long =
+        (raw::CTXT_PRIV_ATMI | raw::CTXT_PRIV_TRAN | raw::CTXT_PRIV_IGN) as c_long;
+    const UBF_FLAGS: c_long =
+        (raw::CTXT_PRIV_NSTD | raw::CTXT_PRIV_UBF | raw::CTXT_PRIV_IGN) as c_long;
+
+    // SAFETY: called only from an expression callback within ExprEvaluation.
+    unsafe fn suspend(ctx: &'ctx AtmiCtx) -> Option<Self> {
+        let mut previous_atmi = std::ptr::null_mut();
+        if raw::ndrx_tpgetctxt(&mut previous_atmi, 0, Self::ATMI_FLAGS) == raw::EXFAIL {
+            return None;
+        }
+        let mut guard = Self {
+            ctx,
+            previous_atmi,
+            ubf_detached: false,
+        };
+        if raw::ndrx_tpgetctxt(ctx.c_ctx_ptr(), 0, Self::UBF_FLAGS) != raw::TPMULTICONTEXTS as c_int
+        {
+            return None;
+        }
+        guard.ubf_detached = true;
+        Some(guard)
+    }
+}
+
+#[cfg(feature = "ctx-send")]
+impl Drop for ExprCallbackTls<'_> {
+    fn drop(&mut self) {
+        // The evaluator still borrows the context, so these handles remain
+        // valid. Restore only the components that were attached on entry.
+        unsafe {
+            if self.ubf_detached {
+                let _ = raw::ndrx_tpsetctxt(*self.ctx.c_ctx_ptr(), 0, Self::UBF_FLAGS);
+            }
+            if !self.previous_atmi.is_null() {
+                let _ = raw::ndrx_tpsetctxt(self.previous_atmi, 0, Self::ATMI_FLAGS);
+            }
+        }
+    }
 }
 
 unsafe extern "C" fn bfprint_output_callback(
@@ -157,31 +240,63 @@ unsafe fn expr_callback_proxy_impl(
         return 0;
     }
 
-    let Ok(ctx) = AtmiCtx::new() else {
-        return 0;
-    };
-    let ubf = TypedUbf::borrowed_from_raw(&ctx, p_ub as *mut c_char);
     let name = CStr::from_ptr(funcname).to_string_lossy().into_owned();
 
+    // Resolve the entry and release the registry lock *before* invoking the
+    // callback: holding it across user code would deadlock a callback that
+    // registers another one.
+    let arg = if arg1.is_null() {
+        None
+    } else {
+        Some(CStr::from_ptr(arg1).to_string_lossy().into_owned())
+    };
+
+    let resolved = if arg.is_none() {
+        expr_callbacks()
+            .lock()
+            .ok()
+            .and_then(|callbacks| callbacks.get(&name).copied())
+            .map(Callback::One)
+    } else {
+        expr_callbacks2()
+            .lock()
+            .ok()
+            .and_then(|callbacks| callbacks.get(&name).copied())
+            .map(Callback::Two)
+    };
+
+    let Some(callback) = resolved else {
+        return 0;
+    };
+    let ctx_ptr = EXPR_CONTEXT.with(Cell::get);
+    if ctx_ptr.is_null() {
+        return 0;
+    }
+
+    // SAFETY: ExprEvaluation holds this borrow for the synchronous native
+    // evaluation on this thread. The callback's higher-ranked argument cannot
+    // retain it, and nested evaluations restore the previous borrow on exit.
     catch_unwind(AssertUnwindSafe(|| {
-        if arg1.is_null() {
-            expr_callbacks()
-                .lock()
-                .ok()
-                .and_then(|callbacks| callbacks.get(&name).copied())
-                .map(|cb| cb(&ubf, &name))
-                .unwrap_or(0)
-        } else {
-            let arg = CStr::from_ptr(arg1).to_string_lossy().into_owned();
-            expr_callbacks2()
-                .lock()
-                .ok()
-                .and_then(|callbacks| callbacks.get(&name).copied())
-                .map(|cb| cb(&ubf, &name, &arg))
-                .unwrap_or(0)
+        let ctx = &*ctx_ptr;
+        #[cfg(feature = "ctx-send")]
+        let Some(_tls) = ExprCallbackTls::suspend(ctx) else {
+            return 0;
+        };
+        let ubf = TypedUbf::borrowed_from_raw(ctx, p_ub as *mut c_char);
+        match (callback, &arg) {
+            (Callback::One(cb), _) => cb(&ubf, &name),
+            (Callback::Two(cb), Some(arg)) => cb(&ubf, &name, arg),
+            (Callback::Two(_), None) => 0,
         }
     }))
     .unwrap_or(0) as c_long
+}
+
+/// Either arity of registered expression callback.
+#[derive(Clone, Copy)]
+enum Callback {
+    One(UbfExprCallback),
+    Two(UbfExprCallback2),
 }
 
 /// UBF field type for safe field-id construction.
@@ -546,6 +661,7 @@ impl AtmiCtx {
 
     #[inline]
     pub(crate) fn bboolev_value(&self, ubf: &TypedUbf<'_>, tree: &UbfExprTree<'_>) -> c_int {
+        let _evaluation = ExprEvaluation::enter(self);
         #[cfg(not(feature = "ctx-send"))]
         unsafe {
             raw::Bboolev(ubf.as_ubfh(), tree.as_ptr())
@@ -559,6 +675,7 @@ impl AtmiCtx {
 
     #[inline]
     pub(crate) fn bfloatev_value(&self, ubf: &TypedUbf<'_>, tree: &UbfExprTree<'_>) -> f64 {
+        let _evaluation = ExprEvaluation::enter(self);
         #[cfg(not(feature = "ctx-send"))]
         unsafe {
             raw::Bfloatev(ubf.as_ubfh(), tree.as_ptr())
@@ -1160,6 +1277,11 @@ impl AtmiCtx {
     }
 
     /// Register a Rust callback for UBF boolean expression evaluation.
+    ///
+    /// Registration is process-wide and independent of this context's lifetime.
+    /// The callback borrows the context of the buffer being evaluated, on the
+    /// evaluating thread. The same callback can run concurrently on several
+    /// threads, so it must synchronize any shared application state.
     pub fn bboolsetcbf(&self, funcname: &str, callback: UbfExprCallback) -> UbfResult<()> {
         if funcname.is_empty() {
             return Err(crate::UbfError::new(
@@ -1199,6 +1321,10 @@ impl AtmiCtx {
     }
 
     /// Register a Rust callback with one string argument for boolean evaluation.
+    ///
+    /// Like [`Self::bboolsetcbf`], registration is process-wide. The callback
+    /// borrows the evaluating buffer's context, regardless of which context or
+    /// thread registered it, and may run concurrently on different threads.
     pub fn bboolsetcbf2(&self, funcname: &str, callback: UbfExprCallback2) -> UbfResult<()> {
         if funcname.is_empty() {
             return Err(crate::UbfError::new(

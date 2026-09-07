@@ -1,8 +1,21 @@
 use endurox_rs::{
-    ubf_fields, AtmiCtx, AtmiResult, ServerHooks, TpReturnStatus, TpSvcInfo, UbfValue,
+    ubf_fields, AtmiCtx, AtmiResult, ServerHooks, TpReturnStatus, TpSvcInfo, TypedUbf, UbfValue,
 };
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+thread_local! {
+    static EXPECTED_EXPR_CTX: Cell<*const AtmiCtx> = const { Cell::new(std::ptr::null()) };
+}
+
+fn service_expression_callback(ubf: &TypedUbf<'_>, _: &str) -> i64 {
+    i64::from(
+        EXPECTED_EXPR_CTX.with(|expected| expected.get() == ubf.ctx() as *const AtmiCtx)
+            && ubf.bget_string(ubf_fields::T_STRING_FLD, 0).is_ok()
+            && ubf.ctx().tpgetsrvid().is_ok(),
+    )
+}
 
 static THRINIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static THRINIT_CTX_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -16,6 +29,14 @@ fn return_echo(ctx: &AtmiCtx, svc: &mut TpSvcInfo<'_>, prefix: &str) {
 
     let req_fld = ubf_fields::T_STRING_FLD;
     let rsp_fld = ubf_fields::T_STRING_2_FLD;
+
+    EXPECTED_EXPR_CTX.with(|expected| expected.set(ctx));
+    let callback_ok = ubf.bqboolev("rust_service_context()").unwrap_or(false);
+    EXPECTED_EXPR_CTX.with(|expected| expected.set(std::ptr::null()));
+    if !callback_ok {
+        ctx.tpreturn_ubf(TpReturnStatus::Fail, 5, ubf, 0);
+        return;
+    }
 
     let req = match ubf.bget_string(req_fld, 0) {
         Ok(v) => v,
@@ -201,6 +222,8 @@ fn rs_it_control(ctx: &AtmiCtx, svc: &mut TpSvcInfo<'_>) {
 }
 
 fn rs_it_init(ctx: &AtmiCtx, _args: &[String]) -> AtmiResult<()> {
+    ctx.bboolsetcbf("rust_service_context", service_expression_callback)
+        .expect("failed to register service expression callback");
     ctx.tpadvertise("RS_IT_ECHO", rs_it_echo)?;
     ctx.tpadvertise("RS_IT_THREAD", rs_it_thread)?;
     ctx.tpadvertise("RS_IT_THRINFO", rs_it_thrinfo)?;
