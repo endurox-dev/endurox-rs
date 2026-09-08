@@ -998,10 +998,6 @@ impl AtmiCtx {
     /// start the buffer header caches. `Bhasptr` seeks straight to it, which
     /// makes the common pointer-free answer a single step rather than a walk
     /// over the whole buffer.
-    ///
-    /// Cores without `Bhasptr` use the equivalent walk below. `build.rs` sets
-    /// `endurox_has_bhasptr` when `ubf.h` declares it.
-    #[cfg(endurox_has_bhasptr)]
     pub fn ubf_has_pointer_fields(&self, ubf: &TypedUbf<'_>) -> UbfResult<bool> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::Bhasptr(ubf.as_ubfh()) };
@@ -1014,42 +1010,6 @@ impl AtmiCtx {
         } else {
             Ok(rc == raw::EXTRUE as c_int)
         }
-    }
-
-    /// Whether `ubf` holds a `BFLD_PTR` field at any depth.
-    ///
-    /// Compatibility path for cores that predate `Bhasptr(3)`. It walks every
-    /// field rather than seeking to the pointer run, so it costs time
-    /// proportional to the buffer contents. The seek is not reproducible from
-    /// here: it needs `EFFECTIVE_BITS`, which lives in the internal
-    /// `ubf_int.h` and depends on how the core was built.
-    #[cfg(not(endurox_has_bhasptr))]
-    pub fn ubf_has_pointer_fields(&self, ubf: &TypedUbf<'_>) -> UbfResult<bool> {
-        let mut it = ubf.bnext();
-        while let Some(field) = it.next()? {
-            match field.field_type {
-                UbfFieldType::Ptr => return Ok(true),
-                UbfFieldType::Ubf => {
-                    let mut len: BFLDLEN = 0;
-                    let nested = self.bfind_value(
-                        ubf,
-                        field.field_id as BFLDID,
-                        field.occurrence as BFLDOCC,
-                        &mut len,
-                    );
-                    if !nested.is_null() {
-                        // SAFETY: Bfind returned the embedded buffer's data,
-                        // and the borrowed view frees nothing.
-                        let nested = unsafe { TypedUbf::borrowed_from_raw(self, nested) };
-                        if self.ubf_has_pointer_fields(&nested)? {
-                            return Ok(true);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(false)
     }
 
     /// Copy the full contents of `src` into `dst`.
