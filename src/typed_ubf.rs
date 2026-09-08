@@ -159,6 +159,23 @@ impl<'ctx> IntoUbfValue<'ctx> for TypedUbf<'ctx> {
     }
 }
 
+/// Exclusive batch appender returned by [`TypedUbf::fast_adder`].
+///
+/// Holds the buffer mutably so nothing else can mutate it while the cached
+/// field position is live. Reallocation during a batch is handled internally.
+pub struct FastAdder<'a, 'ctx> {
+    ubf: &'a mut TypedUbf<'ctx>,
+    loc: BFldLocInfo,
+}
+
+impl<'ctx> FastAdder<'_, 'ctx> {
+    /// Append one occurrence using the cached position.
+    pub fn add(&mut self, bfldid: i32, v: impl IntoUbfValue<'ctx>, realloc: bool) -> UbfResult<()> {
+        self.ubf
+            .write_value_fast(bfldid, v.into_ubf_value(), &mut self.loc, realloc)
+    }
+}
+
 /// UBF-typed buffer: logically a UBF atmibuf.
 #[derive(Debug)]
 pub struct TypedUbf<'ctx> {
@@ -176,6 +193,9 @@ pub struct UbfField {
 pub struct UbfIterator<'a, 'ctx> {
     ubf: &'a TypedUbf<'ctx>,
     field_id: raw::BFLDID,
+    /// Per-iterator cursor. Sharing `Bnext`'s buffer-wide state made two live
+    /// iterators over one buffer interfere and fail with `BEINVAL`.
+    state: raw::Bnext_state_t,
 }
 
 /// Borrowed, non-reallocatable view of a buffer owned by another buffer.
@@ -247,6 +267,8 @@ impl<'a, 'ctx> BorrowedUbf<'a, 'ctx> {
 
     /// Read a field from this embedded UBF as a `String`.
     pub fn bget_string(&self, bfldid: i32, occ: i32) -> UbfResult<String> {
+        self.ctx
+            .reject_ptr_conversion(bfldid as raw::BFLDID, "bget_string")?;
         let mut buf = vec![0u8; raw::NDRX_ATMI_MSG_MAX_SIZE as usize];
         let mut len = buf.len() as raw::BFLDLEN;
         let rc = self.ctx.cbget_borrowed_ubf_value(
@@ -288,8 +310,22 @@ impl<'ctx> TypedUbf<'ctx> {
     ///
     /// The caller must know that the wrapped ATMI buffer is actually a UBF
     /// buffer, for example because it came from `tpalloc("UBF", ...)`.
-    pub fn from_typed(buf: TypedBuffer<'ctx>) -> Self {
-        TypedUbf { inner: buf }
+    pub fn from_typed(buf: TypedBuffer<'ctx>) -> UbfResult<Self> {
+        match buf.tptypes() {
+            Ok(info) if info.type_name == "UBF" => Ok(TypedUbf { inner: buf }),
+            Ok(info) => Err(UbfError::new(
+                UbfError::BTYPERR,
+                format!(
+                    "cannot view a {} buffer as UBF; every UBF operation would \
+                     address it through a header it does not have",
+                    info.type_name
+                ),
+            )),
+            Err(err) => Err(UbfError::new(
+                UbfError::BTYPERR,
+                format!("buffer is not a live ATMI allocation: {err}"),
+            )),
+        }
     }
 
     /// Return the ATMI context that owns this UBF buffer.
@@ -371,19 +407,42 @@ impl<'ctx> TypedUbf<'ctx> {
         self.write_value(bfldid, 0, v.into_ubf_value(), realloc, true)
     }
 
-    /// Add a new UBF field occurrence using Enduro/X fast-add location state.
-    pub fn badd_fast(
-        &mut self,
-        bfldid: i32,
-        v: impl IntoUbfValue<'ctx>,
-        loc: &mut BFldLocInfo,
-        first: bool,
-        realloc: bool,
-    ) -> UbfResult<()> {
-        if first {
-            *loc = BFldLocInfo::default();
+    /// Begin a batch of fast appends.
+    ///
+    /// Enduro/X's fast-add path caches a field position inside the buffer. That
+    /// cursor is invalidated by anything that moves or reshapes the data --
+    /// reallocation, `Binit`, a deletion, a projection -- and following a stale
+    /// one silently writes to the wrong place. Rather than trying to detect
+    /// every such mutation, [`FastAdder`] borrows the buffer exclusively for as
+    /// long as it lives, so no other mutation can happen in between and the
+    /// cursor cannot be reused against a different buffer.
+    ///
+    /// ```no_run
+    /// # use endurox_rs::{TypedUbf, UbfResult};
+    /// # fn f(ubf: &mut TypedUbf<'_>, field: i32) -> UbfResult<()> {
+    /// let mut adder = ubf.fast_adder();
+    /// for i in 0..100_i64 {
+    ///     adder.add(field, i, true)?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn fast_adder<'a>(&'a mut self) -> FastAdder<'a, 'ctx> {
+        FastAdder {
+            ubf: self,
+            loc: BFldLocInfo::default(),
         }
-        self.write_value_fast(bfldid, v.into_ubf_value(), loc, realloc)
+    }
+
+    /// Point `loc` at this buffer, restarting it if it was positioned elsewhere.
+    fn sync_fast_cursor(&self, loc: &mut BFldLocInfo) {
+        let current = self.inner.as_ptr();
+        if !loc.belongs_to(current) {
+            // Either a fresh cursor, or one left over from a different buffer or
+            // from a since-relocated allocation. Its cached position does not
+            // describe this memory, so restart rather than follow it.
+            loc.rebase(current);
+        }
     }
 
     /// Change or add a field based on `do_add`, matching Go's `BChgCombined`.
@@ -398,10 +457,16 @@ impl<'ctx> TypedUbf<'ctx> {
         self.write_value(bfldid, occ, v.into_ubf_value(), realloc, do_add)
     }
 
+    /// Iterate the fields of this buffer.
+    ///
+    /// Each iterator owns its cursor, so several can be live over the same
+    /// buffer at once without interfering.
     pub fn bnext(&self) -> UbfIterator<'_, 'ctx> {
         UbfIterator {
             ubf: self,
             field_id: 0,
+            // Zeroed is the documented "start from the beginning" state.
+            state: unsafe { std::mem::zeroed() },
         }
     }
 
@@ -413,12 +478,26 @@ impl<'ctx> TypedUbf<'ctx> {
         realloc: bool,
         add: bool,
     ) -> UbfResult<()> {
+        self.check_pointer_field_write(bfldid, &v)?;
+
         loop {
             if let UbfValue::Ubf(ubf) = &mut v {
                 if add {
                     return Err(UbfError::new(
                         UbfError::BEINVAL,
                         "adding embedded UBF fields is not supported",
+                    ));
+                }
+                if self.inner.ctx.ubf_has_pointer_fields(ubf)? {
+                    // Embedding copies the sub-buffer's bytes, including any
+                    // stored pointer addresses. The value is consumed here and
+                    // dropped on return, which frees those targets while the
+                    // embedded copy still references them.
+                    return Err(UbfError::new(
+                        UbfError::BEINVAL,
+                        "cannot embed a UBF containing BFLD_PTR fields: the copy \
+                         would keep the pointers while the consumed original frees \
+                         their targets",
                     ));
                 }
                 let rc = self.inner.ctx.bchg_ubf_value(
@@ -546,6 +625,12 @@ impl<'ctx> TypedUbf<'ctx> {
         loc: &mut BFldLocInfo,
         realloc: bool,
     ) -> UbfResult<()> {
+        self.check_pointer_field_write(bfldid, &v)?;
+
+        // A cursor carried over from another buffer, or from an allocation this
+        // buffer has since outgrown, describes memory that is no longer here.
+        self.sync_fast_cursor(loc);
+
         loop {
             let mut _string_storage: Option<CString> = None;
             let mut empty_carray = [0u8; 1];
@@ -617,6 +702,10 @@ impl<'ctx> TypedUbf<'ctx> {
             let err = self.inner.ctx.ubf_last_error();
             if err.code == UbfError::BNOSPACE && realloc {
                 self.grow_buffer()?;
+                // grow_buffer relocates the allocation, so the cursor's cached
+                // position now points into freed memory. Restart it before the
+                // retry.
+                loc.rebase(self.inner.as_ptr());
                 continue;
             }
             return Err(err);
@@ -630,6 +719,9 @@ impl<'ctx> TypedUbf<'ctx> {
     /// Uses `CBget(3)` so Enduro/X performs type conversion from the stored
     /// field type to `BFLD_STRING`.
     pub fn bget_string(&self, bfldid: i32, occ: i32) -> UbfResult<String> {
+        self.inner
+            .ctx
+            .reject_ptr_conversion(bfldid as raw::BFLDID, "bget_string")?;
         let mut buf = vec![0u8; raw::NDRX_ATMI_MSG_MAX_SIZE as usize];
         let mut len = buf.len() as raw::BFLDLEN;
         let rc = self.inner.ctx.cbget_value(
@@ -671,6 +763,9 @@ impl<'ctx> TypedUbf<'ctx> {
     ///
     /// Uses `CBget(3)` with `BFLD_LONG` as the requested target type.
     pub fn bget_long(&self, bfldid: i32, occ: i32) -> UbfResult<i64> {
+        self.inner
+            .ctx
+            .reject_ptr_conversion(bfldid as raw::BFLDID, "bget_long")?;
         let mut val: i64 = 0;
         let mut len = std::mem::size_of::<i64>() as raw::BFLDLEN;
         let rc = self.inner.ctx.cbget_value(
@@ -692,6 +787,9 @@ impl<'ctx> TypedUbf<'ctx> {
     ///
     /// Uses `CBget(3)` with `BFLD_SHORT` as the requested target type.
     pub fn bget_short(&self, bfldid: i32, occ: i32) -> UbfResult<i16> {
+        self.inner
+            .ctx
+            .reject_ptr_conversion(bfldid as raw::BFLDID, "bget_short")?;
         let mut val: i16 = 0;
         let mut len = std::mem::size_of::<i16>() as raw::BFLDLEN;
         let rc = self.inner.ctx.cbget_value(
@@ -713,6 +811,9 @@ impl<'ctx> TypedUbf<'ctx> {
     ///
     /// Uses `CBget(3)` with `BFLD_DOUBLE` as the requested target type.
     pub fn bget_double(&self, bfldid: i32, occ: i32) -> UbfResult<f64> {
+        self.inner
+            .ctx
+            .reject_ptr_conversion(bfldid as raw::BFLDID, "bget_double")?;
         let mut val: f64 = 0.0;
         let mut len = std::mem::size_of::<f64>() as raw::BFLDLEN;
         let rc = self.inner.ctx.cbget_value(
@@ -734,6 +835,9 @@ impl<'ctx> TypedUbf<'ctx> {
     ///
     /// Uses `CBget(3)` with `BFLD_FLOAT` as the requested target type.
     pub fn bget_float(&self, bfldid: i32, occ: i32) -> UbfResult<f32> {
+        self.inner
+            .ctx
+            .reject_ptr_conversion(bfldid as raw::BFLDID, "bget_float")?;
         let mut val: f32 = 0.0;
         let mut len = std::mem::size_of::<f32>() as raw::BFLDLEN;
         let rc = self.inner.ctx.cbget_value(
@@ -755,6 +859,9 @@ impl<'ctx> TypedUbf<'ctx> {
     ///
     /// Uses `CBget(3)` with `BFLD_CHAR` as the requested target type.
     pub fn bget_char(&self, bfldid: i32, occ: i32) -> UbfResult<i8> {
+        self.inner
+            .ctx
+            .reject_ptr_conversion(bfldid as raw::BFLDID, "bget_char")?;
         let mut val: i8 = 0;
         let mut len = std::mem::size_of::<i8>() as raw::BFLDLEN;
         let rc = self.inner.ctx.cbget_value(
@@ -776,6 +883,9 @@ impl<'ctx> TypedUbf<'ctx> {
     ///
     /// The exact CARRAY length returned by Enduro/X is preserved.
     pub fn bget_bytes(&self, bfldid: i32, occ: i32) -> UbfResult<Vec<u8>> {
+        self.inner
+            .ctx
+            .reject_ptr_conversion(bfldid as raw::BFLDID, "bget_bytes")?;
         let mut buf = vec![0u8; raw::NDRX_ATMI_MSG_MAX_SIZE as usize];
         let mut len = buf.len() as raw::BFLDLEN;
         let rc = self.inner.ctx.cbget_value(
@@ -797,7 +907,56 @@ impl<'ctx> TypedUbf<'ctx> {
     /// Read an embedded UBF occurrence as a borrowed read-only UBF view.
     ///
     /// The returned view is tied to this parent buffer and must not outlive it.
+    /// Refuse to interpret a field's bytes as a type it was not declared with.
+    ///
+    /// The field id encodes its type, so this is a cheap check. Without it,
+    /// `bget_ptr`/`bget_ubf` on a LONG field would read whatever eight bytes
+    /// happen to be stored there and treat them as a buffer address.
+    /// Keep `BFLD_PTR` occurrences and owned buffers paired up.
+    ///
+    /// Enduro/X converts freely between `BFLD_PTR` and the scalar types, so
+    /// `bchg(ptr_field, 0, 0x7fff_0000i64)` stores that integer as a pointer and
+    /// the parent passes it to `tpfree` when it is freed
+    /// (`ndrx_tpfree_scan_ptrs`, `libatmi/typed_buf.c`). Only
+    /// [`UbfValue::Ptr`] carries the ownership transfer this buffer relies on,
+    /// so it is the only value a pointer field accepts, and it is accepted
+    /// nowhere else: storing it in a scalar field would record the address
+    /// while the Rust wrapper kept the buffer and freed it on drop.
+    fn check_pointer_field_write(&self, bfldid: i32, v: &UbfValue<'ctx>) -> UbfResult<()> {
+        let field_is_ptr = self.inner.ctx.bfldtype(bfldid as raw::BFLDID)? == UbfFieldType::Ptr;
+        let value_is_ptr = matches!(v, UbfValue::Ptr(_));
+
+        if field_is_ptr && !value_is_ptr {
+            return Err(UbfError::new(
+                UbfError::BTYPERR,
+                format!(
+                    "field id {bfldid} is BFLD_PTR and only accepts an owned buffer; \
+                     the parent frees whatever address is stored here"
+                ),
+            ));
+        }
+        if value_is_ptr && !field_is_ptr {
+            return Err(UbfError::new(
+                UbfError::BTYPERR,
+                format!("field id {bfldid} is not BFLD_PTR, so it cannot hold a buffer"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_field_type(&self, bfldid: i32, want: UbfFieldType, what: &str) -> UbfResult<()> {
+        let got = self.inner.ctx.bfldtype(bfldid as raw::BFLDID)?;
+        if got != want {
+            return Err(UbfError::new(
+                UbfError::BTYPERR,
+                format!("{what} requires a {want:?} field; field id {bfldid} is {got:?}"),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn bget_ubf<'a>(&'a self, bfldid: i32, occ: i32) -> UbfResult<BorrowedUbf<'a, 'ctx>> {
+        self.require_field_type(bfldid, UbfFieldType::Ubf, "bget_ubf")?;
         let mut len: raw::BFLDLEN = 0;
         let ptr =
             self.inner
@@ -816,6 +975,7 @@ impl<'ctx> TypedUbf<'ctx> {
     /// `ndrx_tpfree_scan_ptrs`). `CBget` is not usable here: it runs the
     /// BFLD_PTR conversion table rather than handing back the stored address.
     fn read_ptr_field(&self, bfldid: i32, occ: i32) -> UbfResult<*mut c_char> {
+        self.require_field_type(bfldid, UbfFieldType::Ptr, "BFLD_PTR access")?;
         let mut len: raw::BFLDLEN = 0;
         let field =
             self.inner
@@ -865,6 +1025,12 @@ impl<'ctx> TypedUbf<'ctx> {
         // unowned, leaving the parent responsible for freeing it, and
         // `BorrowedBuffer` withholds every reallocating method.
         let unowned = unsafe { TypedBuffer::borrowed_from_raw(self.inner.ctx, target) };
+        // The wrapper starts at length zero, so `as_bytes` is empty until the
+        // caller states a length. The payload length is genuinely unknown here:
+        // a BFLD_PTR field stores an address and nothing else, and the
+        // allocation size is an upper bound, not the length. Reporting the
+        // allocation would resurrect bytes the previous owner had truncated
+        // away and expose whatever sits past the data.
         Ok(unsafe { BorrowedBuffer::from_unowned(unowned) })
     }
 
@@ -923,6 +1089,10 @@ impl<'ctx> TypedUbf<'ctx> {
         ctx.bdel(self, bfldid as raw::BFLDID, occ as raw::BFLDOCC)?;
         // SAFETY: the field no longer references `target`, so the parent will
         // not free it and this wrapper becomes its sole owner.
+        // Length starts at zero for the same reason as `bget_ptr`: the field
+        // carried an address, not an extent. `set_len` no longer overwrites
+        // anything, so a caller that knows the payload length can state it and
+        // read the data back intact.
         Ok(unsafe { TypedBuffer::from_raw(ctx, target) })
     }
 
@@ -1004,11 +1174,12 @@ impl<'ctx> TypedUbf<'ctx> {
 impl<'a, 'ctx> UbfIterator<'a, 'ctx> {
     pub fn next(&mut self) -> UbfResult<Option<UbfField>> {
         let mut occurrence: raw::BFLDOCC = 0;
-        let rc = self
-            .ubf
-            .inner
-            .ctx
-            .bnext_value(self.ubf, &mut self.field_id, &mut occurrence);
+        let rc = self.ubf.inner.ctx.bnext_value(
+            self.ubf,
+            &mut self.state,
+            &mut self.field_id,
+            &mut occurrence,
+        );
 
         match rc {
             1 => {

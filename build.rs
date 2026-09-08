@@ -48,6 +48,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LIBCLANG_PATH");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
     println!("cargo:rustc-check-cfg=cfg(endurox_pollable)");
+    println!("cargo:rustc-check-cfg=cfg(endurox_has_bhasptr)");
 
     // Resolve Enduro/X libs and include paths via pkg-config (atmisrvinteg.pc).
     // This emits the appropriate cargo:rustc-link-lib / rustc-link-search lines.
@@ -66,6 +67,10 @@ fn main() {
 
     if endurox_config_has_pollable_reply_queue(&include_dirs) {
         println!("cargo:rustc-cfg=endurox_pollable");
+    }
+
+    if endurox_has_bhasptr(&include_dirs) {
+        println!("cargo:rustc-cfg=endurox_has_bhasptr");
     }
 
     // --- 3) Generate bindings with bindgen -----------------------------------
@@ -150,6 +155,26 @@ fn find_mkfldhdr(manifest_dir: &Path) -> PathBuf {
     }
 
     PathBuf::from("mkfldhdr")
+}
+
+/// Whether the Enduro/X core provides `Bhasptr(3)`.
+///
+/// It reports if a UBF holds `BFLD_PTR` fields at any depth, which the copy
+/// APIs need in order to refuse an operation that would duplicate a pointer
+/// without its target. It seeks via the buffer header's cached pointer offset,
+/// so it answers in constant time where a field walk is linear.
+///
+/// Cores that predate it fall back to walking the buffer from Rust. The
+/// binding is published, so a hard requirement here would break every build
+/// against a released Enduro/X.
+fn endurox_has_bhasptr(include_dirs: &[String]) -> bool {
+    for dir in include_dirs {
+        let header = PathBuf::from(dir).join("ubf.h");
+        if let Ok(contents) = fs::read_to_string(header) {
+            return contents.contains("Bhasptr");
+        }
+    }
+    false
 }
 
 fn endurox_config_has_pollable_reply_queue(include_dirs: &[String]) -> bool {

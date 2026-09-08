@@ -1,0 +1,15 @@
+# Anchored to this crate's root. Unanchored patterns like `bin/` match at any
+# depth and would also swallow src/bin/, which holds the client and server.
+/Cargo.lock
+/bin/
+/target/
+/log/
+/tmp/
+/qdata/
+/tmlogs/
+/ubftab/
+/test.out
+/conf/app.ini
+/conf/settest1
+/conf/setnrc*
+ULOG*

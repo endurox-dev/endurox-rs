@@ -5,9 +5,9 @@ use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use endurox_rs::{
-    ubf_fields, ubf_read_adhoc, ubf_read_nested, ubf_write_nested, AtmiCtx, BFldLocInfo,
-    TypedBuffer, TypedUbf, UbfCarray, UbfDeserialize, UbfFieldDeserialize, UbfFieldSerialize,
-    UbfFieldType, UbfGetValue, UbfResult, UbfSerialize, UbfValue, TPBLK_ALL,
+    ubf_fields, ubf_read_adhoc, ubf_read_nested, ubf_write_nested, AtmiCtx, TypedBuffer, TypedUbf,
+    UbfCarray, UbfDeserialize, UbfFieldDeserialize, UbfFieldSerialize, UbfFieldType, UbfGetValue,
+    UbfResult, UbfSerialize, UbfValue, TPBLK_ALL,
 };
 
 #[test]
@@ -307,12 +307,15 @@ fn ubf_dynamic_get_and_fast_add_match_field_types() {
     let _guard = endurox_test_env();
     let ctx = AtmiCtx::new().expect("failed to create AtmiCtx");
     let mut ubf = ctx.tpalloc_ubf(4096).expect("tpalloc_ubf failed");
-    let mut loc = BFldLocInfo::default();
-
-    ubf.badd_fast(ubf_fields::T_SHORT_FLD, 5_i16, &mut loc, true, false)
-        .expect("short Baddfast failed");
-    ubf.badd_fast(ubf_fields::T_SHORT_FLD, 7_i16, &mut loc, false, false)
-        .expect("second short Baddfast failed");
+    {
+        let mut adder = ubf.fast_adder();
+        adder
+            .add(ubf_fields::T_SHORT_FLD, 5_i16, false)
+            .expect("short fast add failed");
+        adder
+            .add(ubf_fields::T_SHORT_FLD, 7_i16, false)
+            .expect("second short fast add failed");
+    }
     ubf.bchg(ubf_fields::T_STRING_FLD, 0, "dynamic", false)
         .expect("string Bchg failed");
 
@@ -413,7 +416,7 @@ fn ubf_generic_buffer_can_be_cast_to_ubf() {
     let _guard = endurox_test_env();
     let ctx = AtmiCtx::new().expect("failed to create AtmiCtx");
     let generic: TypedBuffer<'_> = ctx.tpalloc("UBF", "", 2048).expect("tpalloc failed");
-    let mut ubf = TypedUbf::from_typed(generic);
+    let mut ubf = TypedUbf::from_typed(generic).expect("buffer is not UBF");
 
     ubf.bchg(
         ubf_fields::T_STRING_2_FLD,
@@ -878,6 +881,116 @@ fn rust_long_arg(ubf: &TypedUbf<'_>, _funcname: &str, arg: &str) -> i64 {
     (ubf.bget_long(ubf_fields::T_LONG_FLD, 0).ok() == Some(expected)) as i64
 }
 
+/// A VIEW buffer cannot be shrunk below the layout its accessors use.
+///
+/// Field access goes through fixed offsets from the compiled view, so the
+/// accessors keep reading at those offsets no matter how small the allocation
+/// becomes. `tprealloc(1)` on a valid view used to succeed and turn every later
+/// read into an out-of-bounds access from safe code.
+#[test]
+fn view_cannot_be_reallocated_below_its_layout() {
+    let _guard = endurox_test_env();
+    let ctx = AtmiCtx::new().expect("failed to create AtmiCtx");
+    ctx.tpinit().expect("tpinit failed");
+
+    let required = ctx.bvsizeof("TESTVIEW1").expect("Bvsizeof failed");
+    assert!(required > 1, "the test view must be larger than a byte");
+
+    let mut view = ctx
+        .tpalloc_view("TESTVIEW1", required)
+        .expect("tpalloc_view failed");
+    view.bvchg("tlong", 0, 4242_i64)
+        .expect("writing a view field failed");
+
+    let err = view
+        .tprealloc(1)
+        .expect_err("shrinking a view below its layout must fail");
+    assert_eq!(err.code, endurox_rs::AtmiError::TPEINVAL);
+
+    // Refused, so the buffer is untouched and the field still reads back.
+    assert_eq!(
+        view.bvget_i64("tlong", 0, 0)
+            .expect("reading the field back"),
+        4242
+    );
+
+    // Growing is still fine.
+    view.tprealloc(required * 2)
+        .expect("growing a view must be allowed");
+    assert_eq!(
+        view.bvget_i64("tlong", 0, 0)
+            .expect("reading the field after growth"),
+        4242
+    );
+
+    drop(view);
+    ctx.tpterm().expect("tpterm failed");
+}
+
+/// A `BFLD_PTR` occurrence only accepts an owned buffer.
+///
+/// Enduro/X converts between `BFLD_PTR` and the scalar types, so a plain
+/// integer write used to install an arbitrary address that the parent then
+/// passed to `tpfree` through `ndrx_tpfree_scan_ptrs`. Reading one back as a
+/// scalar had the mirror problem: it handed out the address of a buffer the
+/// parent still owned.
+#[test]
+fn ubf_ptr_field_rejects_scalar_conversions() {
+    let _guard = endurox_test_env();
+    let ctx = AtmiCtx::new().expect("failed to create AtmiCtx");
+    ctx.tpinit().expect("tpinit failed");
+
+    let mut ubf = ctx.tpalloc_ubf(1024).expect("tpalloc_ubf failed");
+
+    // Writing a bare address into a pointer field.
+    for err in [
+        ubf.bchg(ubf_fields::T_PTR_3_FLD, 0, 0x7fff_0000_i64, true)
+            .expect_err("bchg of an integer into a BFLD_PTR field must fail"),
+        ubf.badd(ubf_fields::T_PTR_3_FLD, 0x7fff_0000_i64, true)
+            .expect_err("badd of an integer into a BFLD_PTR field must fail"),
+        ubf.fast_adder()
+            .add(ubf_fields::T_PTR_3_FLD, 0x7fff_0000_i64, true)
+            .expect_err("fast_adder of an integer into a BFLD_PTR field must fail"),
+    ] {
+        assert_eq!(err.code, endurox_rs::UbfError::BTYPERR);
+    }
+
+    // And the field must still be empty, so nothing bogus can be freed.
+    assert!(
+        ubf.bget_ptr(ubf_fields::T_PTR_3_FLD, 0).is_err(),
+        "a rejected write must not have stored an occurrence"
+    );
+
+    // An owned buffer belongs only in a pointer field.
+    let stray = ctx.tpalloc_carray(b"STRAY").expect("tpalloc_carray failed");
+    let err = ubf
+        .bchg(ubf_fields::T_LONG_FLD, 0, UbfValue::Ptr(stray), true)
+        .expect_err("a buffer must not be storable in a scalar field");
+    assert_eq!(err.code, endurox_rs::UbfError::BTYPERR);
+
+    // Reading a real pointer field as a scalar must be refused too.
+    let target = ctx
+        .tpalloc_carray(b"TARGET")
+        .expect("tpalloc_carray failed");
+    ubf.bchg(ubf_fields::T_PTR_3_FLD, 0, UbfValue::Ptr(target), true)
+        .expect("storing a BFLD_PTR field failed");
+    for err in [
+        ubf.bget_long(ubf_fields::T_PTR_3_FLD, 0)
+            .expect_err("bget_long on a BFLD_PTR field must fail"),
+        ubf.bget_short(ubf_fields::T_PTR_3_FLD, 0)
+            .expect_err("bget_short on a BFLD_PTR field must fail"),
+        ubf.bget_string(ubf_fields::T_PTR_3_FLD, 0)
+            .expect_err("bget_string on a BFLD_PTR field must fail"),
+        ubf.bget_bytes(ubf_fields::T_PTR_3_FLD, 0)
+            .expect_err("bget_bytes on a BFLD_PTR field must fail"),
+    ] {
+        assert_eq!(err.code, endurox_rs::UbfError::BTYPERR);
+    }
+
+    drop(ubf);
+    ctx.tpterm().expect("tpterm failed");
+}
+
 /// A `BFLD_PTR` field must store the target's *address*, not the first bytes of
 /// its contents, and the target must survive the write.
 ///
@@ -944,7 +1057,7 @@ fn ubf_ptr_field_extraction_transfers_ownership() {
     drop(master);
 
     // Still live, and writable -- extraction hands over a standalone buffer.
-    let mut owned = TypedUbf::from_typed(extracted);
+    let mut owned = TypedUbf::from_typed(extracted).expect("extracted buffer is not UBF");
     owned
         .bchg(
             ubf_fields::T_STRING_FLD,
@@ -1108,30 +1221,18 @@ fn ubf_ptr_field_fast_add_transfers_ownership() {
     ctx.tpinit().expect("tpinit failed");
 
     let mut master = ctx.tpalloc_ubf(4096).expect("master");
-    let mut loc = BFldLocInfo::default();
 
     let first = ctx.tpalloc_carray(b"FAST-1").expect("first target");
-    master
-        .badd_fast(
-            ubf_fields::T_PTR_FLD,
-            UbfValue::Ptr(first),
-            &mut loc,
-            true,
-            true,
-        )
-        .expect("badd_fast BFLD_PTR failed");
-
     let second = ctx.tpalloc_carray(b"FAST-22").expect("second target");
-    master
-        .badd_fast(
-            ubf_fields::T_PTR_FLD,
-            UbfValue::Ptr(second),
-            &mut loc,
-            false,
-            true,
-        )
-        .expect("second badd_fast BFLD_PTR failed");
-
+    {
+        let mut adder = master.fast_adder();
+        adder
+            .add(ubf_fields::T_PTR_FLD, UbfValue::Ptr(first), true)
+            .expect("fast add BFLD_PTR failed");
+        adder
+            .add(ubf_fields::T_PTR_FLD, UbfValue::Ptr(second), true)
+            .expect("second fast add BFLD_PTR failed");
+    }
     // tptypes only succeeds while Enduro/X still has the buffer registered, so
     // this fails loudly if either target was freed by the fast path.
     for (occ, size) in [(0, 6usize), (1, 7)] {
@@ -1185,6 +1286,191 @@ fn ubf_ptr_field_replacement_reclaims_the_old_target() {
     ctx.tpterm().expect("tpterm failed");
 }
 
+/// Two live iterators over one buffer must not interfere.
+///
+/// `Bnext` keeps its cursor in per-buffer native state, so interleaving two
+/// iterators corrupted both and returned BEINVAL. Each iterator now carries its
+/// own `Bnext_state_t` and uses `Bnext2`.
+#[test]
+fn ubf_iterators_do_not_interfere() {
+    let _guard = endurox_test_env();
+    let ctx = AtmiCtx::new().expect("failed to create AtmiCtx");
+    let mut ubf = ctx.tpalloc_ubf(4096).expect("tpalloc_ubf failed");
+
+    ubf.bchg(ubf_fields::T_LONG_FLD, 0, 1_i64, false).unwrap();
+    ubf.bchg(ubf_fields::T_STRING_FLD, 0, "a", false).unwrap();
+    ubf.bchg(ubf_fields::T_SHORT_FLD, 0, 2_i16, false).unwrap();
+
+    let all: Vec<_> = {
+        let mut it = ubf.bnext();
+        let mut v = Vec::new();
+        while let Some(f) = it.next().expect("single iteration failed") {
+            v.push(f.field_id);
+        }
+        v
+    };
+    assert_eq!(all.len(), 3, "expected three fields, got {all:?}");
+
+    // Interleave two iterators step by step.
+    let mut a = ubf.bnext();
+    let mut b = ubf.bnext();
+    let mut from_a = Vec::new();
+    let mut from_b = Vec::new();
+    loop {
+        let na = a.next().expect("iterator A failed");
+        let nb = b.next().expect("iterator B failed");
+        match (na, nb) {
+            (None, None) => break,
+            (x, y) => {
+                from_a.extend(x.map(|f| f.field_id));
+                from_b.extend(y.map(|f| f.field_id));
+            }
+        }
+    }
+    assert_eq!(from_a, all, "interleaved iterator A diverged");
+    assert_eq!(from_b, all, "interleaved iterator B diverged");
+}
+
+/// Typed accessors must refuse fields of the wrong type.
+///
+/// `bget_ptr` and `bget_ubf` reinterpret the field's raw bytes as a buffer
+/// address. Applied to a LONG field they would treat an ordinary integer as a
+/// pointer. `from_typed` had the same shape at buffer level.
+#[test]
+fn typed_accessors_reject_mismatched_types() {
+    let _guard = endurox_test_env();
+    let ctx = AtmiCtx::new().expect("failed to create AtmiCtx");
+    ctx.tpinit().expect("tpinit failed");
+
+    let mut ubf = ctx.tpalloc_ubf(4096).expect("tpalloc_ubf failed");
+    ubf.bchg(ubf_fields::T_LONG_FLD, 0, 0x4141_4141_i64, false)
+        .expect("long Bchg failed");
+
+    let err = ubf
+        .bget_ptr(ubf_fields::T_LONG_FLD, 0)
+        .expect_err("bget_ptr on a LONG field must fail");
+    assert_eq!(err.code, endurox_rs::UbfError::BTYPERR);
+
+    let err = ubf
+        .bget_ubf(ubf_fields::T_LONG_FLD, 0)
+        .expect_err("bget_ubf on a LONG field must fail");
+    assert_eq!(err.code, endurox_rs::UbfError::BTYPERR);
+
+    // Buffer level: a CARRAY is not a UBF.
+    let carray = ctx.tpalloc_carray(b"not a ubf").expect("tpalloc_carray");
+    let err = TypedUbf::from_typed(carray)
+        .err()
+        .expect("from_typed on a CARRAY buffer must fail");
+    assert_eq!(err.code, endurox_rs::UbfError::BTYPERR);
+
+    drop(ubf);
+    ctx.tpterm().expect("tpterm failed");
+}
+
+/// Copying or embedding a buffer that holds BFLD_PTR fields must be refused.
+///
+/// Both operations duplicate the stored pointer *addresses* without duplicating
+/// their targets. The source then frees targets the destination still
+/// references. Detection recurses through embedded UBF fields.
+#[test]
+fn pointer_fields_block_copy_and_embed() {
+    let _guard = endurox_test_env();
+    let ctx = AtmiCtx::new().expect("failed to create AtmiCtx");
+    ctx.tpinit().expect("tpinit failed");
+
+    let mut src = ctx.tpalloc_ubf(4096).expect("src");
+    let target = ctx.tpalloc_carray(b"owned").expect("target");
+    src.bchg(ubf_fields::T_PTR_FLD, 0, UbfValue::Ptr(target), true)
+        .expect("store BFLD_PTR");
+
+    let mut dst = ctx.tpalloc_ubf(4096).expect("dst");
+
+    // Every copying operation, not just Bcpy: each duplicates the pointer
+    // addresses without the targets.
+    for (label, result) in [
+        ("bcpy", ctx.bcpy(&mut dst, &src)),
+        ("bconcat", ctx.bconcat(&mut dst, &src)),
+        ("bjoin", ctx.bjoin(&mut dst, &src)),
+        ("bojoin", ctx.bojoin(&mut dst, &src)),
+        ("bupdate", ctx.bupdate(&mut dst, &src)),
+        (
+            "bprojcpy",
+            ctx.bprojcpy(&mut dst, &src, &[ubf_fields::T_PTR_FLD]),
+        ),
+    ] {
+        let err = result
+            .err()
+            .unwrap_or_else(|| panic!("{label} must refuse a buffer holding pointer fields"));
+        assert_eq!(err.code, endurox_rs::UbfError::BEINVAL, "{label}");
+    }
+
+    // Same rule when the pointer is nested one level down.
+    let mut outer = ctx.tpalloc_ubf(4096).expect("outer");
+    let err = outer
+        .bchg(ubf_fields::T_UBF_FLD, 0, UbfValue::Ubf(src), true)
+        .expect_err("embedding a UBF with pointer fields must fail");
+    assert_eq!(err.code, endurox_rs::UbfError::BEINVAL);
+
+    // A buffer with no pointer fields still copies normally.
+    let mut plain = ctx.tpalloc_ubf(4096).expect("plain");
+    plain
+        .bchg(ubf_fields::T_LONG_FLD, 0, 5_i64, false)
+        .expect("long Bchg");
+    ctx.bcpy(&mut dst, &plain)
+        .expect("plain Bcpy should succeed");
+    assert_eq!(dst.bget_long(ubf_fields::T_LONG_FLD, 0).unwrap(), 5);
+
+    ctx.tpterm().expect("tpterm failed");
+}
+
+/// The fast-add batch writer must survive reallocation, and must make an
+/// intervening mutation impossible.
+///
+/// The cursor caches a field position. `badd_fast` used to take a caller-held
+/// cursor, so `badd_fast -> binit -> badd_fast` reported success while the
+/// field read back BNOTPRES. `FastAdder` borrows the buffer exclusively, so
+/// that sequence no longer compiles.
+#[test]
+fn fast_adder_survives_growth_and_excludes_other_mutations() {
+    let _guard = endurox_test_env();
+    let ctx = AtmiCtx::new().expect("failed to create AtmiCtx");
+    ctx.tpinit().expect("tpinit failed");
+
+    // Start small so the appends force reallocation mid-batch.
+    let mut ubf = ctx.tpalloc_ubf(64).expect("tpalloc_ubf failed");
+    {
+        let mut adder = ubf.fast_adder();
+        for i in 0..64_i64 {
+            adder
+                .add(ubf_fields::T_LONG_FLD, i, true)
+                .unwrap_or_else(|e| panic!("fast add #{i} failed: {e}"));
+        }
+    }
+    assert_eq!(ctx.boccur(&ubf, ubf_fields::T_LONG_FLD).unwrap(), 64);
+    for i in 0..64_i64 {
+        assert_eq!(ubf.bget_long(ubf_fields::T_LONG_FLD, i as i32).unwrap(), i);
+    }
+
+    // A fresh batch after an unrelated mutation starts from a clean cursor,
+    // because the previous FastAdder released its borrow.
+    let size = ubf.tptypes().expect("tptypes failed").size;
+    ctx.binit(&mut ubf, size).expect("binit failed");
+    {
+        let mut adder = ubf.fast_adder();
+        adder
+            .add(ubf_fields::T_LONG_FLD, 7_i64, true)
+            .expect("fast add after binit failed");
+    }
+    assert_eq!(
+        ubf.bget_long(ubf_fields::T_LONG_FLD, 0).unwrap(),
+        7,
+        "field added after binit was not readable"
+    );
+    assert_eq!(ctx.boccur(&ubf, ubf_fields::T_LONG_FLD).unwrap(), 1);
+
+    ctx.tpterm().expect("tpterm failed");
+}
+
 #[test]
 fn atmictx_ubf_error_paths_set_ubf_error() {
     let _guard = endurox_test_env();
@@ -1223,6 +1509,11 @@ fn provision_endurox_env() {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let test_dir = manifest_dir.join("tests").join("00_unittest");
         let ubf_file = manifest_dir.join("tests").join("ubftab").join("test.fd");
+        let view_file = manifest_dir.join("tests").join("views").join("test.v");
+        let viewc_sibling = manifest_dir
+            .parent()
+            .map(|parent| parent.join("endurox/dist/bin/viewc"))
+            .unwrap_or_default();
 
         let output = Command::new("bash")
             .arg("-lc")
@@ -1253,7 +1544,18 @@ with open('conf/app.ini', 'w') as f:
     f.write(txt)
 "
 . conf/settest1
+# Compile the test view. `viewc` is looked up the same way build.rs looks up
+# mkfldhdr: an explicit override, then the sibling Enduro/X build, then PATH.
+rm -rf views
+mkdir -p views
+VIEWC="${ENDUROX_VIEWC:-}"
+if [ -z "$VIEWC" ] && [ -x "$NDRX_RS_UNIT_VIEWC_SIBLING" ]; then
+    VIEWC="$NDRX_RS_UNIT_VIEWC_SIBLING"
+fi
+"${VIEWC:-viewc}" -n -d views "$NDRX_RS_UNIT_VIEW_FILE" >/dev/null
 export NDRX_CONFIG="$NDRX_RS_UNIT_TEST_DIR/conf/ndrxconfig.xml"
+export VIEWDIR="$NDRX_RS_UNIT_TEST_DIR/views"
+export VIEWFILES="$(basename "$NDRX_RS_UNIT_VIEW_FILE" .v).V"
 export FLDTBLDIR="$(dirname "$NDRX_RS_UNIT_UBF_FILE")"
 export FIELDTBLS="$(basename "$NDRX_RS_UNIT_UBF_FILE")"
 export NDRX_DEBUG_STR="file=$NDRX_RS_UNIT_TEST_DIR/log/ubf-tests.log ndrx=5"
@@ -1262,6 +1564,8 @@ env
             )
             .env("NDRX_RS_UNIT_TEST_DIR", &test_dir)
             .env("NDRX_RS_UNIT_UBF_FILE", &ubf_file)
+            .env("NDRX_RS_UNIT_VIEW_FILE", &view_file)
+            .env("NDRX_RS_UNIT_VIEWC_SIBLING", &viewc_sibling)
             .output()
             .expect("failed to run xadmin provision for UBF tests");
 

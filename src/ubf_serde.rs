@@ -1,5 +1,19 @@
 use crate::{TypedUbf, UbfError, UbfResult, UbfValue};
 
+/// Delete every occurrence of `field_id` from `first` upward.
+///
+/// Occurrences are removed from the end so the indices below `first` keep their
+/// positions while the list shrinks.
+fn clear_from(ubf: &mut TypedUbf<'_>, field_id: i32, first: i32) -> UbfResult<()> {
+    let ctx = ubf.ctx();
+    let mut total = ctx.boccur(ubf, field_id)? as i32;
+    while total > first {
+        total -= 1;
+        ctx.bdel(ubf, field_id, total)?;
+    }
+    Ok(())
+}
+
 /// Serialize a Rust structure into a UBF buffer.
 ///
 /// This is the runtime layer intended for derive macros or hand-written
@@ -182,10 +196,14 @@ where
         occurrence: i32,
         realloc: bool,
     ) -> UbfResult<()> {
-        if let Some(value) = self {
-            value.ubf_write_field(ubf, field_id, occurrence, realloc)?;
+        match self {
+            Some(value) => value.ubf_write_field(ubf, field_id, occurrence, realloc),
+            None => {
+                // Serializing is a replace, not a merge. Leaving the previous
+                // value in place would make a `None` round-trip back as `Some`.
+                clear_from(ubf, field_id, occurrence)
+            }
         }
-        Ok(())
     }
 }
 
@@ -220,7 +238,8 @@ where
         for (idx, value) in self.iter().enumerate() {
             value.ubf_write_field(ubf, field_id, occurrence + idx as i32, realloc)?;
         }
-        Ok(())
+        // Rewriting [1,2,3] as [9] must not leave [9,2,3] behind.
+        clear_from(ubf, field_id, occurrence + self.len() as i32)
     }
 }
 

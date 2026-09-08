@@ -13,16 +13,3 @@ impl TpTranId {
         TpTranId(inner)
     }
 }
-
-/// Opaque ATMI context handle returned by `tpgetctxt` / used by `tpsetctxt`.
-/// Useful when migrating a context between threads (requires `ctx-send` feature).
-#[derive(Debug, Copy, Clone)]
-pub struct TpContext(pub(crate) crate::raw::TPCONTEXT_T);
-
-impl TpContext {
-    /// # Safety
-    /// Must be a valid context handle obtained from `tpgetctxt`.
-    pub(crate) unsafe fn from_raw(inner: crate::raw::TPCONTEXT_T) -> Self {
-        TpContext(inner)
-    }
-}

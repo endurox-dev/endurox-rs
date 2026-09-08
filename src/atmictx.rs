@@ -168,13 +168,23 @@ impl AtmiCtx {
             .map_err(|_| AtmiError::new(raw::TPEINVAL, "type_ contains NUL byte"))?;
         let subtype_c = CString::new(subtype)
             .map_err(|_| AtmiError::new(raw::TPEINVAL, "subtype contains NUL byte"))?;
+        // `tpalloc` takes a signed length. A `usize` past `c_long::MAX` wraps to
+        // a negative one, which Enduro/X reads as "below the minimum" and
+        // satisfies with a small buffer, leaving the caller believing it got
+        // what it asked for.
+        let c_size = c_long::try_from(size).map_err(|_| {
+            AtmiError::new(
+                raw::TPEINVAL,
+                format!("size {size} exceeds the largest XATMI buffer length"),
+            )
+        })?;
 
         #[cfg(not(feature = "ctx-send"))]
         let ptr = unsafe {
             raw::tpalloc(
                 type_c.as_ptr() as *mut c_char,
                 subtype_c.as_ptr() as *mut c_char,
-                size as c_long,
+                c_size,
             )
         };
 
@@ -184,7 +194,7 @@ impl AtmiCtx {
                 self.c_ctx_ptr(),
                 type_c.as_ptr(),
                 subtype_c.as_ptr(),
-                size as c_long,
+                c_size,
             )
         };
 
@@ -192,6 +202,25 @@ impl AtmiCtx {
             Err(self.atmi_last_error())
         } else {
             let buf = unsafe { TypedBuffer::from_raw(self, ptr) };
+
+            // `tpalloc` hands back uninitialised memory. For a CARRAY that is
+            // reachable from safe code: `set_len` followed by `as_bytes` would
+            // build a slice over it, which is undefined behaviour. Clearing it
+            // once here is what lets `set_len` stay a pure bookkeeping call
+            // rather than a write that destroys live data. The self-describing
+            // types initialise their own headers.
+            //
+            // Both the type and the extent come from the allocated buffer
+            // rather than from the arguments. `type_` may be an alias -- Enduro/X
+            // maps X_OCTET onto CARRAY (`G_buf_descr`, `libatmi/typed_buf.c`) --
+            // and the allocation is not the requested size either, since the
+            // CARRAY allocator raises anything below `CARRAY_DEFAULT_SIZE`.
+            // Trusting either would leave part of the buffer unwritten.
+            if let Ok(info) = buf.tptypes() {
+                if info.type_name == "CARRAY" && info.size > 0 {
+                    unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, info.size) };
+                }
+            }
             Ok(buf)
         }
     }
@@ -206,7 +235,7 @@ impl AtmiCtx {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.as_ptr() as *mut u8, bytes.len());
             }
         }
-        buf.set_len(bytes.len());
+        buf.set_len_reported(bytes.len());
         Ok(buf)
     }
 
@@ -214,13 +243,21 @@ impl AtmiCtx {
     pub fn tpalloc_ubf<'ctx>(&'ctx self, size: usize) -> AtmiResult<TypedUbf<'ctx>> {
         let type_c = CString::new("UBF").unwrap();
         let subtype_c = CString::new("").unwrap();
+        // Signed length, same as `tpalloc`: a wrapped size would be read as
+        // below the minimum and quietly satisfied with a small buffer.
+        let c_size = c_long::try_from(size).map_err(|_| {
+            AtmiError::new(
+                raw::TPEINVAL,
+                format!("size {size} exceeds the largest XATMI buffer length"),
+            )
+        })?;
 
         #[cfg(not(feature = "ctx-send"))]
         let raw_ptr = unsafe {
             raw::tpalloc(
                 type_c.as_ptr() as *mut c_char,
                 subtype_c.as_ptr() as *mut c_char,
-                size as c_long,
+                c_size,
             )
         };
 
@@ -230,7 +267,7 @@ impl AtmiCtx {
                 self.c_ctx_ptr(),
                 type_c.as_ptr(),
                 subtype_c.as_ptr(),
-                size as c_long,
+                c_size,
             )
         };
 
@@ -246,6 +283,16 @@ impl AtmiCtx {
     fn ubf_last_error() -> AtmiError { ... }
     fn nstd_last_error() -> AtmiError { ... }
     */
+
+    /// This context's raw handle, without detaching anything.
+    ///
+    /// Context management must not go through the Object API: `Otpgetctxt`
+    /// would attach, detach, then detach again and NULL this field.
+    #[cfg(feature = "ctx-send")]
+    #[inline]
+    pub(crate) fn raw_handle(&self) -> raw::TPCONTEXT_T {
+        self.handle.get()
+    }
 
     #[cfg(feature = "ctx-send")]
     #[inline]

@@ -17,3 +17,6 @@ pub const TPTRANSUSPEND: i64 = raw::TPTRANSUSPEND as i64;
 pub const TPBLK_NEXT: i64 = raw::TPBLK_NEXT as i64;
 /// `tpsblktime`/`tpgblktime`: apply the timeout to every call on this thread.
 pub const TPBLK_ALL: i64 = raw::TPBLK_ALL as i64;
+
+/// `tpencrypt`/`tpdecrypt`: input and output are NUL-terminated base64 strings.
+pub const TPEX_STRING: i64 = raw::TPEX_STRING as i64;

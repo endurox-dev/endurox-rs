@@ -455,7 +455,7 @@ impl ReplyDemux {
             len: data.len(),
         };
         data.replace_ptr(buf.ptr);
-        data.set_len(buf.len);
+        data.set_len_reported(buf.len);
         self.stash(previous);
         outcome
     }
@@ -547,7 +547,7 @@ impl ReplyDemux {
             // SAFETY: the pointer came from a TypedBuffer allocated by this
             // same context and has not been freed since.
             let mut buffer = unsafe { TypedBuffer::from_raw(ctx, buf.ptr) };
-            buffer.set_len(buf.len);
+            buffer.set_len_reported(buf.len);
             return Ok(buffer);
         }
         // Type and size are provisional: `tpgetrply` reallocates and converts

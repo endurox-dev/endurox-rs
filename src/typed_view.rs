@@ -141,11 +141,47 @@ impl Default for BvNextState {
 }
 
 impl<'ctx> TypedView<'ctx> {
-    pub fn from_typed(view: impl Into<String>, buf: TypedBuffer<'ctx>) -> Self {
-        Self {
-            view: view.into(),
-            inner: buf,
+    /// View an existing typed buffer as VIEW `view`.
+    ///
+    /// Validates three things, because every VIEW accessor addresses the buffer
+    /// through the declared layout: the buffer really is a VIEW, its subtype is
+    /// the same VIEW, and the allocation is at least as large as the layout
+    /// requires. Without these a one-byte CARRAY could be presented as an
+    /// 816-byte VIEW and field access would run past the allocation.
+    pub fn from_typed(view: impl Into<String>, buf: TypedBuffer<'ctx>) -> UbfResult<Self> {
+        let view = view.into();
+        let info = buf
+            .tptypes()
+            .map_err(|e| UbfError::new(UbfError::BEINVAL, e.message.into_owned()))?;
+
+        if info.type_name != "VIEW" {
+            return Err(UbfError::new(
+                UbfError::BEINVAL,
+                format!("cannot view a {} buffer as VIEW `{view}`", info.type_name),
+            ));
         }
+        if info.subtype != view {
+            return Err(UbfError::new(
+                UbfError::BEINVAL,
+                format!(
+                    "buffer declares VIEW `{}`, not `{view}`; the layouts differ",
+                    info.subtype
+                ),
+            ));
+        }
+
+        let required = buf.ctx.bvsizeof(&view)?;
+        if info.size < required {
+            return Err(UbfError::new(
+                UbfError::BNOSPACE,
+                format!(
+                    "VIEW `{view}` needs {required} bytes, buffer holds {}",
+                    info.size
+                ),
+            ));
+        }
+
+        Ok(Self { view, inner: buf })
     }
 
     pub fn into_inner(self) -> TypedBuffer<'ctx> {
@@ -557,7 +593,43 @@ impl<'ctx> TypedView<'ctx> {
         }
     }
 
+    /// Copy this view into `dst`.
+    ///
+    /// Both views must name the same VIEW, and the destination must be at least
+    /// as large as the source. `Bvcpy` writes the source's layout into the
+    /// destination buffer without checking either, so a differently shaped or
+    /// smaller destination is a buffer overflow.
     pub fn bvcpy(&self, dst: &mut TypedView<'_>) -> UbfResult<usize> {
+        if self.view != dst.view {
+            return Err(UbfError::new(
+                UbfError::BTYPERR,
+                format!(
+                    "cannot copy VIEW `{}` into VIEW `{}`: the layouts differ",
+                    self.view, dst.view
+                ),
+            ));
+        }
+
+        // Check both allocations against the *declared* layout, not against
+        // each other. Two buffers can agree in size and still both be too small
+        // for the VIEW they name, and `Bvcpy` writes a full layout.
+        let required = self.inner.ctx.bvsizeof(&self.view)?;
+        for (label, buf) in [("source", &self.inner), ("destination", &dst.inner)] {
+            let size = buf
+                .tptypes()
+                .map(|info| info.size)
+                .map_err(|e| UbfError::new(UbfError::BTYPERR, e.message.into_owned()))?;
+            if size < required {
+                return Err(UbfError::new(
+                    UbfError::BNOSPACE,
+                    format!(
+                        "{label} VIEW buffer is {size} bytes, but VIEW `{}` needs {required}",
+                        self.view
+                    ),
+                ));
+            }
+        }
+
         let view = self.view_cstring()?;
 
         #[cfg(not(feature = "ctx-send"))]
@@ -598,7 +670,8 @@ impl AtmiCtx {
         size: usize,
     ) -> Result<TypedView<'ctx>, AtmiError> {
         let buf = self.tpalloc("VIEW", view, size)?;
-        Ok(TypedView::from_typed(view, buf))
+        TypedView::from_typed(view, buf)
+            .map_err(|e| AtmiError::new(crate::raw::TPEINVAL, e.message.into_owned()))
     }
 
     pub fn bvsizeof(&self, view: &str) -> UbfResult<usize> {
@@ -631,6 +704,7 @@ impl AtmiCtx {
             .to_string_lossy()
             .into_owned();
         let buf = unsafe { TypedBuffer::from_raw(self, raw) };
-        Ok(TypedView::from_typed(view, buf))
+        TypedView::from_typed(view, buf)
+            .map_err(|e| AtmiError::new(crate::raw::TPEINVAL, e.message.into_owned()))
     }
 }

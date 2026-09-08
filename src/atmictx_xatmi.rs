@@ -1,4 +1,4 @@
-use crate::{raw, AtmiCtx, AtmiError, AtmiResult, TpContext, TpTranId, TypedBuffer, TypedUbf};
+use crate::{raw, AtmiCtx, AtmiError, AtmiResult, TpTranId, TypedBuffer, TypedUbf};
 use core::ffi::{c_char, c_int, c_long};
 use std::ffi::{CStr, CString};
 use std::ptr;
@@ -35,6 +35,12 @@ impl Drop for PendingCall<'_> {
     }
 }
 
+/// Read a NUL-terminated string out of a byte buffer the C side filled.
+fn cstr_prefix_to_string(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
 impl AtmiCtx {
     /// Synchronous RPC call with separate input and output buffers.
     ///
@@ -51,7 +57,11 @@ impl AtmiCtx {
         let c_svc = CString::new(svc).map_err(|_| self.atmi_last_error())?;
         let ilen = idata.len() as c_long;
         let mut reply = odata.as_ptr();
-        let mut olen: c_long = 0;
+        // `olen` is in/out: it carries the current length in and the reply
+        // length back. Seeding it with zero meant an error path where Enduro/X
+        // returns before touching the buffer reported a length of zero, wiping
+        // the caller's existing contents from view.
+        let mut olen: c_long = odata.len() as c_long;
 
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe {
@@ -78,9 +88,14 @@ impl AtmiCtx {
             )
         };
 
+        // Adopt the reply buffer on every path, as `tpgetrply` does. Enduro/X
+        // runs `ndrx_mbuf_prepare_incoming(.., char **odata, long *olen, ..)`,
+        // which can reallocate, *before* raising TPESVCFAIL. Keeping the old
+        // pointer on that path leaves it dangling and leaks the replacement.
+        odata.replace_ptr(reply);
+        odata.set_len_reported(olen.max(0) as usize);
+
         if rc == raw::EXSUCCEED as c_int {
-            odata.replace_ptr(reply);
-            odata.set_len(olen as usize);
             Ok(())
         } else {
             Err(self.atmi_last_error())
@@ -131,7 +146,11 @@ impl AtmiCtx {
     ) -> AtmiResult<()> {
         let mut c_cd = *cd as c_int;
         let mut odata = data.as_ptr();
-        let mut olen: c_long = 0;
+        // `olen` is in/out: it carries the current length in and the reply
+        // length back. Seeding it with zero meant an error path where Enduro/X
+        // returns before touching the buffer reported a length of zero, wiping
+        // the caller's existing contents from view.
+        let mut olen: c_long = data.len() as c_long;
 
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpgetrply(&mut c_cd, &mut odata, &mut olen, flags as c_long) };
@@ -155,7 +174,7 @@ impl AtmiCtx {
         // replacement, and drops the descriptor that says which call failed.
         *cd = c_cd as i32;
         data.replace_ptr(odata);
-        data.set_len(olen.max(0) as usize);
+        data.set_len_reported(olen.max(0) as usize);
 
         if rc == raw::EXSUCCEED as c_int {
             Ok(())
@@ -376,13 +395,12 @@ impl AtmiCtx {
         }
     }
 
-    pub fn tpconnect(
-        &self,
-        svc: &str,
-        data: &TypedBuffer<'_>,
-        len: usize,
-        flags: i64,
-    ) -> AtmiResult<i32> {
+    /// Open a conversational connection.
+    ///
+    /// The payload length comes from the buffer itself. An independent `len`
+    /// argument bypassed the allocation checks on `set_len`, so a value larger
+    /// than the buffer reached the native copy.
+    pub fn tpconnect(&self, svc: &str, data: &TypedBuffer<'_>, flags: i64) -> AtmiResult<i32> {
         let c_svc = CString::new(svc).map_err(|_| self.atmi_last_error())?;
 
         #[cfg(not(feature = "ctx-send"))]
@@ -390,7 +408,7 @@ impl AtmiCtx {
             raw::tpconnect(
                 c_svc.as_ptr() as *mut c_char,
                 data.as_ptr(),
-                len as c_long,
+                data.len() as c_long,
                 flags as c_long,
             )
         };
@@ -401,7 +419,7 @@ impl AtmiCtx {
                 self.c_ctx_ptr(),
                 c_svc.as_ptr() as *mut c_char,
                 data.as_ptr(),
-                len as c_long,
+                data.len() as c_long,
                 flags as c_long,
             )
         };
@@ -423,15 +441,26 @@ impl AtmiCtx {
         self.rc_to_result(rc)
     }
 
+    /// Receive on a conversational connection.
+    ///
+    /// `revent` is an out-parameter, mirroring the C API, because the event is
+    /// the whole point of the `TPEEVENT` error: returning it only on success
+    /// would discard exactly the information the caller needs to react to a
+    /// disconnect or a service completion.
     pub fn tprecv(
         &self,
         cd: i32,
         data: &mut TypedBuffer<'_>,
         flags: i64,
-    ) -> AtmiResult<(usize, i64)> {
+        revent: &mut i64,
+    ) -> AtmiResult<usize> {
         let mut odata = data.as_ptr();
-        let mut olen: c_long = 0;
-        let mut revent: c_long = 0;
+        // `olen` is in/out: it carries the current length in and the reply
+        // length back. Seeding it with zero meant an error path where Enduro/X
+        // returns before touching the buffer reported a length of zero, wiping
+        // the caller's existing contents from view.
+        let mut olen: c_long = data.len() as c_long;
+        let mut c_revent: c_long = 0;
 
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe {
@@ -440,7 +469,7 @@ impl AtmiCtx {
                 &mut odata,
                 &mut olen,
                 flags as c_long,
-                &mut revent,
+                &mut c_revent,
             )
         };
 
@@ -452,35 +481,47 @@ impl AtmiCtx {
                 &mut odata,
                 &mut olen,
                 flags as c_long,
-                &mut revent,
+                &mut c_revent,
             )
         };
 
+        // Same reasoning as tpcall/tpgetrply: the buffer may have been replaced
+        // before the error was raised, and the length was previously dropped
+        // even on success.
+        *revent = c_revent as i64;
+        data.replace_ptr(odata);
+        data.set_len_reported(olen.max(0) as usize);
+
         if rc == raw::EXSUCCEED as c_int {
-            data.replace_ptr(odata);
-            Ok((olen as usize, revent as i64))
+            Ok(olen.max(0) as usize)
         } else {
             Err(self.atmi_last_error())
         }
     }
 
+    /// Send on a conversational connection.
+    ///
+    /// `revent` is an out-parameter for the same reason as [`Self::tprecv`]:
+    /// the event carries the meaning of a `TPEEVENT` failure and must survive
+    /// the error return. The payload length comes from the buffer, not from a
+    /// separate unchecked argument.
     pub fn tpsend(
         &self,
         cd: i32,
         data: &TypedBuffer<'_>,
-        len: usize,
         flags: i64,
-    ) -> AtmiResult<i64> {
-        let mut revent: c_long = 0;
+        revent: &mut i64,
+    ) -> AtmiResult<()> {
+        let mut c_revent: c_long = 0;
 
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe {
             raw::tpsend(
                 cd as c_int,
                 data.as_ptr(),
-                len as c_long,
+                data.len() as c_long,
                 flags as c_long,
-                &mut revent,
+                &mut c_revent,
             )
         };
 
@@ -490,14 +531,16 @@ impl AtmiCtx {
                 self.c_ctx_ptr(),
                 cd as c_int,
                 data.as_ptr(),
-                len as c_long,
+                data.len() as c_long,
                 flags as c_long,
-                &mut revent,
+                &mut c_revent,
             )
         };
 
+        *revent = c_revent as i64;
+
         if rc == raw::EXSUCCEED as c_int {
-            Ok(revent as i64)
+            Ok(())
         } else {
             Err(self.atmi_last_error())
         }
@@ -737,7 +780,7 @@ impl AtmiCtx {
             raw::tppost(
                 c_event.as_ptr() as *mut c_char,
                 data.as_ptr(),
-                0,
+                data.len() as c_long,
                 flags as c_long,
             )
         };
@@ -748,7 +791,7 @@ impl AtmiCtx {
                 self.c_ctx_ptr(),
                 c_event.as_ptr() as *mut c_char,
                 data.as_ptr(),
-                0,
+                data.len() as c_long,
                 flags as c_long,
             )
         };
@@ -795,7 +838,14 @@ impl AtmiCtx {
         flags: i64,
     ) -> AtmiResult<()> {
         #[cfg(not(feature = "ctx-send"))]
-        let rc = unsafe { raw::tpnotify(clientid, data.as_ptr(), 0, flags as c_long) };
+        let rc = unsafe {
+            raw::tpnotify(
+                clientid,
+                data.as_ptr(),
+                data.len() as c_long,
+                flags as c_long,
+            )
+        };
 
         #[cfg(feature = "ctx-send")]
         let rc = unsafe {
@@ -803,7 +853,7 @@ impl AtmiCtx {
                 self.c_ctx_ptr(),
                 clientid,
                 data.as_ptr(),
-                0,
+                data.len() as c_long,
                 flags as c_long,
             )
         };
@@ -847,8 +897,16 @@ impl AtmiCtx {
             .unwrap_or(ptr::null_mut());
 
         #[cfg(not(feature = "ctx-send"))]
-        let rc =
-            unsafe { raw::tpbroadcast(p_lmid, p_usr, p_clt, data.as_ptr(), 0, flags as c_long) };
+        let rc = unsafe {
+            raw::tpbroadcast(
+                p_lmid,
+                p_usr,
+                p_clt,
+                data.as_ptr(),
+                data.len() as c_long,
+                flags as c_long,
+            )
+        };
 
         #[cfg(feature = "ctx-send")]
         let rc = unsafe {
@@ -858,7 +916,7 @@ impl AtmiCtx {
                 p_usr,
                 p_clt,
                 data.as_ptr(),
-                0,
+                data.len() as c_long,
                 flags as c_long,
             )
         };
@@ -928,8 +986,11 @@ impl AtmiCtx {
         };
 
         if rc == raw::EXSUCCEED as c_int {
-            let _ = olen;
-            Ok(unsafe { TypedBuffer::from_raw(self, obuf) })
+            let mut buf = unsafe { TypedBuffer::from_raw(self, obuf) };
+            // Enduro/X reports how much it decoded. Dropping it left the
+            // imported payload invisible to `as_bytes`.
+            buf.set_len_reported(olen.max(0) as usize);
+            Ok(buf)
         } else {
             Err(self.atmi_last_error())
         }
@@ -1129,7 +1190,7 @@ impl AtmiCtx {
                 c_qname.as_ptr() as *mut c_char,
                 ctl_ptr,
                 data.as_ptr(),
-                0,
+                data.len() as c_long,
                 flags as c_long,
             )
         };
@@ -1142,7 +1203,7 @@ impl AtmiCtx {
                 c_qname.as_ptr() as *mut c_char,
                 ctl_ptr,
                 data.as_ptr(),
-                0,
+                data.len() as c_long,
                 flags as c_long,
             )
         };
@@ -1190,7 +1251,11 @@ impl AtmiCtx {
         };
 
         if rc == raw::EXSUCCEED as c_int {
-            Ok(unsafe { TypedBuffer::from_raw(self, odata) })
+            // Keep the reported length: dropping it surfaces every dequeued
+            // CARRAY message as empty.
+            let mut buf = unsafe { TypedBuffer::from_raw(self, odata) };
+            buf.set_len_reported(olen.max(0) as usize);
+            Ok(buf)
         } else {
             Err(self.atmi_last_error())
         }
@@ -1216,7 +1281,7 @@ impl AtmiCtx {
                 c_qname.as_ptr() as *mut c_char,
                 ctl_ptr,
                 data.as_ptr(),
-                0,
+                data.len() as c_long,
                 flags as c_long,
             )
         };
@@ -1230,7 +1295,7 @@ impl AtmiCtx {
                 c_qname.as_ptr() as *mut c_char,
                 ctl_ptr,
                 data.as_ptr(),
-                0,
+                data.len() as c_long,
                 flags as c_long,
             )
         };
@@ -1280,48 +1345,55 @@ impl AtmiCtx {
         };
 
         if rc == raw::EXSUCCEED as c_int {
-            Ok(unsafe { TypedBuffer::from_raw(self, odata) })
+            // Keep the reported length: dropping it surfaces every dequeued
+            // CARRAY message as empty.
+            let mut buf = unsafe { TypedBuffer::from_raw(self, odata) };
+            buf.set_len_reported(olen.max(0) as usize);
+            Ok(buf)
         } else {
             Err(self.atmi_last_error())
         }
     }
 
-    /// Capture the current ATMI context handle.
-    pub fn tpgetctxt(&self) -> AtmiResult<TpContext> {
-        let mut out: raw::TPCONTEXT_T = ptr::null_mut();
+    // `tpgetctxt` / `tpsetctxt` are deliberately absent from the safe API.
+    //
+    // `tpsetctxt` attaches a context to the calling thread and leaves it
+    // attached. `AtmiCtx`'s `unsafe impl Send` rests on the opposite: the
+    // handle is created detached (`tpnewctxt(0, 0)`) and the Object API
+    // attaches it only for the duration of one call. A context left attached
+    // has thread affinity while its Rust owner still claims to be `Send`, and
+    // `tpsetctxt(TPNULLCONTEXT)` frees the attached context outright
+    // (libatmi/atmi_tls.c) while the owner is still live.
+    //
+    // Nothing is lost. Moving work between threads is what the `ctx-send`
+    // feature is for: it makes `AtmiCtx` itself `Send`, and every operation
+    // attaches and detaches around its own call.
 
-        #[cfg(not(feature = "ctx-send"))]
-        let rc = unsafe { raw::tpgetctxt(&mut out, 0) };
-
-        #[cfg(feature = "ctx-send")]
-        let rc = unsafe { raw::Otpgetctxt(self.c_ctx_ptr(), &mut out, 0) };
-
-        if rc == raw::TPMULTICONTEXTS as c_int {
-            Ok(TpContext(out))
-        } else if rc == raw::EXFAIL as c_int {
-            Err(self.atmi_last_error())
-        } else {
-            // TPNULLCONTEXT. Enduro/X reports "no context" without setting
-            // tperrno, so atmi_last_error() would report a stale code here.
-            Err(AtmiError::new(
-                raw::TPEPROTO,
-                "no ATMI context is associated with the current thread",
-            ))
+    /// Reject `TPEX_STRING` on the byte-slice APIs.
+    ///
+    /// In string mode Enduro/X calls `ndrx_crypto_enc_string(input, output,
+    /// olen)`, which takes no input length and therefore reads to the first NUL.
+    /// A `&[u8]` carries no such guarantee, so the native side would read past
+    /// the slice. Use [`AtmiCtx::tpencrypt_string`] /
+    /// [`AtmiCtx::tpdecrypt_string`] instead.
+    fn reject_string_mode(flags: i64, what: &str) -> AtmiResult<()> {
+        if flags & raw::TPEX_STRING as i64 != 0 {
+            return Err(AtmiError::new(
+                raw::TPEINVAL,
+                format!(
+                    "TPEX_STRING cannot be used with {what}: the native call reads \
+                     the input to its first NUL, which a byte slice does not \
+                     guarantee. Use {what}_string instead."
+                ),
+            ));
         }
+        Ok(())
     }
 
-    /// Activate a previously captured ATMI context handle on the current thread.
-    pub fn tpsetctxt(&self, context: TpContext, flags: i64) -> AtmiResult<()> {
-        #[cfg(not(feature = "ctx-send"))]
-        let rc = unsafe { raw::tpsetctxt(context.0, flags as c_long) };
-
-        #[cfg(feature = "ctx-send")]
-        let rc = unsafe { raw::Otpsetctxt(self.c_ctx_ptr(), context.0, flags as c_long) };
-
-        self.rc_to_result(rc)
-    }
-
+    /// Encrypt a byte payload. `TPEX_STRING` is rejected; see
+    /// [`AtmiCtx::tpencrypt_string`].
     pub fn tpencrypt(&self, input: &[u8], flags: i64) -> AtmiResult<Vec<u8>> {
+        Self::reject_string_mode(flags, "tpencrypt")?;
         let mut out = vec![0u8; input.len().saturating_mul(2).max(256)];
         let mut olen = out.len() as c_long;
 
@@ -1356,7 +1428,10 @@ impl AtmiCtx {
         }
     }
 
+    /// Decrypt a byte payload. `TPEX_STRING` is rejected; see
+    /// [`AtmiCtx::tpdecrypt_string`].
     pub fn tpdecrypt(&self, input: &[u8], flags: i64) -> AtmiResult<Vec<u8>> {
+        Self::reject_string_mode(flags, "tpdecrypt")?;
         let mut out = vec![0u8; input.len().max(256)];
         let mut olen = out.len() as c_long;
 
@@ -1386,6 +1461,85 @@ impl AtmiCtx {
         if rc == raw::EXSUCCEED as c_int {
             out.truncate(olen as usize);
             Ok(out)
+        } else {
+            Err(self.atmi_last_error())
+        }
+    }
+
+    /// Encrypt a string with `TPEX_STRING`, producing base64 output.
+    ///
+    /// The native call reads the input to its first NUL and NUL-terminates the
+    /// result, so both sides are handled as C strings here rather than as byte
+    /// slices.
+    pub fn tpencrypt_string(&self, input: &str) -> AtmiResult<String> {
+        let c_input = CString::new(input)
+            .map_err(|_| AtmiError::new(raw::TPEINVAL, "input contains a NUL byte"))?;
+        // Base64 grows the payload; leave room for the terminator too.
+        let mut out = vec![0u8; input.len().saturating_mul(2).max(256) + 1];
+        let mut olen = out.len() as c_long;
+
+        #[cfg(not(feature = "ctx-send"))]
+        let rc = unsafe {
+            raw::tpencrypt(
+                c_input.as_ptr() as *mut c_char,
+                0,
+                out.as_mut_ptr() as *mut c_char,
+                &mut olen,
+                raw::TPEX_STRING as c_long,
+            )
+        };
+
+        #[cfg(feature = "ctx-send")]
+        let rc = unsafe {
+            raw::Otpencrypt(
+                self.c_ctx_ptr(),
+                c_input.as_ptr() as *mut c_char,
+                0,
+                out.as_mut_ptr() as *mut c_char,
+                &mut olen,
+                raw::TPEX_STRING as c_long,
+            )
+        };
+
+        if rc == raw::EXSUCCEED as c_int {
+            Ok(cstr_prefix_to_string(&out))
+        } else {
+            Err(self.atmi_last_error())
+        }
+    }
+
+    /// Decrypt a base64 string produced by [`AtmiCtx::tpencrypt_string`].
+    pub fn tpdecrypt_string(&self, input: &str) -> AtmiResult<String> {
+        let c_input = CString::new(input)
+            .map_err(|_| AtmiError::new(raw::TPEINVAL, "input contains a NUL byte"))?;
+        let mut out = vec![0u8; input.len().max(256) + 1];
+        let mut olen = out.len() as c_long;
+
+        #[cfg(not(feature = "ctx-send"))]
+        let rc = unsafe {
+            raw::tpdecrypt(
+                c_input.as_ptr() as *mut c_char,
+                0,
+                out.as_mut_ptr() as *mut c_char,
+                &mut olen,
+                raw::TPEX_STRING as c_long,
+            )
+        };
+
+        #[cfg(feature = "ctx-send")]
+        let rc = unsafe {
+            raw::Otpdecrypt(
+                self.c_ctx_ptr(),
+                c_input.as_ptr() as *mut c_char,
+                0,
+                out.as_mut_ptr() as *mut c_char,
+                &mut olen,
+                raw::TPEX_STRING as c_long,
+            )
+        };
+
+        if rc == raw::EXSUCCEED as c_int {
+            Ok(cstr_prefix_to_string(&out))
         } else {
             Err(self.atmi_last_error())
         }

@@ -56,7 +56,7 @@ fn dequeue_str(ctx: &AtmiCtx) -> Result<String, String> {
     let buf = ctx
         .tpdequeue(QSPACE, QNAME, &mut ctl, 0)
         .map_err(|e| format!("tpdequeue failed: {e}"))?;
-    let ubf = TypedUbf::from_typed(buf);
+    let ubf = TypedUbf::from_typed(buf).expect("buffer is not UBF");
     ubf.bget_string(ubf_fields::T_STRING_FLD, 0)
         .map_err(|e| format!("bget_string failed: {e}"))
 }
@@ -101,7 +101,7 @@ fn run_corrid(ctx: &AtmiCtx) -> Result<(), String> {
     let dequeued = ctx
         .tpdequeue(QSPACE, QNAME, &mut deq_ctl, 0)
         .map_err(|e| format!("tpdequeue (by corrid) failed: {e}"))?;
-    let ubf = TypedUbf::from_typed(dequeued);
+    let ubf = TypedUbf::from_typed(dequeued).expect("dequeued buffer is not UBF");
     let val = ubf
         .bget_string(ubf_fields::T_STRING_FLD, 0)
         .map_err(|e| format!("bget_string (corrid) failed: {e}"))?;

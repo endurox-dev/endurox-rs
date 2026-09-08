@@ -109,6 +109,10 @@ impl<'ctx> TpSvcInfo<'ctx> {
     /// Convenience wrapper over `take_data()` for the common case where the
     /// request was sent as a UBF message.
     pub fn take_data_ubf(&mut self) -> Option<TypedUbf<'ctx>> {
-        self.data.take().map(TypedUbf::from_typed)
+        // A service that advertised a UBF interface but was handed something
+        // else yields None rather than a UBF view over foreign bytes.
+        self.data
+            .take()
+            .and_then(|buf| TypedUbf::from_typed(buf).ok())
     }
 }

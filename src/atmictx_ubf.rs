@@ -8,16 +8,37 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Mutex, OnceLock};
 
 /// Fast-add location state used by [`TypedUbf::badd_fast`](crate::TypedUbf::badd_fast).
+///
+/// The native cursor caches a position *inside* a specific buffer allocation.
+/// It is invalidated by anything that relocates that allocation, and it is
+/// meaningless against a different buffer. `owner` records which allocation the
+/// cursor currently refers to so both cases can be detected and the cursor
+/// restarted instead of dereferencing a stale position.
 #[derive(Debug)]
 pub struct BFldLocInfo {
     pub(crate) inner: raw::Bfld_loc_info_t,
+    pub(crate) owner: *mut c_char,
 }
 
 impl Default for BFldLocInfo {
     fn default() -> Self {
         Self {
             inner: unsafe { std::mem::zeroed() },
+            owner: std::ptr::null_mut(),
         }
+    }
+}
+
+impl BFldLocInfo {
+    /// Restart the cursor against `buffer`.
+    pub(crate) fn rebase(&mut self, buffer: *mut c_char) {
+        self.inner = unsafe { std::mem::zeroed() };
+        self.owner = buffer;
+    }
+
+    /// Whether this cursor is currently positioned in `buffer`.
+    pub(crate) fn belongs_to(&self, buffer: *mut c_char) -> bool {
+        !self.owner.is_null() && self.owner == buffer
     }
 }
 
@@ -566,19 +587,28 @@ impl AtmiCtx {
         }
     }
 
+    /// Advance a cursor that owns its iteration state.
+    ///
+    /// `Bnext` keeps its position in per-buffer native state, so two live
+    /// iterators over one buffer corrupt each other and return `BEINVAL`.
+    /// `Bnext2` takes the state explicitly, which lets each iterator hold its
+    /// own.
     #[inline]
     pub(crate) fn bnext_value(
         &self,
         ubf: &TypedUbf<'_>,
+        state: &mut raw::Bnext_state_t,
         bfldid: &mut BFLDID,
         occ: &mut BFLDOCC,
     ) -> c_int {
         #[cfg(not(feature = "ctx-send"))]
         unsafe {
-            raw::Bnext(
+            raw::Bnext2(
+                state,
                 ubf.as_ubfh(),
                 bfldid,
                 occ,
+                std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
             )
@@ -586,11 +616,13 @@ impl AtmiCtx {
 
         #[cfg(feature = "ctx-send")]
         unsafe {
-            raw::OBnext(
+            raw::OBnext2(
                 self.c_ctx_ptr(),
+                state,
                 ubf.as_ubfh(),
                 bfldid,
                 occ,
+                std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
             )
@@ -924,6 +956,7 @@ impl AtmiCtx {
 
     /// Append all fields from `src` into `dst`.
     pub fn bconcat(&self, dst: &mut TypedUbf<'_>, src: &TypedUbf<'_>) -> UbfResult<()> {
+        self.reject_pointer_copy(src, "Bconcat")?;
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::Bconcat(dst.as_ubfh(), src.as_ubfh()) };
 
@@ -933,8 +966,101 @@ impl AtmiCtx {
         self.ubf_unit_result(rc)
     }
 
+    /// Refuse a copying operation whose source holds `BFLD_PTR` fields.
+    ///
+    /// Every one of these duplicates the stored pointer *addresses* without
+    /// duplicating their targets, so the destination ends up referencing
+    /// allocations the source still owns and frees. Ownership-preserving deep
+    /// copies are not implemented.
+    fn reject_pointer_copy(&self, src: &TypedUbf<'_>, what: &str) -> UbfResult<()> {
+        if self.ubf_has_pointer_fields(src)? {
+            return Err(crate::UbfError::new(
+                crate::UbfError::BEINVAL,
+                format!(
+                    "{what} on a buffer containing BFLD_PTR fields would copy the \
+                     pointers without their targets, leaving both buffers owning \
+                     the same allocations"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether `ubf` holds a `BFLD_PTR` field at any depth.
+    ///
+    /// Wraps `Bhasptr(3)`, which recurses through embedded `BFLD_UBF` fields
+    /// because a pointer nested inside one carries the same ownership problem
+    /// as a top-level one. It does not follow the pointer targets: finding one
+    /// already answers the question.
+    ///
+    /// UBF stores fields ordered by field id and the id encodes the type in its
+    /// high bits, so the pointer occurrences form one contiguous run whose
+    /// start the buffer header caches. `Bhasptr` seeks straight to it, which
+    /// makes the common pointer-free answer a single step rather than a walk
+    /// over the whole buffer.
+    ///
+    /// Cores without `Bhasptr` use the equivalent walk below. `build.rs` sets
+    /// `endurox_has_bhasptr` when `ubf.h` declares it.
+    #[cfg(endurox_has_bhasptr)]
+    pub fn ubf_has_pointer_fields(&self, ubf: &TypedUbf<'_>) -> UbfResult<bool> {
+        #[cfg(not(feature = "ctx-send"))]
+        let rc = unsafe { raw::Bhasptr(ubf.as_ubfh()) };
+
+        #[cfg(feature = "ctx-send")]
+        let rc = unsafe { raw::OBhasptr(self.c_ctx_ptr(), ubf.as_ubfh()) };
+
+        if rc < 0 {
+            Err(self.ubf_last_error())
+        } else {
+            Ok(rc == raw::EXTRUE as c_int)
+        }
+    }
+
+    /// Whether `ubf` holds a `BFLD_PTR` field at any depth.
+    ///
+    /// Compatibility path for cores that predate `Bhasptr(3)`. It walks every
+    /// field rather than seeking to the pointer run, so it costs time
+    /// proportional to the buffer contents. The seek is not reproducible from
+    /// here: it needs `EFFECTIVE_BITS`, which lives in the internal
+    /// `ubf_int.h` and depends on how the core was built.
+    #[cfg(not(endurox_has_bhasptr))]
+    pub fn ubf_has_pointer_fields(&self, ubf: &TypedUbf<'_>) -> UbfResult<bool> {
+        let mut it = ubf.bnext();
+        while let Some(field) = it.next()? {
+            match field.field_type {
+                UbfFieldType::Ptr => return Ok(true),
+                UbfFieldType::Ubf => {
+                    let mut len: BFLDLEN = 0;
+                    let nested = self.bfind_value(
+                        ubf,
+                        field.field_id as BFLDID,
+                        field.occurrence as BFLDOCC,
+                        &mut len,
+                    );
+                    if !nested.is_null() {
+                        // SAFETY: Bfind returned the embedded buffer's data,
+                        // and the borrowed view frees nothing.
+                        let nested = unsafe { TypedUbf::borrowed_from_raw(self, nested) };
+                        if self.ubf_has_pointer_fields(&nested)? {
+                            return Ok(true);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(false)
+    }
+
     /// Copy the full contents of `src` into `dst`.
+    ///
+    /// Rejected with `BEINVAL` when `src` contains `BFLD_PTR` fields at any
+    /// depth. `Bcpy` copies the stored *addresses*, so both buffers would then
+    /// reference the same targets while each believes it owns them: dropping
+    /// `src` frees targets that `dst` still points at. Deep-copying the targets
+    /// is not implemented; extract the pointers and rebuild them explicitly.
     pub fn bcpy(&self, dst: &mut TypedUbf<'_>, src: &TypedUbf<'_>) -> UbfResult<()> {
+        self.reject_pointer_copy(src, "Bcpy")?;
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::Bcpy(dst.as_ubfh(), src.as_ubfh()) };
 
@@ -1020,6 +1146,7 @@ impl AtmiCtx {
 
     /// Join fields from `src` into `dest`.
     pub fn bjoin(&self, dest: &mut TypedUbf<'_>, src: &TypedUbf<'_>) -> UbfResult<()> {
+        self.reject_pointer_copy(src, "Bjoin")?;
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::Bjoin(dest.as_ubfh(), src.as_ubfh()) };
 
@@ -1064,6 +1191,7 @@ impl AtmiCtx {
 
     /// Outer-join fields from `src` into `dest`.
     pub fn bojoin(&self, dest: &mut TypedUbf<'_>, src: &TypedUbf<'_>) -> UbfResult<()> {
+        self.reject_pointer_copy(src, "Bojoin")?;
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::Bojoin(dest.as_ubfh(), src.as_ubfh()) };
 
@@ -1100,6 +1228,28 @@ impl AtmiCtx {
 
         UbfFieldType::from_raw(rc)
             .ok_or_else(|| crate::UbfError::new(crate::UbfError::BEINVAL, "unknown UBF field type"))
+    }
+
+    /// Refuse to run Enduro/X's `BFLD_PTR` conversions on `bfldid`.
+    ///
+    /// The conversion table pairs `BFLD_PTR` with the scalar types, so reading a
+    /// pointer field as an integer hands out the address of a buffer that the
+    /// parent still owns and will free, and writing an integer into one installs
+    /// an arbitrary address that the parent later passes to `tpfree`
+    /// (`ndrx_tpfree_scan_ptrs`, `libatmi/typed_buf.c`). Ownership is only
+    /// tracked when the value is a [`crate::UbfValue::Ptr`], so that is the one
+    /// form allowed to cross a pointer field.
+    pub(crate) fn reject_ptr_conversion(&self, bfldid: BFLDID, op: &str) -> UbfResult<()> {
+        if self.bfldtype(bfldid)? == UbfFieldType::Ptr {
+            return Err(crate::UbfError::new(
+                crate::UbfError::BTYPERR,
+                format!(
+                    "{op}: field id {bfldid} is BFLD_PTR; write it with an owned buffer \
+                     and read it back with bget_ptr or bextract_ptr"
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Resolve a field name to its typed field id.
@@ -1194,7 +1344,20 @@ impl AtmiCtx {
     }
 
     /// Reinitialize a UBF buffer with a given UBF length.
+    ///
+    /// Fails with `BEINVAL` if `len` exceeds the allocation. `Binit` formats the
+    /// buffer header for the length it is given, so a value larger than the
+    /// allocation makes every later UBF operation address memory past the end
+    /// of it.
     pub fn binit(&self, ubf: &mut TypedUbf<'_>, len: usize) -> UbfResult<()> {
+        let cap = ubf.tptypes().map(|info| info.size).unwrap_or(0);
+        if len > cap {
+            return Err(crate::UbfError::new(
+                crate::UbfError::BEINVAL,
+                format!("Binit length {len} exceeds the {cap} byte buffer allocation"),
+            ));
+        }
+
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::Binit(ubf.as_ubfh(), len as raw::BFLDLEN) };
 
@@ -1387,6 +1550,7 @@ impl AtmiCtx {
         src: &TypedUbf<'_>,
         fldlist: &[i32],
     ) -> UbfResult<()> {
+        self.reject_pointer_copy(src, "Bprojcpy")?;
         let mut fields: Vec<BFLDID> = fldlist.iter().copied().map(|f| f as BFLDID).collect();
         fields.push(0);
 
@@ -1454,6 +1618,7 @@ impl AtmiCtx {
 
     /// Update `dst` with fields from `src`.
     pub fn bupdate(&self, dst: &mut TypedUbf<'_>, src: &TypedUbf<'_>) -> UbfResult<()> {
+        self.reject_pointer_copy(src, "Bupdate")?;
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::Bupdate(dst.as_ubfh(), src.as_ubfh()) };
 

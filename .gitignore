@@ -1,0 +1,19 @@
+# Cargo build output, at any depth. The nested test crates under tests/ each
+# build into their own target/ and none of the per-crate .gitignore files
+# covered it, so a plain `git add -A` swept thousands of object files in.
+target/
+
+# Per-crate lockfiles for the tests/ crates. Only the root Cargo.lock is
+# tracked; the test crates are publish = false and pin nothing.
+tests/*/Cargo.lock
+
+# Enduro/X user log, written next to whatever process starts in a directory.
+ULOG*
+
+# viewc output for the unit tests: the compiled .V and the C header it emits
+# alongside it. Both are rebuilt from tests/views/test.v on every run. Anchored
+# so the patterns cannot also match a source directory further down the tree.
+/tests/00_unittest/views/
+/tests/00_unittest/test.h
+
+.DS_Store

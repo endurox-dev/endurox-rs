@@ -50,18 +50,18 @@ pub use atmictx_srv::{
 pub use atmictx_ubf::{BFldLocInfo, UbfExprCallback, UbfExprCallback2, UbfExprTree, UbfFieldType};
 pub use errors::{AtmiError, AtmiResult, NstdError, NstdResult, UbfError, UbfResult};
 pub use flags::{
-    TPBLK_ALL, TPBLK_NEXT, TPCONV, TPGETANY, TPNOBLOCK, TPNOCHANGE, TPNOREPLY, TPNOTIME, TPNOTRAN,
-    TPRECVONLY, TPSENDONLY, TPSIGRSTRT, TPTRAN, TPTRANSUSPEND,
+    TPBLK_ALL, TPBLK_NEXT, TPCONV, TPEX_STRING, TPGETANY, TPNOBLOCK, TPNOCHANGE, TPNOREPLY,
+    TPNOTIME, TPNOTRAN, TPRECVONLY, TPSENDONLY, TPSIGRSTRT, TPTRAN, TPTRANSUSPEND,
 };
 pub use nstdutil::NdrxStdCfgStr;
 pub use tpsvcinfo::TpSvcInfo;
 pub use typed_buf::{TpTypeInfo, TypedBuffer};
 pub use typed_ubf::{
-    BorrowedBuffer, BorrowedUbf, IntoUbfValue, TypedUbf, UbfField, UbfGetValue, UbfIterator,
-    UbfValue,
+    BorrowedBuffer, BorrowedUbf, FastAdder, IntoUbfValue, TypedUbf, UbfField, UbfGetValue,
+    UbfIterator, UbfValue,
 };
 pub use typed_view::{BvNextState, IntoViewValue, TypedView, ViewValue, BVACCESS_NOTNULL};
-pub use types::{ClientId, TpContext, TpTranId};
+pub use types::{ClientId, TpTranId};
 pub use ubf_serde::{
     ubf_read_adhoc, ubf_read_nested, ubf_write_adhoc, ubf_write_nested, UbfAdhoc, UbfCarray,
     UbfDeserialize, UbfFieldDeserialize, UbfFieldSerialize, UbfSerialize,
