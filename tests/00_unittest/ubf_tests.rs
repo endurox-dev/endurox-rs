@@ -1367,13 +1367,14 @@ fn typed_accessors_reject_mismatched_types() {
     ctx.tpterm().expect("tpterm failed");
 }
 
-/// Copying or embedding a buffer that holds BFLD_PTR fields must be refused.
+/// Copying or inline-embedding a buffer that holds BFLD_PTR fields must be refused.
 ///
-/// Both operations duplicate the stored pointer *addresses* without duplicating
-/// their targets. The source then frees targets the destination still
-/// references. Detection recurses through embedded UBF fields.
+/// Every shallow copy duplicates the pointer *addresses* without their targets;
+/// an inline embed would do the same into a parent that shares the consumed
+/// original's targets. Pointer-bearing sub-buffers must be stored behind
+/// BFLD_PTR instead. Detection recurses through embedded UBF fields.
 #[test]
-fn pointer_fields_block_copy_and_embed() {
+fn pointer_fields_block_shallow_copy_and_inline_embed() {
     let _guard = endurox_test_env();
     let ctx = AtmiCtx::new().expect("failed to create AtmiCtx");
     ctx.tpinit().expect("tpinit failed");
@@ -1404,11 +1405,13 @@ fn pointer_fields_block_copy_and_embed() {
         assert_eq!(err.code, endurox_rs::UbfError::BEINVAL, "{label}");
     }
 
-    // Same rule when the pointer is nested one level down.
+    // Inline-embedding a UBF that owns pointer targets is refused as well: the
+    // inline copy would share the targets with the consumed original. The
+    // rejected value drops here, freeing what it owned.
     let mut outer = ctx.tpalloc_ubf(4096).expect("outer");
     let err = outer
         .bchg(ubf_fields::T_UBF_FLD, 0, UbfValue::Ubf(src), true)
-        .expect_err("embedding a UBF with pointer fields must fail");
+        .expect_err("inline-embedding a UBF with pointer fields must fail");
     assert_eq!(err.code, endurox_rs::UbfError::BEINVAL);
 
     // A buffer with no pointer fields still copies normally.
@@ -1585,3 +1588,9 @@ env
         }
     });
 }
+
+#[path = "serde_complex.rs"]
+mod serde_complex;
+
+#[path = "script_buffer_tests.rs"]
+mod script_buffer_tests;

@@ -8,7 +8,7 @@ use std::io;
 use std::ops::Deref;
 use std::pin::pin;
 use std::task::{Poll, Waker};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(any(feature = "async-io", feature = "tokio"))]
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
@@ -41,6 +41,36 @@ pub trait AsyncReplyDriver: Sized {
 
     /// Sleep until an absolute standard-library deadline.
     fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()> + '_;
+}
+
+/// Retry only a definitely-unsent request. Each failed attempt yields to the
+/// executor; the timer is capped by the original send/reply deadline.
+async fn send_with_backpressure<T, F, S, W>(
+    flags: i64,
+    deadline: Option<Instant>,
+    mut send: F,
+    mut sleep: S,
+) -> AtmiResult<T>
+where
+    F: FnMut(i64, bool) -> AtmiResult<T>,
+    S: FnMut(Instant) -> W,
+    W: Future<Output = ()>,
+{
+    let mut delay = Duration::from_millis(1);
+    let mut retry = false;
+    loop {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(AtmiError::new(raw::TPETIME, "async send wait timed out"));
+        }
+        match send(flags | raw::TPNOBLOCK as i64, retry) {
+            Err(error) if error.code == raw::TPEBLOCK && flags & raw::TPNOBLOCK as i64 == 0 => {}
+            result => return result,
+        }
+        let wake = Instant::now() + delay;
+        sleep(deadline.map_or(wake, |deadline| deadline.min(wake))).await;
+        delay = (delay * 2).min(Duration::from_millis(16));
+        retry = true;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -668,8 +698,8 @@ impl ReplyDemux {
 ///
 /// The adapter owns the context, which guarantees that the reply fd is
 /// registered only once. It dereferences to [`AtmiCtx`] for allocation,
-/// logging, `tpacall`, and APIs unrelated to reply collection. Its inherent
-/// `tpcall`, `tpgetrply`, `tpcancel`, and `tpterm` methods provide the
+/// logging and APIs unrelated to async calls. Its inherent
+/// `tpcall`, `tpacall`, `tpgetrply`, `tpcancel`, and `tpterm` methods provide the
 /// async-aware variants of those operations.
 ///
 /// Several calls may be in flight at once. Replies are demultiplexed by call
@@ -689,6 +719,31 @@ pub struct AsyncAtmiCtx<D> {
     driver: D,
     demux: ReplyDemux,
     context: AtmiCtx,
+    // Adapter-owned one-shot metadata stays out of native TLS until a logical
+    // send starts. Retries must not consume another future's pending priority.
+    next_priority: Cell<Option<SendPriority>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SendPriority {
+    value: i32,
+    flags: i64,
+}
+
+impl SendPriority {
+    fn new(value: i32, flags: i64) -> AtmiResult<Self> {
+        let absolute = flags & raw::TPABSOLUTE as i64 != 0;
+        if flags & !(raw::TPABSOLUTE as i64) != 0
+            || (absolute && !(1..=100).contains(&value))
+            || (!absolute && !(-100..=100).contains(&value))
+        {
+            return Err(AtmiError::new(
+                raw::TPEINVAL,
+                "invalid message priority or flags",
+            ));
+        }
+        Ok(Self { value, flags })
+    }
 }
 
 impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
@@ -708,6 +763,7 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
             driver,
             demux: ReplyDemux::default(),
             context,
+            next_priority: Cell::new(None),
         })
     }
 
@@ -719,10 +775,27 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
         &self.context
     }
 
+    /// Set the priority of the next async submission (including `try_tpacall`).
+    /// Relative values use flags 0; `TPABSOLUTE` selects an absolute priority.
+    /// The setting is consumed when that submission is first polled, and the
+    /// resolved priority is retained across queue-full retries. It is separate
+    /// from native operations invoked through `context()` or `Deref`; configure
+    /// those through `context().tpsprio(...)` instead.
+    pub fn tpsprio(&self, priority: i32, flags: i64) -> AtmiResult<()> {
+        self.next_priority
+            .set(Some(SendPriority::new(priority, flags)?));
+        Ok(())
+    }
+
     /// Remove the asynchronous driver and return the synchronous context.
     ///
     /// No call future may still borrow this adapter.
     pub fn into_inner(self) -> AtmiCtx {
+        if let Some(priority) = self.next_priority.take() {
+            // Already validated; transfer the unused one-shot setting back to
+            // the native context when ownership leaves the adapter.
+            let _ = self.context.tpsprio(priority.value, priority.flags);
+        }
         // `Self` has a Drop impl, so the fields cannot simply be destructured.
         let this = std::mem::ManuallyDrop::new(self);
         // SAFETY: each field is moved out exactly once and `this` is never
@@ -739,6 +812,10 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
 
     /// Submit a request and asynchronously wait for its reply.
     ///
+    /// A full destination queue yields between nonblocking send attempts.
+    /// `TPNOBLOCK` makes the send fail immediately with `TPEBLOCK` if full,
+    /// but a successfully submitted call still awaits its reply.
+    ///
     /// Dropping the returned future after submission cancels its Enduro/X
     /// descriptor.
     pub async fn tpcall(
@@ -753,12 +830,18 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
         // Read before tpacall: a TPBLK_NEXT setting is one-shot and the call
         // consumes it.
         let deadline = self.deadline_for(flags)?;
-        let cd = self.submit(svc, idata, flags, deadline, true)?;
+        let cd = self.submit(svc, idata, flags, deadline, true).await?;
         let mut pending = AsyncPendingCall::new(self, cd);
         // Always Target::One here: a tpcall owns its descriptor, so it must not
         // pick up someone else's reply even if the caller passed TPGETANY.
         let result = match self
-            .await_reply(Target::One(pending.cd), odata, flags, deadline, false)
+            .await_reply(
+                Target::One(pending.cd),
+                odata,
+                flags & !(raw::TPNOBLOCK as i64),
+                deadline,
+                false,
+            )
             .await
         {
             Ok((_, outcome)) => outcome,
@@ -770,19 +853,91 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
         result
     }
 
-    /// Submit a request without waiting, recording its deadline.
+    /// Asynchronously submit a request, returning its descriptor once sent.
     ///
-    /// Prefer this over `AtmiCtx::tpacall` (reachable through `Deref`) when the
-    /// reply will be collected with [`Self::tpgetrply`]. The Enduro/X call
-    /// timeout starts when the request is *sent*, and a `TPBLK_NEXT` setting is
-    /// consumed by that send. Reading `tpgblktime` later, at collection time,
-    /// yields a fresh interval measured from the wrong instant and a value that
-    /// no longer reflects the one-shot override -- cancelling the descriptor
-    /// too late, or too early.
-    pub fn tpacall(&self, svc: &str, idata: &TypedBuffer<'_>, flags: i64) -> AtmiResult<i32> {
+    /// A full queue yields between attempts unless `TPNOBLOCK` was requested.
+    /// The original timeout covers both queue waiting and later reply waiting
+    /// through [`Self::tpgetrply`]. `TPNOREPLY` returns zero after submission.
+    /// Dropping this future while waiting for space stops further attempts;
+    /// after success, the caller owns the returned descriptor.
+    pub async fn tpacall(&self, svc: &str, idata: &TypedBuffer<'_>, flags: i64) -> AtmiResult<i32> {
         Self::check_supported_flags(flags)?;
         let deadline = self.deadline_for(flags)?;
-        self.submit(svc, idata, flags, deadline, false)
+        self.submit(svc, idata, flags, deadline, false).await
+    }
+
+    /// Attempt submission once, returning `TPEBLOCK` if the queue is full.
+    /// Records the deadline for later [`Self::tpgetrply`] collection.
+    pub fn try_tpacall(&self, svc: &str, idata: &TypedBuffer<'_>, flags: i64) -> AtmiResult<i32> {
+        Self::check_supported_flags(flags)?;
+        let deadline = self.deadline_for(flags)?;
+        let priority = self.next_priority.take();
+        let cd = self.with_send_priority(priority, || {
+            self.context
+                .tpacall(svc, idata, flags | raw::TPNOBLOCK as i64)
+        })?;
+        self.register_submission(cd, deadline, false)
+    }
+
+    /// Compatibility spelling for [`Self::tpacall`].
+    pub async fn tpacall_async(
+        &self,
+        svc: &str,
+        idata: &TypedBuffer<'_>,
+        flags: i64,
+    ) -> AtmiResult<i32> {
+        self.tpacall(svc, idata, flags).await
+    }
+
+    async fn submit(
+        &self,
+        svc: &str,
+        idata: &TypedBuffer<'_>,
+        flags: i64,
+        deadline: Option<Instant>,
+        claimed: bool,
+    ) -> AtmiResult<i32> {
+        let priority = self.next_priority.take();
+        let mut retry_priority = None;
+        send_with_backpressure(
+            flags,
+            deadline,
+            |send_flags, retry| {
+                let result = if retry {
+                    self.retry_tpacall(
+                        svc,
+                        idata,
+                        send_flags,
+                        deadline,
+                        retry_priority.expect("a retry follows a blocked send"),
+                    )
+                } else {
+                    self.with_send_priority(priority, || {
+                        self.context.tpacall(svc, idata, send_flags)
+                    })
+                };
+                if matches!(&result, Err(error) if error.code == raw::TPEBLOCK)
+                    && !Self::is_nonblocking(flags)
+                {
+                    if !retry {
+                        // tpgprio reports the actual absolute priority, including
+                        // any relative adjustment and service routing priority.
+                        // Read before draining: callbacks may send other messages.
+                        retry_priority = Some(self.context.tpgprio()?);
+                    }
+                    // A server may itself be blocked on our full reply queue.
+                    // Route replies even while the caller is still submitting
+                    // a batch before collecting any of its descriptors.
+                    let next = self.context.tpgblktime(raw::TPBLK_NEXT as i64)?;
+                    self.demux.drain(&self.context, 0);
+                    self.demux.wake_any_waiters();
+                    self.context.tpsblktime(next, raw::TPBLK_NEXT as i64)?;
+                }
+                result.and_then(|cd| self.register_submission(cd, deadline, claimed))
+            },
+            |wake| self.driver.sleep_until(wake),
+        )
+        .await
     }
 
     /// Send a request and take ownership of the descriptor, refusing to reuse
@@ -796,16 +951,12 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
     /// `claimed` says whether a specific future owns the descriptor. `tpcall`
     /// does; `tpacall` hands the descriptor back to the caller, so its reply
     /// must stay collectable by `TPGETANY` until a `tpgetrply` names it.
-    fn submit(
+    fn register_submission(
         &self,
-        svc: &str,
-        idata: &TypedBuffer<'_>,
-        flags: i64,
+        cd: i32,
         deadline: Option<Instant>,
         claimed: bool,
     ) -> AtmiResult<i32> {
-        let cd = self.context.tpacall(svc, idata, flags)?;
-
         if cd > 0 && self.demux.is_descriptor_busy(cd) {
             // Cancel through the *context*, not through `Self::tpcancel`: the
             // adapter version calls `release_slot`, which would delete and free
@@ -830,6 +981,74 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
             self.demux.record_deadline(cd, deadline);
         }
         Ok(cd)
+    }
+
+    /// Apply priority only for this synchronous native attempt. Clear it even
+    /// if routing fails before the native queue sender consumes the setting.
+    fn with_send_priority(
+        &self,
+        priority: Option<SendPriority>,
+        send: impl FnOnce() -> AtmiResult<i32>,
+    ) -> AtmiResult<i32> {
+        let Some(priority) = priority else {
+            return send();
+        };
+        self.context.tpsprio(priority.value, priority.flags)?;
+        let result = send();
+        if let Err(error) = self.context.tpsprio(0, 0) {
+            if let Ok(cd) = result {
+                if cd > 0 {
+                    let _ = self.tpcancel(cd);
+                }
+            }
+            return Err(error);
+        }
+        result
+    }
+
+    /// Reapply the remaining timeout because native tpacall consumes TPBLK_NEXT
+    /// even when sending fails. No temporary setting survives an async yield.
+    fn retry_tpacall(
+        &self,
+        svc: &str,
+        idata: &TypedBuffer<'_>,
+        flags: i64,
+        deadline: Option<Instant>,
+        priority: i32,
+    ) -> AtmiResult<i32> {
+        let seconds = match deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(AtmiError::new(raw::TPETIME, "async send wait timed out"));
+                }
+                // Native timeouts use whole seconds; the reactor retains the
+                // exact deadline, so round up without extending that deadline.
+                (remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0))
+                    .min(i32::MAX as u64) as i32
+            }
+            None => 0,
+        };
+        let next = self.context.tpgblktime(raw::TPBLK_NEXT as i64)?;
+        self.context.tpsblktime(seconds, raw::TPBLK_NEXT as i64)?;
+        let result = self.with_send_priority(
+            Some(SendPriority {
+                value: priority,
+                flags: raw::TPABSOLUTE as i64,
+            }),
+            || self.context.tpacall(svc, idata, flags),
+        );
+        // Another task may have configured its next call while this task slept.
+        // Preserve that setting instead of letting this retry consume it.
+        if let Err(error) = self.context.tpsblktime(next, raw::TPBLK_NEXT as i64) {
+            if let Ok(cd) = result {
+                if cd > 0 {
+                    let _ = self.tpcancel(cd);
+                }
+            }
+            return Err(error);
+        }
+        result
     }
 
     /// Compatibility spelling for [`AsyncAtmiCtx::tpcall`].
@@ -1378,6 +1597,344 @@ mod tests {
         fn wake_by_ref(self: &Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    /// Invoked by tests/05_async_demux/run.sh inside its isolated test domain.
+    /// Only sending is under test: a socket supplies an unused reply reactor
+    /// registration so this also covers native System V queue backpressure.
+    #[cfg(feature = "tokio")]
+    #[test]
+    #[ignore = "requires the 05_async_demux domain; run its --send-only launcher"]
+    fn native_queue_pressure_preserves_priority() {
+        assert_eq!(
+            std::env::var("ENDUROX_RS_TEST_SEND_DOMAIN").as_deref(),
+            Ok("1")
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        runtime.block_on(async {
+            let context = AtmiCtx::new().unwrap();
+            context.tpinit().unwrap();
+            let ctx = AsyncAtmiCtx {
+                driver: TokioReplyDriver::register(socket.as_raw_fd()).unwrap(),
+                demux: ReplyDemux::default(),
+                context,
+                next_priority: Cell::new(None),
+            };
+            let request = ctx.tpalloc_ubf(256).unwrap().into_inner();
+            let no_reply = raw::TPNOREPLY as i64;
+            for _ in 0..2 {
+                ctx.try_tpacall("RS_DEMUX_HOLD", &request, no_reply)
+                    .unwrap();
+            }
+            let mut full = false;
+            for _ in 0..1000 {
+                match ctx.try_tpacall("RS_DEMUX_FAST", &request, no_reply) {
+                    Err(error) if error.code == raw::TPEBLOCK => {
+                        full = true;
+                        break;
+                    }
+                    result => {
+                        result.unwrap();
+                    }
+                }
+            }
+            assert!(full, "request queue did not fill");
+            ctx.tpsprio(41, 0).unwrap();
+            {
+                let mut sent = pin!(ctx.tpacall("RS_DEMUX_FAST", &request, no_reply));
+                let mut other_task = pin!(async {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    ctx.tpsprio(23, raw::TPABSOLUTE as i64).unwrap();
+                    ctx.tpsblktime(7, raw::TPBLK_NEXT as i64).unwrap();
+                });
+                let mut other_done = false;
+                let submit = poll_fn(|cx| {
+                    if !other_done && other_task.as_mut().poll(cx).is_ready() {
+                        other_done = true;
+                    }
+                    sent.as_mut().poll(cx)
+                });
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(5), submit)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    0
+                );
+                assert!(other_done, "the send blocked the executor");
+            }
+            assert_eq!(
+                ctx.tpgprio().unwrap(),
+                91,
+                "relative priority was lost or reapplied as relative"
+            );
+            assert_eq!(ctx.tpgblktime(raw::TPBLK_NEXT as i64).unwrap(), 7);
+            ctx.tpacall("RS_DEMUX_FAST", &request, no_reply)
+                .await
+                .unwrap();
+            assert_eq!(
+                ctx.tpgprio().unwrap(),
+                23,
+                "retry stole the next task's priority"
+            );
+            ctx.tpacall("RS_DEMUX_FAST", &request, no_reply)
+                .await
+                .unwrap();
+            assert_eq!(
+                ctx.tpgprio().unwrap(),
+                50,
+                "priority leaked into another call"
+            );
+
+            // Routing errors occur before native send consumes priority.
+            ctx.tpsprio(99, raw::TPABSOLUTE as i64).unwrap();
+            assert_eq!(
+                ctx.try_tpacall("RS_NO_SUCH_PRIORITY_SERVICE", &request, no_reply)
+                    .unwrap_err()
+                    .code,
+                raw::TPENOENT
+            );
+            ctx.tpacall("RS_DEMUX_FAST", &request, no_reply)
+                .await
+                .unwrap();
+            assert_eq!(ctx.tpgprio().unwrap(), 50, "failed routing leaked priority");
+            ctx.tpsprio(33, raw::TPABSOLUTE as i64).unwrap();
+            assert!(ctx.tpsprio(i32::MIN, 0).is_err());
+            assert!(ctx.tpsprio(101, raw::TPABSOLUTE as i64).is_err());
+            ctx.tpacall("RS_DEMUX_FAST", &request, no_reply)
+                .await
+                .unwrap();
+            assert_eq!(
+                ctx.tpgprio().unwrap(),
+                33,
+                "invalid setter overwrote the pending priority"
+            );
+            ctx.tpsprio(77, raw::TPABSOLUTE as i64).unwrap();
+            drop(request);
+            let native = ctx.into_inner();
+            let request = native.tpalloc_ubf(256).unwrap().into_inner();
+            native.tpacall("RS_DEMUX_FAST", &request, no_reply).unwrap();
+            assert_eq!(
+                native.tpgprio().unwrap(),
+                77,
+                "into_inner lost a pending priority"
+            );
+            drop(request);
+            native.tpterm().unwrap();
+        });
+    }
+
+    #[test]
+    fn full_queue_yields_before_each_retry_and_stops_after_success() {
+        let attempts = Cell::new(0);
+        let wake = Cell::new(false);
+        let sleeps = RefCell::new(Vec::new());
+        let mut send = Box::pin(send_with_backpressure(
+            0,
+            None,
+            |flags, retry| {
+                assert_ne!(flags & raw::TPNOBLOCK as i64, 0);
+                assert_eq!(retry, attempts.get() != 0);
+                attempts.set(attempts.get() + 1);
+                if attempts.get() < 8 {
+                    Err(AtmiError::new(raw::TPEBLOCK, "full"))
+                } else {
+                    Ok(42)
+                }
+            },
+            |deadline| {
+                sleeps
+                    .borrow_mut()
+                    .push(deadline.saturating_duration_since(Instant::now()));
+                poll_fn(|_| {
+                    if wake.replace(false) {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+            },
+        ));
+        let waker = Waker::from(Arc::new(CountingWaker(AtomicUsize::new(0))));
+        let mut cx = std::task::Context::from_waker(&waker);
+        for expected in 1..8 {
+            assert!(send.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(attempts.get(), expected);
+            // Spurious executor polls cannot trigger another native send.
+            assert!(send.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(attempts.get(), expected);
+            wake.set(true);
+        }
+        assert!(matches!(send.as_mut().poll(&mut cx), Poll::Ready(Ok(42))));
+        assert_eq!(attempts.get(), 8);
+        assert_eq!(sleeps.borrow().len(), 7);
+        assert!(sleeps
+            .borrow()
+            .iter()
+            .all(|delay| *delay <= Duration::from_millis(16)));
+    }
+
+    #[test]
+    fn nonblocking_and_non_queue_errors_are_never_retried() {
+        let waker = Waker::from(Arc::new(CountingWaker(AtomicUsize::new(0))));
+        let mut cx = std::task::Context::from_waker(&waker);
+        for (flags, code) in [
+            (raw::TPNOBLOCK as i64, raw::TPEBLOCK),
+            (0, raw::TPENOENT),
+            (0, raw::TPETIME),
+            (0, raw::TPELIMIT),
+            (0, raw::TPESVCFAIL),
+        ] {
+            let mut send = Box::pin(send_with_backpressure(
+                flags,
+                None,
+                |_, _| Err::<i32, _>(AtmiError::new(code, "failure")),
+                |_| {
+                    panic!("this error must not cause a retry");
+                    #[allow(unreachable_code)]
+                    std::future::ready(())
+                },
+            ));
+            assert!(
+                matches!(send.as_mut().poll(&mut cx), Poll::Ready(Err(error)) if error.code == code)
+            );
+        }
+    }
+
+    #[test]
+    fn send_deadline_caps_sleep_and_prevents_late_submission() {
+        let attempts = Cell::new(0);
+        let deadline = Instant::now() + Duration::from_millis(10);
+        let mut send = Box::pin(send_with_backpressure(
+            0,
+            Some(deadline),
+            |_, _| {
+                attempts.set(attempts.get() + 1);
+                Err::<i32, _>(AtmiError::new(raw::TPEBLOCK, "full"))
+            },
+            |wake| {
+                assert!(wake <= deadline);
+                poll_fn(|_| {
+                    if Instant::now() >= deadline {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+            },
+        ));
+        let waker = Waker::from(Arc::new(CountingWaker(AtomicUsize::new(0))));
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(send.as_mut().poll(&mut cx).is_pending());
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            matches!(send.as_mut().poll(&mut cx), Poll::Ready(Err(error)) if error.code == raw::TPETIME)
+        );
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
+    fn cancelling_a_send_drops_its_timer_without_resubmitting() {
+        struct PendingTimer<'a>(&'a Cell<bool>);
+        impl Future for PendingTimer<'_> {
+            type Output = ();
+            fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<()> {
+                Poll::Pending
+            }
+        }
+        impl Drop for PendingTimer<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let dropped = Cell::new(false);
+        let attempts = Cell::new(0);
+        let mut send = Box::pin(send_with_backpressure(
+            raw::TPNOTIME as i64,
+            None,
+            |flags, _| {
+                assert_ne!(flags & raw::TPNOTIME as i64, 0);
+                attempts.set(attempts.get() + 1);
+                Err::<i32, _>(AtmiError::new(raw::TPEBLOCK, "full"))
+            },
+            |_| PendingTimer(&dropped),
+        ));
+        let waker = Waker::from(Arc::new(CountingWaker(AtomicUsize::new(0))));
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(send.as_mut().poll(&mut cx).is_pending());
+        drop(send);
+        assert!(dropped.get());
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn tokio_runs_other_tasks_while_a_send_waits_for_space() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        runtime.block_on(async {
+            let driver = TokioReplyDriver::register(socket.as_raw_fd()).unwrap();
+            let space = Cell::new(false);
+            let mut free_space = pin!(async {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                space.set(true);
+            });
+            let mut send = pin!(send_with_backpressure(
+                raw::TPNOREPLY as i64,
+                Some(Instant::now() + Duration::from_secs(2)),
+                |flags, _| {
+                    assert_ne!(flags & raw::TPNOREPLY as i64, 0);
+                    if space.get() {
+                        Ok(0)
+                    } else {
+                        Err(AtmiError::new(raw::TPEBLOCK, "full"))
+                    }
+                },
+                |wake| driver.sleep_until(wake),
+            ));
+            let mut space_freed = false;
+            let cd = poll_fn(|cx| {
+                if !space_freed && free_space.as_mut().poll(cx).is_ready() {
+                    space_freed = true;
+                }
+                send.as_mut().poll(cx)
+            })
+            .await
+            .unwrap();
+            assert!(space_freed);
+            assert_eq!(cd, 0);
+        });
+    }
+
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn async_io_send_timer_retries_until_space_is_available() {
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let driver = AsyncIoReplyDriver::register(socket.as_raw_fd()).unwrap();
+        let attempts = Cell::new(0);
+        let cd = async_io::block_on(send_with_backpressure(
+            0,
+            Some(Instant::now() + Duration::from_secs(2)),
+            |_, _| {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 3 {
+                    Ok(5)
+                } else {
+                    Err(AtmiError::new(raw::TPEBLOCK, "full"))
+                }
+            },
+            |wake| driver.sleep_until(wake),
+        ))
+        .unwrap();
+        assert_eq!(cd, 5);
+        assert_eq!(attempts.get(), 3);
     }
 
     /// The stranding scenario, exercised against the routing table alone so it

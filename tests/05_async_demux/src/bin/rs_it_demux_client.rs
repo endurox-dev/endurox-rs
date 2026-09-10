@@ -11,7 +11,11 @@
 //! hung. With `tpgetrply(TPGETANY)` demultiplexing, every reply is accepted and
 //! routed to its own descriptor, so both calls complete.
 
-use endurox_rs::{ubf_fields, AtmiCtx, TokioAtmiCtx, UbfValue};
+use endurox_rs::{
+    ubf_fields, AtmiCtx, AtmiError, TokioAtmiCtx, TypedBuffer, UbfValue, TPABSOLUTE, TPBLK_NEXT,
+    TPNOBLOCK, TPNOREPLY, TPNOTIME,
+};
+use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 /// Generous relative to the server's 600 ms delay, but far below any plausible
@@ -73,8 +77,126 @@ async fn run() -> Result<(), String> {
         ));
     }
 
+    queue_pressure(&ctx)
+        .await
+        .map_err(|e| format!("queue pressure: {e}"))?;
+
     ctx.tpterm().map_err(|e| format!("tpterm failed: {e}"))?;
     println!("demux ok: both replies routed in {elapsed:.2?}");
+    Ok(())
+}
+
+/// Occupy both workers, then fill their shared request queue with fast calls.
+/// Only the first two requests sleep; draining the filler messages is quick.
+fn fill_queue(ctx: &TokioAtmiCtx, request: &TypedBuffer<'_>) -> Result<(), AtmiError> {
+    for _ in 0..2 {
+        ctx.try_tpacall("RS_DEMUX_HOLD", request, TPNOREPLY | TPNOTIME)?;
+    }
+    for _ in 0..1000 {
+        match ctx.try_tpacall("RS_DEMUX_FAST", request, TPNOREPLY | TPNOTIME) {
+            Err(error) if error.code == AtmiError::TPEBLOCK => return Ok(()),
+            Err(error) => return Err(error),
+            Ok(_) => (),
+        }
+    }
+    Err(AtmiError::new(
+        AtmiError::TPEINVAL,
+        "could not fill the request queue",
+    ))
+}
+
+async fn queue_pressure(ctx: &TokioAtmiCtx) -> Result<(), AtmiError> {
+    let request = ctx.tpalloc_ubf(1024)?.into_inner();
+    let mut response = ctx.tpalloc_ubf(4096)?.into_inner();
+
+    // A nonblocking send which succeeds must still await a delayed reply.
+    ctx.tpcall("RS_DEMUX_SLOW", &request, &mut response, TPNOBLOCK)
+        .await?;
+
+    fill_queue(ctx, &request)?;
+    let error = ctx
+        .tpcall("RS_DEMUX_FAST", &request, &mut response, TPNOBLOCK)
+        .await
+        .expect_err("full queue must fail immediately with TPNOBLOCK");
+    assert_eq!(error.code, AtmiError::TPEBLOCK);
+
+    // Both APIs must yield while the request queue is full. A heartbeat on the
+    // same executor thread must run before either submission completes.
+    let beat = Cell::new(false);
+    let (call, submitted, ()) = tokio::join!(
+        async {
+            let result = ctx
+                .tpcall("RS_DEMUX_FAST", &request, &mut response, 0)
+                .await;
+            assert!(beat.get(), "tpcall prevented the heartbeat from running");
+            result
+        },
+        async {
+            ctx.tpsprio(41, 0)?; // Default 50 + relative 41 = absolute 91.
+            let result = ctx.tpacall("RS_DEMUX_FAST", &request, 0).await;
+            assert!(beat.get(), "tpacall prevented the heartbeat from running");
+            if result.is_ok() {
+                assert_eq!(ctx.tpgprio()?, 91);
+            }
+            result
+        },
+        async {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            ctx.tpsprio(23, TPABSOLUTE).unwrap();
+            beat.set(true);
+        },
+    );
+    call?;
+    assert!(beat.get());
+    let mut cd = submitted?;
+    ctx.tpacall("RS_DEMUX_FAST", &request, TPNOREPLY).await?;
+    assert_eq!(ctx.tpgprio()?, 23);
+    ctx.tpgetrply(&mut cd, &mut response, 0).await?;
+
+    fill_queue(ctx, &request)?;
+    // Cancelling a waiting send must not retain a descriptor or submit later.
+    assert!(tokio::time::timeout(
+        Duration::from_millis(25),
+        ctx.tpacall("RS_DEMUX_FAST", &request, 0)
+    )
+    .await
+    .is_err());
+    ctx.tpsblktime(1, TPBLK_NEXT)?;
+    let start = Instant::now();
+    let error = ctx
+        .tpacall("RS_DEMUX_FAST", &request, 0)
+        .await
+        .expect_err("one-shot timeout must expire before the queue opens");
+    assert_eq!(error.code, AtmiError::TPETIME);
+    assert!(start.elapsed() < Duration::from_millis(1600));
+
+    // The preceding timeout must not leak into a TPNOTIME send. A no-reply
+    // request returns zero, with no reply slot allocated by the adapter.
+    let cd = ctx
+        .tpacall_async("RS_DEMUX_FAST", &request, TPNOREPLY | TPNOTIME)
+        .await?;
+    assert_eq!(cd, 0);
+    ctx.tpcall("RS_DEMUX_FAST", &request, &mut response, 0)
+        .await?;
+
+    // More calls than either queue's capacity. The send loop must drain replies
+    // while submitting, or the service and caller can block each other's queues.
+    let mut calls = Vec::new();
+    for _ in 0..32 {
+        match ctx.tpacall("RS_DEMUX_FAST", &request, 0).await {
+            Ok(cd) => calls.push(cd),
+            // Draining native replies can release native descriptors before
+            // the Rust caller has collected them. The existing demux rejects
+            // reuse with TPELIMIT; collect the older replies without resending
+            // a request whose submission may already have reached the service.
+            Err(error) if error.code == AtmiError::TPELIMIT => break,
+            Err(error) => return Err(error),
+        }
+    }
+    for mut cd in calls {
+        ctx.tpgetrply(&mut cd, &mut response, 0).await?;
+    }
+    println!("queue pressure ok: yielding sends, nonblocking flags, cancellation and deadlines");
     Ok(())
 }
 

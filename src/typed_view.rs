@@ -141,6 +141,10 @@ impl Default for BvNextState {
 }
 
 impl<'ctx> TypedView<'ctx> {
+    pub(crate) fn buffer(&self) -> &TypedBuffer<'ctx> {
+        &self.inner
+    }
+
     /// View an existing typed buffer as VIEW `view`.
     ///
     /// Validates three things, because every VIEW accessor addresses the buffer

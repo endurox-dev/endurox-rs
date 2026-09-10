@@ -1,13 +1,27 @@
-// Only the pollable variant of the test starts an Enduro/X domain, so the
-// shared-domain lock is only needed there.
-#[cfg(endurox_pollable)]
 #[path = "common/endurox_domain_lock.rs"]
 mod endurox_domain_lock;
-#[cfg(endurox_pollable)]
 use endurox_domain_lock::lock_endurox_domain;
 
-#[cfg(endurox_pollable)]
 use std::process::Command;
+
+/// Real native queue pressure without requiring a pollable reply backend.
+#[test]
+fn async_send_retries_preserve_priority_and_other_tasks_settings() {
+    let _guard = lock_endurox_domain();
+    let test_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/05_async_demux");
+    let output = Command::new("bash")
+        .arg(format!("{test_dir}/run.sh"))
+        .arg("--send-only")
+        .current_dir(test_dir)
+        .output()
+        .expect("failed to execute send-only run.sh");
+    assert!(
+        output.status.success(),
+        "native async send regression failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
 
 /// End-to-end proof that concurrent async calls on one context both complete.
 ///

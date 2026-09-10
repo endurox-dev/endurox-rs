@@ -1,0 +1,11 @@
+[package]
+name = "rs-it-tpscript"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+endurox-rs = { path = "../.." }
+
+[features]
+ctx-send = ["endurox-rs/ctx-send"]

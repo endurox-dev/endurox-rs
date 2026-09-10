@@ -6,7 +6,7 @@
 )]
 use std::ffi::CStr;
 
-pub use endurox_rs_derive::{UbfDeserialize, UbfSerialize};
+pub use endurox_rs_derive::{UbfDeserialize, UbfSerialize, ViewDeserialize, ViewSerialize};
 
 pub(crate) mod raw {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
@@ -27,12 +27,16 @@ mod atmictx_xatmi;
 mod errors;
 mod flags;
 mod nstdutil;
+mod script_buffers;
+mod tpscript;
 mod tpsvcinfo;
 mod typed_buf;
 mod typed_ubf;
 mod typed_view;
 mod types;
+mod ubf_complex;
 mod ubf_serde;
+mod view_serde;
 
 #[cfg(feature = "async")]
 pub use async_atmi::{AsyncAtmiCtx, AsyncReplyDriver};
@@ -50,10 +54,18 @@ pub use atmictx_srv::{
 pub use atmictx_ubf::{BFldLocInfo, UbfExprCallback, UbfExprCallback2, UbfExprTree, UbfFieldType};
 pub use errors::{AtmiError, AtmiResult, NstdError, NstdResult, UbfError, UbfResult};
 pub use flags::{
-    TPBLK_ALL, TPBLK_NEXT, TPCONV, TPEX_STRING, TPGETANY, TPNOBLOCK, TPNOCHANGE, TPNOREPLY,
-    TPNOTIME, TPNOTRAN, TPRECVONLY, TPSENDONLY, TPSIGRSTRT, TPTRAN, TPTRANSUSPEND,
+    TPABSOLUTE, TPBLK_ALL, TPBLK_NEXT, TPCONV, TPEX_STRING, TPGETANY, TPNOBLOCK, TPNOCHANGE,
+    TPNOREPLY, TPNOTIME, TPNOTRAN, TPRECVONLY, TPSENDONLY, TPSIGRSTRT, TPTRAN, TPTRANSUSPEND,
 };
 pub use nstdutil::NdrxStdCfgStr;
+pub use script_buffers::{ScriptBuffers, ScriptSlot};
+pub use tpscript::{
+    ScriptBytecode, ScriptCallback, ScriptCallbackContext, ScriptConfig, ScriptError, ScriptResult,
+    ScriptVm,
+};
+pub const NDRX_TPSCR_PACKAGE: i64 = raw::NDRX_TPSCR_PACKAGE as i64;
+pub const NDRX_TPSCR_REPLACE: i64 = raw::NDRX_TPSCR_REPLACE as i64;
+pub const NDRX_TPSCR_FLAT: i64 = raw::NDRX_TPSCR_FLAT as i64;
 pub use tpsvcinfo::TpSvcInfo;
 pub use typed_buf::{TpTypeInfo, TypedBuffer};
 pub use typed_ubf::{
@@ -62,10 +74,18 @@ pub use typed_ubf::{
 };
 pub use typed_view::{BvNextState, IntoViewValue, TypedView, ViewValue, BVACCESS_NOTNULL};
 pub use types::{ClientId, TpTranId};
+#[doc(hidden)]
+pub use ubf_serde::{ubf_group_clear, ubf_group_field_check, ubf_mapping_present, ubf_occurrence};
 pub use ubf_serde::{
-    ubf_read_adhoc, ubf_read_nested, ubf_write_adhoc, ubf_write_nested, UbfAdhoc, UbfCarray,
-    UbfDeserialize, UbfFieldDeserialize, UbfFieldSerialize, UbfSerialize,
+    ubf_read_adhoc, ubf_read_nested, ubf_read_ptr, ubf_write_adhoc, ubf_write_nested,
+    ubf_write_ptr, EmbeddedUbf, EmbeddedView, PointerUbf, PointerView, UbfAdhoc, UbfCarray,
+    UbfDeserialize, UbfFieldDeserialize, UbfFieldSerialize, UbfGroupDeserialize,
+    UbfGroupFieldDeserialize, UbfGroupFieldSerialize, UbfGroupSerialize, UbfMappedDeserialize,
+    UbfMappedSerialize, UbfMapping, UbfSerialize,
 };
+#[doc(hidden)]
+pub use view_serde::check_view;
+pub use view_serde::{ViewDeserialize, ViewFieldDeserialize, ViewFieldSerialize, ViewSerialize};
 
 pub const TPQCORRID: i64 = raw::TPQCORRID as i64;
 pub const TPQFAILUREQ: i64 = raw::TPQFAILUREQ as i64;

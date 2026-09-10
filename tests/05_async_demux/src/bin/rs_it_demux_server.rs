@@ -46,9 +46,15 @@ fn rs_demux_fast(ctx: &AtmiCtx, svc: &mut TpSvcInfo<'_>) {
     echo_back(ctx, svc, "FAST");
 }
 
+fn rs_demux_hold(ctx: &AtmiCtx, svc: &mut TpSvcInfo<'_>) {
+    std::thread::sleep(Duration::from_secs(2));
+    echo_back(ctx, svc, "HOLD");
+}
+
 fn rs_demux_init(ctx: &AtmiCtx, _args: &[String]) -> AtmiResult<()> {
     ctx.tpadvertise("RS_DEMUX_SLOW", rs_demux_slow)?;
     ctx.tpadvertise("RS_DEMUX_FAST", rs_demux_fast)?;
+    ctx.tpadvertise("RS_DEMUX_HOLD", rs_demux_hold)?;
     Ok(())
 }
 

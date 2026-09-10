@@ -15,3 +15,13 @@ VIEW TESTVIEW1
 	string	tstring		-	1	-	64	-
 	carray	tcarray		-	1	-	32	-
 END
+
+# Layout exercised by the Rust VIEW derives, including native C/L indicators.
+VIEW SERDE_VIEW
+    long    id      -   1   -   -   -
+    string  name    -   1   -   64  -
+    long    values  -   5   C   -   -
+    string  note    -   1   -   32  -
+    carray  blob    -   1   L   64  -
+    short   fixed   -   3   -   -   -
+END

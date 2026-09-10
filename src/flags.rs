@@ -20,3 +20,5 @@ pub const TPBLK_ALL: i64 = raw::TPBLK_ALL as i64;
 
 /// `tpencrypt`/`tpdecrypt`: input and output are NUL-terminated base64 strings.
 pub const TPEX_STRING: i64 = raw::TPEX_STRING as i64;
+/// Interpret a message priority as an absolute value in the range 1..=100.
+pub const TPABSOLUTE: i64 = raw::TPABSOLUTE as i64;

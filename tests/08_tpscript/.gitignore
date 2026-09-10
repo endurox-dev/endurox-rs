@@ -1,0 +1,7 @@
+/Cargo.lock
+/target/
+/conf/
+/log/
+/tmp/
+/ubftab/
+ULOG*

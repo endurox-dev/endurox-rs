@@ -1,6 +1,6 @@
 [package]
 name = "endurox-rs"
-version = "0.1.335"
+version = "0.1.340"
 edition = "2021"
 
 # REQUIRED by crates.io
@@ -15,14 +15,13 @@ documentation = "https://www.endurox.org/dokuwiki"
 keywords = ["middleware", "development", "endurox", "bindings", "rust"]
 categories = ["development-tools"]
 exclude = [
-    "CLAUDE.md",
     "target/**",
     "endurox-rs-derive/target/**",
 ]
 
 [dependencies]
 async-io = { version = "2", optional = true }
-endurox-rs-derive = { version = "0.1.0", path = "endurox-rs-derive" }
+endurox-rs-derive = { version = "0.1.1", path = "endurox-rs-derive" }
 libc = "0.2"
 tokio = { version = "1", features = ["net", "rt", "time"], optional = true }
 

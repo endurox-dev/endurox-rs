@@ -28,8 +28,8 @@ type CtxHandle = raw::TPCONTEXT_T;
 #[derive(Debug)]
 pub struct AtmiCtx {
     _marker: PhantomData<CtxMarker>,
-    // Service callbacks borrow libatmisrv's worker context. Such a view must
-    // neither terminate nor free the worker TLS when it goes out of scope.
+    // Native callbacks borrow the invoking context. Such a view must neither
+    // terminate nor free that context's TLS when it goes out of scope.
     borrowed: bool,
 
     #[cfg(feature = "ctx-send")]
@@ -96,7 +96,7 @@ impl AtmiCtx {
         if self.borrowed {
             return Err(AtmiError::new(
                 raw::TPEPROTO,
-                "cannot terminate a borrowed libatmisrv worker context",
+                "cannot terminate a borrowed native callback context",
             ));
         }
 
@@ -300,17 +300,17 @@ impl AtmiCtx {
         self.handle.as_ptr()
     }
 
-    /// Create a callback-scoped view of the current libatmisrv worker context.
+    /// Create a callback-scoped view of the current native ATMI context.
     ///
-    /// With `ctx-send`, the worker TLS is detached into an Object API handle
+    /// With `ctx-send`, the native TLS is detached into an Object API handle
     /// and restored when this value is dropped. Without `ctx-send`, calls use
-    /// the worker's current TLS directly and Drop is a no-op.
+    /// the current TLS directly and Drop is a no-op.
     ///
     /// # Safety
     ///
-    /// The current thread must be inside a libatmisrv service callback, and the
+    /// The current thread must be inside a native callback with active ATMI TLS, and the
     /// returned value must not outlive that callback.
-    pub(crate) unsafe fn borrow_current_worker() -> AtmiResult<Self> {
+    pub(crate) unsafe fn borrow_current_context() -> AtmiResult<Self> {
         #[cfg(not(feature = "ctx-send"))]
         {
             Ok(Self {
@@ -334,7 +334,7 @@ impl AtmiCtx {
             } else {
                 Err(AtmiError::new(
                     raw::TPEPROTO,
-                    "libatmisrv worker callback has no active ATMI context",
+                    "native callback has no active ATMI context",
                 ))
             }
         }
@@ -364,8 +364,8 @@ impl Drop for AtmiCtx {
             let handle = self.handle.get();
             if !handle.is_null() {
                 if self.borrowed {
-                    // Restore libatmisrv's worker TLS before returning through
-                    // the C dispatcher. The worker owns and terminates it.
+                    // Restore native TLS before returning through the C
+                    // callback. The native caller owns and terminates it.
                     let _ = raw::tpsetctxt(handle, 0);
                 } else {
                     // tpfreectxt only runs tpterm automatically for a context

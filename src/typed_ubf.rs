@@ -4,8 +4,8 @@ use std::ffi::{CStr, CString};
 use std::ops::{Deref, DerefMut};
 
 use crate::{
-    raw, AtmiCtx, AtmiError, BFldLocInfo, TypedBuffer, UbfError, UbfExprTree, UbfFieldType,
-    UbfResult,
+    raw, AtmiCtx, AtmiError, BFldLocInfo, TypedBuffer, TypedView, UbfError, UbfExprTree,
+    UbfFieldType, UbfResult,
 };
 
 /// Value that can be written into a UBF field.
@@ -31,7 +31,9 @@ pub enum UbfValue<'ctx> {
     /// Pointer field containing another typed ATMI buffer.
     Ptr(TypedBuffer<'ctx>),
     /// Embedded UBF field.
-    Ubf(TypedUbf<'ctx>), //Ubf(TypedView<'ctx>) - TODO
+    Ubf(TypedUbf<'ctx>),
+    /// Embedded VIEW field.
+    View(TypedView<'ctx>),
 }
 
 /// Value read dynamically from a UBF field based on the field id type.
@@ -176,6 +178,12 @@ impl<'ctx> FastAdder<'_, 'ctx> {
     }
 }
 
+impl<'ctx> IntoUbfValue<'ctx> for TypedView<'ctx> {
+    fn into_ubf_value(self) -> UbfValue<'ctx> {
+        UbfValue::View(self)
+    }
+}
+
 /// UBF-typed buffer: logically a UBF atmibuf.
 #[derive(Debug)]
 pub struct TypedUbf<'ctx> {
@@ -308,8 +316,8 @@ impl<'ctx> TypedUbf<'ctx> {
 
     /// Convert a generic typed buffer into a UBF buffer wrapper.
     ///
-    /// The caller must know that the wrapped ATMI buffer is actually a UBF
-    /// buffer, for example because it came from `tpalloc("UBF", ...)`.
+    /// Validates the native allocation type and returns `BTYPERR` for non-UBF
+    /// buffers.
     pub fn from_typed(buf: TypedBuffer<'ctx>) -> UbfResult<Self> {
         match buf.tptypes() {
             Ok(info) if info.type_name == "UBF" => Ok(TypedUbf { inner: buf }),
@@ -371,7 +379,7 @@ impl<'ctx> TypedUbf<'ctx> {
     }
 
     /// Reallocate the buffer twice of the size
-    fn grow_buffer(&mut self) -> UbfResult<()> {
+    pub(crate) fn grow_buffer(&mut self) -> UbfResult<()> {
         let cur_size = self.bsizeof()?;
         self.inner.tprealloc(cur_size * 2).map_err(|e: AtmiError| {
             // Reuse the message from AtmiError, change the code to BMALLOC
@@ -382,8 +390,11 @@ impl<'ctx> TypedUbf<'ctx> {
 
     /// Change or add a UBF field occurrence.
     ///
-    /// Wraps `CBchg(3)` for scalar values and `Bchg(3)` for embedded UBF
-    /// values.
+    /// Wraps `CBchg(3)` for scalar values and `Bchg(3)` for embedded UBF/VIEW
+    /// values. An embedded UBF must be pointer-free: one that owns `BFLD_PTR`
+    /// targets is rejected, since the inline copy would share them with the
+    /// consumed original — store such sub-buffers behind `BFLD_PTR` instead.
+    /// Replacing an owned complex value frees the previous targets.
     ///
     /// If `realloc` is true and Enduro/X reports `BNOSPACE`, the buffer is
     /// grown and the operation is retried.
@@ -474,51 +485,24 @@ impl<'ctx> TypedUbf<'ctx> {
         &mut self,
         bfldid: i32,
         occ: i32,
-        mut v: UbfValue<'ctx>,
+        v: UbfValue<'ctx>,
         realloc: bool,
         add: bool,
     ) -> UbfResult<()> {
         self.check_pointer_field_write(bfldid, &v)?;
 
+        let complex_occ = if add {
+            i32::try_from(self.ctx().boccur(self, bfldid)?)
+                .map_err(|_| UbfError::new(UbfError::BEINVAL, "too many occurrences"))?
+        } else {
+            occ
+        };
+        let mut v = match v {
+            UbfValue::Ubf(ubf) => return self.put_embedded_ubf(bfldid, complex_occ, ubf, realloc),
+            UbfValue::View(view) => return self.bchg_view(bfldid, complex_occ, &view, realloc),
+            other => other,
+        };
         loop {
-            if let UbfValue::Ubf(ubf) = &mut v {
-                if add {
-                    return Err(UbfError::new(
-                        UbfError::BEINVAL,
-                        "adding embedded UBF fields is not supported",
-                    ));
-                }
-                if self.inner.ctx.ubf_has_pointer_fields(ubf)? {
-                    // Embedding copies the sub-buffer's bytes, including any
-                    // stored pointer addresses. The value is consumed here and
-                    // dropped on return, which frees those targets while the
-                    // embedded copy still references them.
-                    return Err(UbfError::new(
-                        UbfError::BEINVAL,
-                        "cannot embed a UBF containing BFLD_PTR fields: the copy \
-                         would keep the pointers while the consumed original frees \
-                         their targets",
-                    ));
-                }
-                let rc = self.inner.ctx.bchg_ubf_value(
-                    self,
-                    bfldid as raw::BFLDID,
-                    occ as raw::BFLDOCC,
-                    ubf,
-                );
-
-                if rc == 0 {
-                    return Ok(());
-                }
-
-                let err = self.inner.ctx.ubf_last_error();
-                if err.code == UbfError::BNOSPACE && realloc {
-                    self.grow_buffer()?;
-                    continue;
-                }
-                return Err(err);
-            }
-
             let mut _string_storage: Option<CString> = None;
             let mut empty_carray = [0u8; 1];
             // CBchg/CBadd take a pointer *to* the value. For BFLD_PTR the value
@@ -558,7 +542,7 @@ impl<'ctx> TypedUbf<'ctx> {
                         raw::BFLD_PTR,
                     )
                 }
-                UbfValue::Ubf(_) => unreachable!("handled before typed write"),
+                UbfValue::Ubf(_) | UbfValue::View(_) => unreachable!("handled before typed write"),
             };
             let stores_ptr = matches!(v, UbfValue::Ptr(_));
             // A replacing write to an occupied BFLD_PTR occurrence orphans the
@@ -570,6 +554,9 @@ impl<'ctx> TypedUbf<'ctx> {
                 None
             };
 
+            if replaced_ptr.is_some() {
+                self.ensure_owned_tree()?;
+            }
             let rc = if add {
                 self.inner
                     .ctx
@@ -671,10 +658,10 @@ impl<'ctx> TypedUbf<'ctx> {
                         raw::BFLD_PTR,
                     )
                 }
-                UbfValue::Ubf(_) => {
+                UbfValue::Ubf(_) | UbfValue::View(_) => {
                     return Err(UbfError::new(
                         UbfError::BEINVAL,
-                        "fast-add embedded UBF fields is not supported",
+                        "fast-add embedded UBF/VIEW fields is not supported",
                     ))
                 }
             };
@@ -944,7 +931,12 @@ impl<'ctx> TypedUbf<'ctx> {
         Ok(())
     }
 
-    fn require_field_type(&self, bfldid: i32, want: UbfFieldType, what: &str) -> UbfResult<()> {
+    pub(crate) fn require_field_type(
+        &self,
+        bfldid: i32,
+        want: UbfFieldType,
+        what: &str,
+    ) -> UbfResult<()> {
         let got = self.inner.ctx.bfldtype(bfldid as raw::BFLDID)?;
         if got != want {
             return Err(UbfError::new(
@@ -1083,8 +1075,11 @@ impl<'ctx> TypedUbf<'ctx> {
     /// no longer cascades into the target (`Bdel` drops only the reference; it
     /// does not free the target). The returned buffer owns its allocation and
     /// may be modified and reallocated freely.
+    /// Shared/cyclic pointer graphs are rejected; deep-clone an acyclic shared
+    /// graph first so the extracted target has exactly one owner.
     pub fn bextract_ptr(&mut self, bfldid: i32, occ: i32) -> UbfResult<TypedBuffer<'ctx>> {
         let target = self.read_ptr_field(bfldid, occ)?;
+        self.ensure_owned_tree()?;
         let ctx = self.inner.ctx;
         ctx.bdel(self, bfldid as raw::BFLDID, occ as raw::BFLDOCC)?;
         // SAFETY: the field no longer references `target`, so the parent will

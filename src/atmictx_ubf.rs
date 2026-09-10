@@ -7,7 +7,7 @@ use std::ffi::{CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Mutex, OnceLock};
 
-/// Fast-add location state used by [`TypedUbf::badd_fast`](crate::TypedUbf::badd_fast).
+/// Fast-add location state used by [`TypedUbf::fast_adder`].
 ///
 /// The native cursor caches a position *inside* a specific buffer allocation.
 /// It is invalidated by anything that relocates that allocation, and it is
@@ -1017,8 +1017,8 @@ impl AtmiCtx {
     /// Rejected with `BEINVAL` when `src` contains `BFLD_PTR` fields at any
     /// depth. `Bcpy` copies the stored *addresses*, so both buffers would then
     /// reference the same targets while each believes it owns them: dropping
-    /// `src` frees targets that `dst` still points at. Deep-copying the targets
-    /// is not implemented; extract the pointers and rebuild them explicitly.
+    /// `src` frees targets that `dst` still points at. Use `TypedUbf::deep_clone`
+    /// when an independent copy of the pointer targets is required.
     pub fn bcpy(&self, dst: &mut TypedUbf<'_>, src: &TypedUbf<'_>) -> UbfResult<()> {
         self.reject_pointer_copy(src, "Bcpy")?;
         #[cfg(not(feature = "ctx-send"))]

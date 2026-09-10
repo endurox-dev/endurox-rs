@@ -1,8 +1,8 @@
 [package]
 name = "endurox-rs-derive"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
-description = "Derive macros for endurox-rs UBF serde support."
+description = "Derive macros for endurox-rs UBF and VIEW structure mappings."
 license = "AGPL-3.0"
 repository = "https://github.com/endurox-dev/endurox-rs"
 homepage = "https://www.mavimax.com"

@@ -58,9 +58,21 @@ fi
 
 sleep 2
 
-if ! "$PROJECT_DIR/target/debug/rs_it_demux_client"; then
-    dump_logs
-    exit 1
+if [ "${1:-}" = "--send-only" ]; then
+    # Send backpressure uses timers, so it can be tested even when the installed
+    # queue backend has no reactor-compatible reply fd. The ignored unit test
+    # supplies a socket registration and exercises real native queue sends.
+    export ENDUROX_RS_TEST_SEND_DOMAIN=1
+    if ! cargo test --manifest-path "$PROJECT_DIR/Cargo.toml" --features tokio --lib \
+        native_queue_pressure_preserves_priority -- --ignored --test-threads=1; then
+        dump_logs
+        exit 1
+    fi
+else
+    if ! "$PROJECT_DIR/target/debug/rs_it_demux_client"; then
+        dump_logs
+        exit 1
+    fi
 fi
 
 xadmin psc

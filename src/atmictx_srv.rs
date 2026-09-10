@@ -271,7 +271,7 @@ unsafe extern "C" fn rust_service_dispatch(svc_ptr: *mut raw::TPSVCINFO) {
     let worker_ctx = if is_main_thread {
         None
     } else {
-        match AtmiCtx::borrow_current_worker() {
+        match AtmiCtx::borrow_current_context() {
             Ok(ctx) => Some(ctx),
             Err(_) => {
                 fail_current_service(svc_ptr);
@@ -493,7 +493,7 @@ unsafe extern "C" fn rust_thread_init(argc: c_int, argv: *mut *mut c_char) -> c_
         return raw::EXSUCCEED as c_int;
     };
 
-    let ctx = match AtmiCtx::borrow_current_worker() {
+    let ctx = match AtmiCtx::borrow_current_context() {
         Ok(ctx) => ctx,
         Err(err) => return record(err),
     };
@@ -521,7 +521,7 @@ unsafe extern "C" fn rust_thread_done() {
     };
 
     if let Some(hook) = hook {
-        if let Ok(ctx) = AtmiCtx::borrow_current_worker() {
+        if let Ok(ctx) = AtmiCtx::borrow_current_context() {
             let _ = catch_unwind(AssertUnwindSafe(|| hook(&ctx)));
         }
     }
