@@ -1,3 +1,4 @@
+//! Service request metadata and ownership of incoming typed buffers.
 use crate::{raw, AtmiCtx, TypedBuffer, TypedUbf};
 use core::ffi::c_char;
 use std::ffi::CStr;
@@ -16,7 +17,10 @@ pub struct TpSvcInfo<'ctx> {
     data: Option<TypedBuffer<'ctx>>,
 }
 
+/// Request metadata access and transfer of the incoming service buffer.
 impl<'ctx> TpSvcInfo<'ctx> {
+    /// Wrap a native service request and take ownership of its incoming data buffer.
+    ///
     /// # Safety
     /// - `raw` must be a valid TPSVCINFO pointer supplied by XATMI.
     /// - `ctx` must be the current ATMI context for this thread.
@@ -31,11 +35,13 @@ impl<'ctx> TpSvcInfo<'ctx> {
         TpSvcInfo { raw, ctx, data }
     }
 
+    /// Borrow the native service metadata for reading.
     #[inline]
     fn raw(&self) -> &raw::TPSVCINFO {
         unsafe { &*self.raw }
     }
 
+    /// Borrow the native service metadata for updating.
     #[inline]
     fn raw_mut(&mut self) -> &mut raw::TPSVCINFO {
         unsafe { &mut *self.raw }
@@ -64,30 +70,45 @@ impl<'ctx> TpSvcInfo<'ctx> {
         self.raw().len
     }
 
+    /// Update the length in the service metadata; the owned buffer’s tracked length is unchanged.
+    ///
+    /// # Arguments
+    ///
+    /// - `len`: Request length in bytes to record in `TPSVCINFO`.
     pub fn set_len(&mut self, len: i64) {
         self.raw_mut().len = len;
     }
 
+    /// Return the request’s native XATMI flags.
     pub fn flags(&self) -> i64 {
         self.raw().flags
     }
 
+    /// Replace the flags in the service metadata.
+    ///
+    /// # Arguments
+    ///
+    /// - `flags`: Replacement XATMI request flag bitmask.
     pub fn set_flags(&mut self, flags: i64) {
         self.raw_mut().flags = flags;
     }
 
+    /// Return the native call or conversation descriptor for this request.
     pub fn cd(&self) -> i32 {
         self.raw().cd
     }
 
+    /// Return the requesting client’s application authentication key.
     pub fn appkey(&self) -> i64 {
         self.raw().appkey
     }
 
+    /// Copy the client identifier used to send unsolicited notifications.
     pub fn cltid(&self) -> crate::ClientId {
         self.raw().cltid
     }
 
+    /// Return the still-owned request buffer pointer, or null after it has been taken.
     pub(crate) fn data_ptr(&self) -> *mut c_char {
         self.data
             .as_ref()

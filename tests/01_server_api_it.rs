@@ -10,6 +10,12 @@ fn xatmi_server_client_tpcall_ubf_roundtrip() {
 }
 
 #[test]
+fn event_request_logging_and_dlm_apis() {
+    run_xatmi_server_client_scenario("api-additions");
+    run_xatmi_server_client_scenario_with_feature("api-additions", "ctx-send");
+}
+
+#[test]
 fn xatmi_server_client_tpacall_ubf_roundtrip() {
     run_xatmi_server_client_scenario("tpacall");
 }

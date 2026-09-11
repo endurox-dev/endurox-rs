@@ -1,11 +1,11 @@
 use endurox_rs::{
-    ubf_fields as f, AtmiCtx, AtmiError, ScriptBuffers, ScriptError, ScriptResult, ScriptSlot as S,
-    ScriptVm, TypedUbf, NDRX_TPSCR_FLAT, NDRX_TPSCR_PACKAGE, NDRX_TPSCR_REPLACE,
+    ubf_fields as f, AtmiCtx, AtmiError, TpScrBuffers, TpScrError, TpScrResult, TpScrSlot as S,
+    TpScrVm, TypedUbf, NDRX_TPSCR_FLAT, NDRX_TPSCR_PACKAGE, NDRX_TPSCR_REPLACE,
 };
 use std::cell::Cell;
 use std::rc::Rc;
 
-fn load(vm: &mut ScriptVm<'_>, name: &str, body: &str) -> ScriptResult<()> {
+fn load(vm: &mut TpScrVm<'_>, name: &str, body: &str) -> TpScrResult<()> {
     vm.tpscrloadstr(
         name,
         format!(
@@ -17,7 +17,7 @@ fn load(vm: &mut ScriptVm<'_>, name: &str, body: &str) -> ScriptResult<()> {
     )
 }
 
-fn run() -> ScriptResult<()> {
+fn run() -> TpScrResult<()> {
     let ctx = AtmiCtx::new()?;
     ctx.tpinit()?;
     if std::env::args().any(|arg| arg == "noplugin") {
@@ -30,7 +30,7 @@ fn run() -> ScriptResult<()> {
         return Ok(());
     }
     let mut vm = ctx.tpscrinit(None, 0)?;
-    let mut buffers = ScriptBuffers::new(&ctx);
+    let mut buffers = TpScrBuffers::new(&ctx);
     vm.tpscrseterror(1234, "manual error")?;
     assert_eq!(vm.tpscrerrno(), 1234);
     assert_eq!(vm.tpscrerror(), "manual error");
@@ -131,7 +131,7 @@ fn run() -> ScriptResult<()> {
                 S::Output,
                 Some(call.context().tpalloc_carray(b"failure-output")?),
             )?;
-            Err(ScriptError::new(7777, "Rust callback error"))
+            Err(TpScrError::new(7777, "Rust callback error"))
         },
         0,
     )?;
@@ -222,7 +222,7 @@ fn run() -> ScriptResult<()> {
     vm.tpscrregcb(
         "panic_cb",
         |_, args| {
-            args.edit_ubf(S::Input, |ubf| -> ScriptResult<()> {
+            args.edit_ubf(S::Input, |ubf| -> TpScrResult<()> {
                 ubf.tprealloc(65536)?;
                 ubf.bchg(f::T_LONG_FLD, 0, 123i64, true)?;
                 panic!("intentional Rust callback panic");
@@ -268,7 +268,7 @@ fn run() -> ScriptResult<()> {
     vm.tpscrregcb(
         "replace_args",
         |call, args| {
-            *args = ScriptBuffers::new(call.context());
+            *args = TpScrBuffers::new(call.context());
             args.set(
                 S::Output,
                 Some(call.context().tpalloc_carray(b"whole-container")?),

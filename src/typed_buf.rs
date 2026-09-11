@@ -1,3 +1,4 @@
+//! Native typed-buffer ownership, tracked payload lengths, and checked byte access.
 use crate::{raw, AtmiCtx, AtmiError, AtmiResult};
 use core::ffi::{c_char, c_long};
 use std::ffi::CStr;
@@ -36,7 +37,15 @@ pub struct TypedBuffer<'ctx> {
     len: usize,
 }
 
+/// Typed allocation ownership, payload-length tracking, and checked buffer access.
 impl<'ctx> TypedBuffer<'ctx> {
+    /// Take ownership of a native typed buffer with an initially untracked payload length.
+    ///
+    /// # Arguments
+    ///
+    /// - `ctx`: Context that remains borrowed while this buffer wrapper exists.
+    /// - `raw`: Native typed-buffer allocation to wrap.
+    ///
     /// # Safety
     /// `raw` must be a valid `atmibuf*` allocated for this context and owned by the caller.
     pub(crate) unsafe fn from_raw(ctx: &'ctx AtmiCtx, raw: *mut c_char) -> Self {
@@ -48,6 +57,14 @@ impl<'ctx> TypedBuffer<'ctx> {
         }
     }
 
+    /// Take ownership of a native typed buffer and record its payload length.
+    ///
+    /// # Arguments
+    ///
+    /// - `ctx`: Context that remains borrowed while this buffer wrapper exists.
+    /// - `raw`: Native typed-buffer allocation to wrap.
+    /// - `len`: Logical payload length in bytes, separate from allocation capacity.
+    ///
     /// # Safety
     /// `raw` must be a valid `atmibuf*` allocated for this context and owned by the caller.
     pub(crate) unsafe fn from_raw_with_len(
@@ -63,6 +80,13 @@ impl<'ctx> TypedBuffer<'ctx> {
         }
     }
 
+    /// Wrap a native typed buffer without taking responsibility for freeing it.
+    ///
+    /// # Arguments
+    ///
+    /// - `ctx`: Context that remains borrowed while this buffer wrapper exists.
+    /// - `raw`: Native typed-buffer allocation to wrap.
+    ///
     /// # Safety
     /// `raw` must be a valid `atmibuf*` owned by the caller for at least `'ctx`.
     pub(crate) unsafe fn borrowed_from_raw(ctx: &'ctx AtmiCtx, raw: *mut c_char) -> Self {
@@ -94,6 +118,12 @@ impl<'ctx> TypedBuffer<'ctx> {
         self.ptr
     }
 
+    /// Transfer this buffer to a wrapper borrowing another ATMI context.
+    ///
+    /// # Arguments
+    ///
+    /// - `new_ctx`: Context to borrow for the returned buffer’s lifetime.
+    ///
     /// # Safety
     /// Retie this buffer to a *different* context.
     ///
@@ -105,6 +135,11 @@ impl<'ctx> TypedBuffer<'ctx> {
     }
 
     /// Update the internal pointer after a C API may have reallocated the buffer.
+    ///
+    /// # Arguments
+    ///
+    /// - `new_ptr`: Pointer returned by the native operation; the old pointer is not freed here.
+    ///
     #[inline]
     pub(crate) fn replace_ptr(&mut self, new_ptr: *mut c_char) {
         self.ptr = new_ptr;
@@ -124,6 +159,10 @@ impl<'ctx> TypedBuffer<'ctx> {
 
     /// Record a length Enduro/X itself reported for this buffer.
     ///
+    /// # Arguments
+    ///
+    /// - `len`: Logical payload length in bytes, separate from allocation capacity.
+    ///
     /// Internal, and unchecked by design: the value comes from an `olen`
     /// out-parameter, so it is within the allocation by construction. Doing a
     /// `tptypes()` round trip to re-verify it would add an FFI call to every
@@ -139,6 +178,10 @@ impl<'ctx> TypedBuffer<'ctx> {
     }
 
     /// Reject byte-level operations on buffers whose layout Enduro/X owns.
+    ///
+    /// # Arguments
+    ///
+    /// - `op`: Operation name included in a wrong-buffer-type error.
     ///
     /// CARRAY is the only type whose payload is a plain byte range carrying a
     /// separately tracked length. UBF and VIEW hold an internal header that raw
@@ -167,8 +210,12 @@ impl<'ctx> TypedBuffer<'ctx> {
 
     /// Set the user data length in bytes used as `ilen` for XATMI calls.
     ///
-    /// CARRAY only. A UBF or VIEW records its own extent in a header, and
-    /// resizing one through this path both means nothing and zeroes the header.
+    /// # Arguments
+    ///
+    /// - `len`: Logical payload length in bytes, separate from allocation capacity.
+    ///
+    /// CARRAY only. UBF and VIEW use native layouts and must be modified through
+    /// their typed accessors. This method changes only the tracked length.
     ///
     /// Fails with `TPEINVAL` if `len` exceeds the allocation. Accepting a larger
     /// value would make [`Self::as_bytes`] construct a slice past the end of the
@@ -223,6 +270,10 @@ impl<'ctx> TypedBuffer<'ctx> {
 
     /// Copy `bytes` into the buffer, growing it via [`Self::tprealloc`] if needed,
     /// and update `len()` to `bytes.len()`.
+    ///
+    /// # Arguments
+    ///
+    /// - `bytes`: Replacement CARRAY payload; its length becomes the tracked payload length.
     ///
     /// CARRAY only, for the reasons given on [`Self::as_bytes_mut`]. Copying a
     /// serialised UBF in with this would reproduce its pointer fields as bare
@@ -283,6 +334,11 @@ impl<'ctx> TypedBuffer<'ctx> {
     }
 
     /// Reallocate this buffer with a new size using `tprealloc`.
+    ///
+    /// # Arguments
+    ///
+    /// - `new_size`: Requested allocation size in bytes; must fit the native length type and
+    ///   any VIEW layout.
     ///
     /// On success, `self` will point to the new buffer.
     /// On failure, `self` remains valid and unchanged, and the error is returned.
@@ -364,7 +420,9 @@ impl<'ctx> TypedBuffer<'ctx> {
     }
 }
 
+/// Free the native allocation when this wrapper owns it.
 impl<'ctx> Drop for TypedBuffer<'ctx> {
+    /// Free the native allocation when this wrapper owns it.
     fn drop(&mut self) {
         if self.owned && !self.ptr.is_null() {
             #[cfg(not(feature = "ctx-send"))]

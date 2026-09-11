@@ -1,3 +1,4 @@
+//! Typed UBF field access, conversion, iteration, and borrowed child-buffer views.
 // src/typed_ubf.rs
 use core::ffi::{c_char, c_int};
 use std::ffi::{CStr, CString};
@@ -50,112 +51,149 @@ pub enum UbfGetValue<'a, 'ctx> {
 
 /// Converts ordinary Rust values into values accepted by UBF write methods.
 pub trait IntoUbfValue<'ctx> {
+    /// Convert this value into the corresponding UBF write variant.
     fn into_ubf_value(self) -> UbfValue<'ctx>;
 }
 
+/// Conversion of `UbfValue<'ctx>` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for UbfValue<'ctx> {
+    /// Convert this value into the corresponding UBF write variant.
     fn into_ubf_value(self) -> UbfValue<'ctx> {
         self
     }
 }
 
+/// Conversion of `i16` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for i16 {
+    /// Convert this value into the corresponding UBF write variant.
     fn into_ubf_value(self) -> UbfValue<'ctx> {
         UbfValue::Short(self)
     }
 }
 
+/// Conversion of `i64` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for i64 {
+    /// Convert this value into the corresponding UBF write variant.
     fn into_ubf_value(self) -> UbfValue<'ctx> {
         UbfValue::Long(self)
     }
 }
 
+/// Conversion of `isize` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for isize {
+    /// Convert this value into the corresponding UBF write variant.
     fn into_ubf_value(self) -> UbfValue<'ctx> {
         UbfValue::Long(self as i64)
     }
 }
 
+/// Conversion of `i32` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for i32 {
+    /// Convert this value into the corresponding UBF write variant.
     fn into_ubf_value(self) -> UbfValue<'ctx> {
         UbfValue::Long(self as i64)
     }
 }
 
+/// Conversion of `u64` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for u64 {
+    /// Convert this value into the corresponding UBF write variant.
     fn into_ubf_value(self) -> UbfValue<'ctx> {
         UbfValue::Long(self as i64)
     }
 }
 
+/// Conversion of `usize` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for usize {
+    /// Convert this value into the corresponding UBF write variant.
     fn into_ubf_value(self) -> UbfValue<'ctx> {
         UbfValue::Long(self as i64)
     }
 }
 
+/// Conversion of `u32` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for u32 {
+    /// Convert this value into the corresponding UBF write variant.
     fn into_ubf_value(self) -> UbfValue<'ctx> {
         UbfValue::Long(self as i64)
     }
 }
 
+/// Conversion of `u16` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for u16 {
+    /// Convert this value into the corresponding UBF write variant.
     fn into_ubf_value(self) -> UbfValue<'ctx> {
         UbfValue::Short(self as i16)
     }
 }
 
+/// Conversion of `u8` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for u8 {
+    /// Convert this value into the corresponding UBF write variant.
     fn into_ubf_value(self) -> UbfValue<'ctx> {
         UbfValue::Short(self as i16)
     }
 }
 
+/// Conversion of `i8` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for i8 {
+    /// Convert this value into the corresponding UBF write variant.
     fn into_ubf_value(self) -> UbfValue<'ctx> {
         UbfValue::Char(self)
     }
 }
 
+/// Conversion of `f32` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for f32 {
+    /// Convert this value into the corresponding UBF write variant.
     fn into_ubf_value(self) -> UbfValue<'ctx> {
         UbfValue::Float(self)
     }
 }
 
+/// Conversion of `f64` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for f64 {
+    /// Convert this value into the corresponding UBF write variant.
     fn into_ubf_value(self) -> UbfValue<'ctx> {
         UbfValue::Double(self)
     }
 }
 
+/// Conversion of `String` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for String {
+    /// Convert this value into the corresponding UBF write variant.
     fn into_ubf_value(self) -> UbfValue<'ctx> {
         UbfValue::String(self)
     }
 }
 
+/// Conversion of `&str` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for &str {
+    /// Convert this value into the corresponding UBF write variant.
     fn into_ubf_value(self) -> UbfValue<'ctx> {
         UbfValue::String(self.to_string())
     }
 }
 
+/// Conversion of `Vec<u8>` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for Vec<u8> {
+    /// Convert this value into the corresponding UBF write variant.
     fn into_ubf_value(self) -> UbfValue<'ctx> {
         UbfValue::Carray(self)
     }
 }
 
+/// Conversion of `TypedBuffer<'ctx>` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for TypedBuffer<'ctx> {
+    /// Convert this value into the corresponding UBF write variant.
     fn into_ubf_value(self) -> UbfValue<'ctx> {
         UbfValue::Ptr(self)
     }
 }
 
+/// Conversion of `TypedUbf<'ctx>` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for TypedUbf<'ctx> {
+    /// Convert this value into the corresponding UBF write variant.
     fn into_ubf_value(self) -> UbfValue<'ctx> {
         UbfValue::Ubf(self)
     }
@@ -170,15 +208,26 @@ pub struct FastAdder<'a, 'ctx> {
     loc: BFldLocInfo,
 }
 
+/// Fast appends while holding an exclusive borrow of the destination UBF.
 impl<'ctx> FastAdder<'_, 'ctx> {
     /// Append one occurrence using the cached position.
+    ///
+    /// # Arguments
+    ///
+    /// - `bfldid`: Typed UBF field identifier, obtained from generated constants or
+    ///   `AtmiCtx::bfldid`.
+    /// - `v`: Value to write; owned buffers transfer into pointer fields only after a
+    ///   successful native write.
+    /// - `realloc`: Whether to grow the destination and retry when Enduro/X reports `BNOSPACE`.
     pub fn add(&mut self, bfldid: i32, v: impl IntoUbfValue<'ctx>, realloc: bool) -> UbfResult<()> {
         self.ubf
             .write_value_fast(bfldid, v.into_ubf_value(), &mut self.loc, realloc)
     }
 }
 
+/// Conversion of `TypedView<'ctx>` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for TypedView<'ctx> {
+    /// Convert this value into the corresponding UBF write variant.
     fn into_ubf_value(self) -> UbfValue<'ctx> {
         UbfValue::View(self)
     }
@@ -190,6 +239,7 @@ pub struct TypedUbf<'ctx> {
     inner: TypedBuffer<'ctx>,
 }
 
+/// Metadata for one field occurrence returned by `UbfIterator::next`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UbfField {
     pub field_id: i32,
@@ -198,6 +248,7 @@ pub struct UbfField {
     pub len: usize,
 }
 
+/// Independent fallible cursor over the field occurrences of a borrowed UBF.
 pub struct UbfIterator<'a, 'ctx> {
     ubf: &'a TypedUbf<'ctx>,
     field_id: raw::BFLDID,
@@ -225,7 +276,14 @@ pub struct BorrowedBuffer<'a, 'ctx> {
     _borrow: std::marker::PhantomData<&'a ()>,
 }
 
+/// Construction of a read-only view over another owner’s allocation.
 impl<'a, 'ctx> BorrowedBuffer<'a, 'ctx> {
+    /// Restrict an unowned typed-buffer wrapper to read-only access for the parent borrow.
+    ///
+    /// # Arguments
+    ///
+    /// - `inner`: Unowned typed-buffer wrapper whose allocation outlives the returned borrow.
+    ///
     /// # Safety
     /// `inner` must wrap a buffer owned by another party that outlives `'a`,
     /// and must have been built as unowned so that dropping it frees nothing.
@@ -237,9 +295,11 @@ impl<'a, 'ctx> BorrowedBuffer<'a, 'ctx> {
     }
 }
 
+/// Shared access to the underlying context or typed buffer.
 impl<'ctx> Deref for BorrowedBuffer<'_, 'ctx> {
     type Target = TypedBuffer<'ctx>;
 
+    /// Borrow the underlying typed buffer for shared access.
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
@@ -256,7 +316,15 @@ pub struct BorrowedUbf<'a, 'ctx> {
     _borrow: std::marker::PhantomData<&'a raw::UBFH>,
 }
 
+/// Read-only field access through a parent-borrowed UBF header.
 impl<'a, 'ctx> BorrowedUbf<'a, 'ctx> {
+    /// Borrow an embedded UBF without taking ownership of its storage.
+    ///
+    /// # Arguments
+    ///
+    /// - `ctx`: Context borrowed while the resulting UBF wrapper exists.
+    /// - `ptr`: Valid embedded UBF header owned by a parent that outlives the borrow.
+    ///
     /// # Safety
     /// `ptr` must point to a valid embedded UBF field owned by another UBF
     /// buffer that outlives `'a`.
@@ -268,12 +336,19 @@ impl<'a, 'ctx> BorrowedUbf<'a, 'ctx> {
         }
     }
 
+    /// Return the borrowed native UBF header pointer for internal calls.
     #[inline]
     pub(crate) fn as_ubfh(&self) -> *mut raw::UBFH {
         self.ptr
     }
 
     /// Read a field from this embedded UBF as a `String`.
+    ///
+    /// # Arguments
+    ///
+    /// - `bfldid`: Typed UBF field identifier, obtained from generated constants or
+    ///   `AtmiCtx::bfldid`.
+    /// - `occ`: Zero-based field occurrence to access.
     pub fn bget_string(&self, bfldid: i32, occ: i32) -> UbfResult<String> {
         self.ctx
             .reject_ptr_conversion(bfldid as raw::BFLDID, "bget_string")?;
@@ -297,7 +372,15 @@ impl<'a, 'ctx> BorrowedUbf<'a, 'ctx> {
     }
 }
 
+/// Typed field reads and writes, iteration, and complex-buffer access.
 impl<'ctx> TypedUbf<'ctx> {
+    /// Take ownership of a native UBF allocation.
+    ///
+    /// # Arguments
+    ///
+    /// - `ctx`: Context borrowed while the resulting UBF wrapper exists.
+    /// - `raw`: Valid native UBF allocation to wrap.
+    ///
     /// # Safety
     /// `raw` must be a valid UBF (`UBFH*`) allocated for this context.
     pub(crate) unsafe fn from_raw(ctx: &'ctx AtmiCtx, raw: *mut c_char) -> Self {
@@ -306,6 +389,13 @@ impl<'ctx> TypedUbf<'ctx> {
         }
     }
 
+    /// Wrap a UBF allocation without freeing it when the wrapper is dropped.
+    ///
+    /// # Arguments
+    ///
+    /// - `ctx`: Context borrowed while the resulting UBF wrapper exists.
+    /// - `raw`: Valid native UBF allocation to wrap.
+    ///
     /// # Safety
     /// `raw` must be a valid UBF pointer owned by another party.
     pub(crate) unsafe fn borrowed_from_raw(ctx: &'ctx AtmiCtx, raw: *mut c_char) -> Self {
@@ -315,6 +405,10 @@ impl<'ctx> TypedUbf<'ctx> {
     }
 
     /// Convert a generic typed buffer into a UBF buffer wrapper.
+    ///
+    /// # Arguments
+    ///
+    /// - `buf`: Owned typed buffer to validate and consume; it is dropped if validation fails.
     ///
     /// Validates the native allocation type and returns `BTYPERR` for non-UBF
     /// buffers.
@@ -361,6 +455,12 @@ impl<'ctx> TypedUbf<'ctx> {
         self.inner.as_ptr() as *mut raw::UBFH
     }
 
+    /// Transfer this UBF into a wrapper borrowing another context.
+    ///
+    /// # Arguments
+    ///
+    /// - `new_ctx`: Context permitted to use and free the transferred native buffer.
+    ///
     /// # Safety
     /// Move this UBF buffer to a different context.
     ///
@@ -378,7 +478,7 @@ impl<'ctx> TypedUbf<'ctx> {
         self.inner.ctx.bsizeof(self)
     }
 
-    /// Reallocate the buffer twice of the size
+    /// Double the buffer’s allocation capacity.
     pub(crate) fn grow_buffer(&mut self) -> UbfResult<()> {
         let cur_size = self.bsizeof()?;
         self.inner.tprealloc(cur_size * 2).map_err(|e: AtmiError| {
@@ -389,6 +489,15 @@ impl<'ctx> TypedUbf<'ctx> {
     }
 
     /// Change or add a UBF field occurrence.
+    ///
+    /// # Arguments
+    ///
+    /// - `bfldid`: Typed UBF field identifier, obtained from generated constants or
+    ///   `AtmiCtx::bfldid`.
+    /// - `occ`: Zero-based field occurrence to access.
+    /// - `v`: Value to write; owned buffers transfer into pointer fields only after a
+    ///   successful native write.
+    /// - `realloc`: Whether to grow the destination and retry when Enduro/X reports `BNOSPACE`.
     ///
     /// Wraps `CBchg(3)` for scalar values and `Bchg(3)` for embedded UBF/VIEW
     /// values. An embedded UBF must be pointer-free: one that owns `BFLD_PTR`
@@ -409,6 +518,14 @@ impl<'ctx> TypedUbf<'ctx> {
     }
 
     /// Add a new UBF field occurrence.
+    ///
+    /// # Arguments
+    ///
+    /// - `bfldid`: Typed UBF field identifier, obtained from generated constants or
+    ///   `AtmiCtx::bfldid`.
+    /// - `v`: Value to write; owned buffers transfer into pointer fields only after a
+    ///   successful native write.
+    /// - `realloc`: Whether to grow the destination and retry when Enduro/X reports `BNOSPACE`.
     pub fn badd(
         &mut self,
         bfldid: i32,
@@ -446,6 +563,10 @@ impl<'ctx> TypedUbf<'ctx> {
     }
 
     /// Point `loc` at this buffer, restarting it if it was positioned elsewhere.
+    ///
+    /// # Arguments
+    ///
+    /// - `loc`: Fast-append cursor belonging to this buffer; updated or reset as needed.
     fn sync_fast_cursor(&self, loc: &mut BFldLocInfo) {
         let current = self.inner.as_ptr();
         if !loc.belongs_to(current) {
@@ -457,6 +578,16 @@ impl<'ctx> TypedUbf<'ctx> {
     }
 
     /// Change or add a field based on `do_add`, matching Go's `BChgCombined`.
+    ///
+    /// # Arguments
+    ///
+    /// - `bfldid`: Typed UBF field identifier, obtained from generated constants or
+    ///   `AtmiCtx::bfldid`.
+    /// - `occ`: Zero-based occurrence to replace; ignored when `do_add` is true.
+    /// - `v`: Value to write; owned buffers transfer into pointer fields only after a
+    ///   successful native write.
+    /// - `do_add`: `true` to append after existing occurrences; `false` to write at `occ`.
+    /// - `realloc`: Whether to grow the destination and retry when Enduro/X reports `BNOSPACE`.
     pub fn bchg_combined(
         &mut self,
         bfldid: i32,
@@ -481,6 +612,17 @@ impl<'ctx> TypedUbf<'ctx> {
         }
     }
 
+    /// Write a scalar or complex value, handling growth and ownership of replaced targets.
+    ///
+    /// # Arguments
+    ///
+    /// - `bfldid`: Typed UBF field identifier, obtained from generated constants or
+    ///   `AtmiCtx::bfldid`.
+    /// - `occ`: Zero-based occurrence to replace; ignored when `add` is true.
+    /// - `v`: Value to write; owned buffers transfer into pointer fields only after a
+    ///   successful native write.
+    /// - `realloc`: Whether to grow the destination and retry when Enduro/X reports `BNOSPACE`.
+    /// - `add`: `true` to append after existing occurrences; `false` to write at `occ`.
     fn write_value(
         &mut self,
         bfldid: i32,
@@ -605,6 +747,16 @@ impl<'ctx> TypedUbf<'ctx> {
         }
     }
 
+    /// Append a scalar or pointer value using a cursor that is reset after allocation growth.
+    ///
+    /// # Arguments
+    ///
+    /// - `bfldid`: Typed UBF field identifier, obtained from generated constants or
+    ///   `AtmiCtx::bfldid`.
+    /// - `v`: Value to write; owned buffers transfer into pointer fields only after a
+    ///   successful native write.
+    /// - `loc`: Fast-append cursor belonging to this buffer; updated or reset as needed.
+    /// - `realloc`: Whether to grow the destination and retry when Enduro/X reports `BNOSPACE`.
     fn write_value_fast(
         &mut self,
         bfldid: i32,
@@ -703,6 +855,12 @@ impl<'ctx> TypedUbf<'ctx> {
 
     /// Read a UBF field occurrence as a `String`.
     ///
+    /// # Arguments
+    ///
+    /// - `bfldid`: Typed UBF field identifier, obtained from generated constants or
+    ///   `AtmiCtx::bfldid`.
+    /// - `occ`: Zero-based field occurrence to access.
+    ///
     /// Uses `CBget(3)` so Enduro/X performs type conversion from the stored
     /// field type to `BFLD_STRING`.
     pub fn bget_string(&self, bfldid: i32, occ: i32) -> UbfResult<String> {
@@ -729,6 +887,12 @@ impl<'ctx> TypedUbf<'ctx> {
     }
 
     /// Read a field occurrence dynamically based on the UBF field id type.
+    ///
+    /// # Arguments
+    ///
+    /// - `bfldid`: Typed UBF field identifier, obtained from generated constants or
+    ///   `AtmiCtx::bfldid`.
+    /// - `occ`: Zero-based field occurrence to access.
     pub fn bget<'a>(&'a self, bfldid: i32, occ: i32) -> UbfResult<UbfGetValue<'a, 'ctx>> {
         match self.inner.ctx.bfldtype(bfldid as raw::BFLDID)? {
             UbfFieldType::Short => Ok(UbfGetValue::Short(self.bget_short(bfldid, occ)?)),
@@ -747,6 +911,12 @@ impl<'ctx> TypedUbf<'ctx> {
     }
 
     /// Read a UBF field occurrence as an `i64`.
+    ///
+    /// # Arguments
+    ///
+    /// - `bfldid`: Typed UBF field identifier, obtained from generated constants or
+    ///   `AtmiCtx::bfldid`.
+    /// - `occ`: Zero-based field occurrence to access.
     ///
     /// Uses `CBget(3)` with `BFLD_LONG` as the requested target type.
     pub fn bget_long(&self, bfldid: i32, occ: i32) -> UbfResult<i64> {
@@ -772,6 +942,12 @@ impl<'ctx> TypedUbf<'ctx> {
 
     /// Read a UBF field occurrence as an `i16`.
     ///
+    /// # Arguments
+    ///
+    /// - `bfldid`: Typed UBF field identifier, obtained from generated constants or
+    ///   `AtmiCtx::bfldid`.
+    /// - `occ`: Zero-based field occurrence to access.
+    ///
     /// Uses `CBget(3)` with `BFLD_SHORT` as the requested target type.
     pub fn bget_short(&self, bfldid: i32, occ: i32) -> UbfResult<i16> {
         self.inner
@@ -795,6 +971,12 @@ impl<'ctx> TypedUbf<'ctx> {
     }
 
     /// Read a UBF field occurrence as an `f64`.
+    ///
+    /// # Arguments
+    ///
+    /// - `bfldid`: Typed UBF field identifier, obtained from generated constants or
+    ///   `AtmiCtx::bfldid`.
+    /// - `occ`: Zero-based field occurrence to access.
     ///
     /// Uses `CBget(3)` with `BFLD_DOUBLE` as the requested target type.
     pub fn bget_double(&self, bfldid: i32, occ: i32) -> UbfResult<f64> {
@@ -820,6 +1002,12 @@ impl<'ctx> TypedUbf<'ctx> {
 
     /// Read a UBF field occurrence as an `f32`.
     ///
+    /// # Arguments
+    ///
+    /// - `bfldid`: Typed UBF field identifier, obtained from generated constants or
+    ///   `AtmiCtx::bfldid`.
+    /// - `occ`: Zero-based field occurrence to access.
+    ///
     /// Uses `CBget(3)` with `BFLD_FLOAT` as the requested target type.
     pub fn bget_float(&self, bfldid: i32, occ: i32) -> UbfResult<f32> {
         self.inner
@@ -843,6 +1031,12 @@ impl<'ctx> TypedUbf<'ctx> {
     }
 
     /// Read a UBF field occurrence as an `i8`.
+    ///
+    /// # Arguments
+    ///
+    /// - `bfldid`: Typed UBF field identifier, obtained from generated constants or
+    ///   `AtmiCtx::bfldid`.
+    /// - `occ`: Zero-based field occurrence to access.
     ///
     /// Uses `CBget(3)` with `BFLD_CHAR` as the requested target type.
     pub fn bget_char(&self, bfldid: i32, occ: i32) -> UbfResult<i8> {
@@ -868,6 +1062,12 @@ impl<'ctx> TypedUbf<'ctx> {
 
     /// Read a UBF `BFLD_CARRAY` occurrence into an owned byte vector.
     ///
+    /// # Arguments
+    ///
+    /// - `bfldid`: Typed UBF field identifier, obtained from generated constants or
+    ///   `AtmiCtx::bfldid`.
+    /// - `occ`: Zero-based field occurrence to access.
+    ///
     /// The exact CARRAY length returned by Enduro/X is preserved.
     pub fn bget_bytes(&self, bfldid: i32, occ: i32) -> UbfResult<Vec<u8>> {
         self.inner
@@ -891,15 +1091,13 @@ impl<'ctx> TypedUbf<'ctx> {
         Ok(bytes)
     }
 
-    /// Read an embedded UBF occurrence as a borrowed read-only UBF view.
-    ///
-    /// The returned view is tied to this parent buffer and must not outlive it.
-    /// Refuse to interpret a field's bytes as a type it was not declared with.
-    ///
-    /// The field id encodes its type, so this is a cheap check. Without it,
-    /// `bget_ptr`/`bget_ubf` on a LONG field would read whatever eight bytes
-    /// happen to be stored there and treat them as a buffer address.
     /// Keep `BFLD_PTR` occurrences and owned buffers paired up.
+    ///
+    /// # Arguments
+    ///
+    /// - `bfldid`: Typed UBF field identifier, obtained from generated constants or
+    ///   `AtmiCtx::bfldid`.
+    /// - `v`: Candidate value, borrowed for checking pointer-field ownership compatibility.
     ///
     /// Enduro/X converts freely between `BFLD_PTR` and the scalar types, so
     /// `bchg(ptr_field, 0, 0x7fff_0000i64)` stores that integer as a pointer and
@@ -931,6 +1129,14 @@ impl<'ctx> TypedUbf<'ctx> {
         Ok(())
     }
 
+    /// Reject a field whose declared native type differs from the required type.
+    ///
+    /// # Arguments
+    ///
+    /// - `bfldid`: Typed UBF field identifier, obtained from generated constants or
+    ///   `AtmiCtx::bfldid`.
+    /// - `want`: Required native UBF field kind.
+    /// - `what`: Operation name included in a type mismatch error.
     pub(crate) fn require_field_type(
         &self,
         bfldid: i32,
@@ -947,6 +1153,13 @@ impl<'ctx> TypedUbf<'ctx> {
         Ok(())
     }
 
+    /// Borrow an inline UBF occurrence for read-only access while the parent remains borrowed.
+    ///
+    /// # Arguments
+    ///
+    /// - `bfldid`: Typed UBF field identifier, obtained from generated constants or
+    ///   `AtmiCtx::bfldid`.
+    /// - `occ`: Zero-based field occurrence to access.
     pub fn bget_ubf<'a>(&'a self, bfldid: i32, occ: i32) -> UbfResult<BorrowedUbf<'a, 'ctx>> {
         self.require_field_type(bfldid, UbfFieldType::Ubf, "bget_ubf")?;
         let mut len: raw::BFLDLEN = 0;
@@ -961,6 +1174,12 @@ impl<'ctx> TypedUbf<'ctx> {
     }
 
     /// Read the pointer stored in a `BFLD_PTR` occurrence.
+    ///
+    /// # Arguments
+    ///
+    /// - `bfldid`: Typed UBF field identifier, obtained from generated constants or
+    ///   `AtmiCtx::bfldid`.
+    /// - `occ`: Zero-based field occurrence to access.
     ///
     /// Uses `Bfind` and dereferences the field data, which is how Enduro/X
     /// itself reads these fields (`lptr=(char **)d_ptr` in
@@ -990,6 +1209,12 @@ impl<'ctx> TypedUbf<'ctx> {
     }
 
     /// Borrow the buffer referenced by a `BFLD_PTR` occurrence.
+    ///
+    /// # Arguments
+    ///
+    /// - `bfldid`: Typed UBF field identifier, obtained from generated constants or
+    ///   `AtmiCtx::bfldid`.
+    /// - `occ`: Zero-based field occurrence to access.
     ///
     /// The target stays owned by this buffer: Enduro/X frees `BFLD_PTR` targets
     /// when the owning buffer is freed, recursing through embedded `BFLD_UBF`
@@ -1028,6 +1253,12 @@ impl<'ctx> TypedUbf<'ctx> {
 
     /// Borrow the buffer referenced by a `BFLD_PTR` occurrence as a read-only
     /// UBF view.
+    ///
+    /// # Arguments
+    ///
+    /// - `bfldid`: Typed UBF field identifier, obtained from generated constants or
+    ///   `AtmiCtx::bfldid`.
+    /// - `occ`: Zero-based field occurrence to access.
     ///
     /// Use this instead of [`Self::bget_ptr`] whenever the target is a UBF and
     /// you only need to read it. [`BorrowedUbf`] exposes no mutators, so it
@@ -1071,6 +1302,12 @@ impl<'ctx> TypedUbf<'ctx> {
     /// Remove a `BFLD_PTR` occurrence and take ownership of the buffer it
     /// referenced.
     ///
+    /// # Arguments
+    ///
+    /// - `bfldid`: Typed UBF field identifier, obtained from generated constants or
+    ///   `AtmiCtx::bfldid`.
+    /// - `occ`: Zero-based field occurrence to access.
+    ///
     /// The occurrence is deleted from this buffer first, so freeing the parent
     /// no longer cascades into the target (`Bdel` drops only the reference; it
     /// does not free the target). The returned buffer owns its allocation and
@@ -1092,17 +1329,29 @@ impl<'ctx> TypedUbf<'ctx> {
     }
 
     /// Evaluate a compiled boolean expression against this UBF.
+    ///
+    /// # Arguments
+    ///
+    /// - `tree`: Compiled UBF expression to evaluate against this buffer.
     pub fn bboolev(&self, tree: &UbfExprTree<'_>) -> bool {
         self.inner.ctx.bboolev_value(self, tree) == 1
     }
 
     /// Compile and evaluate a boolean expression against this UBF.
+    ///
+    /// # Arguments
+    ///
+    /// - `expr`: UBF expression text to compile and evaluate.
     pub fn bqboolev(&self, expr: &str) -> UbfResult<bool> {
         let tree = self.inner.ctx.bboolco(expr)?;
         Ok(self.bboolev(&tree))
     }
 
     /// Evaluate a compiled expression as a floating point value.
+    ///
+    /// # Arguments
+    ///
+    /// - `tree`: Compiled UBF expression to evaluate against this buffer.
     pub fn bfloatev(&self, tree: &UbfExprTree<'_>) -> f64 {
         self.inner.ctx.bfloatev_value(self, tree)
     }
@@ -1123,6 +1372,11 @@ impl<'ctx> TypedUbf<'ctx> {
     }
 
     /// Print this UBF buffer to Enduro/X logs.
+    ///
+    /// # Arguments
+    ///
+    /// - `level`: Native logging level controlling whether the buffer dump is emitted.
+    /// - `title`: Log heading for the dump, without embedded NUL bytes.
     pub fn tplogprintubf(&self, level: i32, title: &str) -> UbfResult<()> {
         let title =
             CString::new(title).map_err(|e| UbfError::new(UbfError::BEINVAL, e.to_string()))?;
@@ -1151,6 +1405,10 @@ impl<'ctx> TypedUbf<'ctx> {
     }
 
     /// Read textual `Bprint`/`Bextread` format into this UBF.
+    ///
+    /// # Arguments
+    ///
+    /// - `text`: Text in native field-name/value format to read into this buffer.
     pub fn bextread(&mut self, text: &str) -> UbfResult<()> {
         self.inner.ctx.bextreadcb_value(self, text)
     }
@@ -1161,12 +1419,18 @@ impl<'ctx> TypedUbf<'ctx> {
     }
 
     /// Read serialized UBF bytes into this buffer.
+    ///
+    /// # Arguments
+    ///
+    /// - `dump`: Binary UBF representation produced by `bwrite`.
     pub fn bread(&mut self, dump: &[u8]) -> UbfResult<()> {
         self.inner.ctx.breadcb_value(self, dump)
     }
 } // impl TypedUbf
 
+/// Fallible iteration over UBF field metadata.
 impl<'a, 'ctx> UbfIterator<'a, 'ctx> {
+    /// Advance to the next field occurrence, returning `None` at the end of the buffer.
     pub fn next(&mut self) -> UbfResult<Option<UbfField>> {
         let mut occurrence: raw::BFLDOCC = 0;
         let rc = self.ubf.inner.ctx.bnext_value(
@@ -1197,16 +1461,20 @@ impl<'a, 'ctx> UbfIterator<'a, 'ctx> {
     }
 }
 
+/// Shared access to the underlying context or typed buffer.
 impl<'ctx> Deref for TypedUbf<'ctx> {
     type Target = TypedBuffer<'ctx>;
 
+    /// Borrow the underlying typed buffer for shared access.
     #[inline]
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
 
+/// Exclusive access to the underlying typed buffer.
 impl<'ctx> DerefMut for TypedUbf<'ctx> {
+    /// Borrow the underlying typed buffer for exclusive access.
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner

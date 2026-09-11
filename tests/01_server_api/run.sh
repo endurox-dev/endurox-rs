@@ -23,11 +23,14 @@ find "$THIS_DIR/log" -type f -exec rm -f {} +
 
 pushd "$THIS_DIR" >/dev/null
 xadmin provision -d \
-    -vaddubf=../ubftab/test.fd \
+    -vaddubf=test.fd \
     -vtimeout=60 \
     -vmsgmax=10 \
     -vmsgsizemax=40000
 popd >/dev/null
+
+# Keep generated field tables inside this suite's ignored runtime directory.
+cp "$PROJECT_DIR/tests/ubftab/test.fd" "$THIS_DIR/ubftab/test.fd"
 
 pushd "$CONF_DIR" >/dev/null
 . ./settest1

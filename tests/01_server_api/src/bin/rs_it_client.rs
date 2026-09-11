@@ -29,6 +29,7 @@ fn run() -> Result<(), String> {
         "tpacall-getany" => return run_tpacall_getany(&ctx),
         "dispatch-threads" => return run_dispatch_threads(&ctx),
         "dynamic-advertise" => return run_dynamic_advertise(&ctx),
+        "api-additions" => return run_api_additions(&ctx).map_err(|e| e.to_string()),
         other => return Err(format!("unknown integration scenario `{other}`")),
     };
 
@@ -332,5 +333,117 @@ fn assert_response(buf: &TypedUbf<'_>, rsp_fld: i32, expected: &str) -> Result<(
         ));
     }
 
+    Ok(())
+}
+
+fn run_api_additions(ctx: &AtmiCtx) -> Result<(), Box<dyn std::error::Error>> {
+    use endurox_rs::{dlm::*, TpDlmCtl, TPRECVONLY};
+    let mut request = ctx.tpalloc_ubf(1024)?;
+    let mut reply = ctx.tpalloc_ubf(1024)?;
+    ctx.tpcall("RS_IT_SUBSCRIBE", &request, &mut reply, 0)?;
+    let subscription = reply.bget_long(ubf_fields::T_LONG_FLD, 0)?;
+    assert_eq!(ctx.tppost("RS_API_EVENT", &request, 0)?, 1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        ctx.tpcall("RS_IT_EVENTCOUNT", &request, &mut reply, 0)?;
+        if reply.bget_long(ubf_fields::T_LONG_FLD, 0)? == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "event was not delivered"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(ctx.tpunsubscribe(subscription, 0)?, 1);
+    assert_eq!(ctx.tppost("RS_API_EVENT", &request, 0)?, 0);
+
+    let filename = std::path::PathBuf::from(std::env::var("NDRX_APPHOME")?)
+        .join("log/request-service.log")
+        .to_string_lossy()
+        .into_owned();
+    for fail in [false, true] {
+        let mut buffer = ctx.tpalloc_ubf(1024)?;
+        buffer.bchg(
+            ubf_fields::T_STRING_FLD,
+            0,
+            if fail { "fail" } else { "success" },
+            true,
+        )?;
+        buffer.bchg(ubf_fields::T_STRING_2_FLD, 0, filename.as_str(), true)?;
+        let result = ctx.tplogsetreqfile(Some(&mut buffer), None, Some("RS_IT_REQLOG"));
+        if fail {
+            assert_eq!(result.unwrap_err().code, AtmiError::TPESVCFAIL);
+        } else {
+            result?;
+        }
+        // The service replaces/grows the caller's buffer even on TPESVCFAIL.
+        assert_eq!(
+            buffer.bget_bytes(ubf_fields::T_CARRAY_FLD, 0)?,
+            vec![7_u8; 12000]
+        );
+        assert_eq!(ctx.tploggetbufreqfile(&buffer)?, filename);
+        assert_eq!(buffer.len(), 0);
+        if !fail {
+            assert_eq!(ctx.tploggetreqfile().as_deref(), Some(filename.as_str()));
+            endurox_rs::tp_always!(ctx, "CLIENT-REQUEST-LOG");
+        }
+        ctx.tplogclosereqfile();
+    }
+    let log = std::fs::read_to_string(&filename)?;
+    assert!(log.contains("SERVICE-REQUEST-LOG"));
+    assert!(log.contains("CLIENT-REQUEST-LOG"));
+
+    let mut ctl = TpDlmCtl::default();
+    ctl.set_svcname("RS_IT_DLM")?.set_wait_time(1000)?;
+    for action in ["success", "fail", "retry"] {
+        request.bchg(ubf_fields::T_STRING_FLD, 0, action, true)?;
+        ctx.tpdlmmkcall(&mut request, &mut ctl)?;
+        let mut reply = ctx.tpalloc_ubf(1024)?;
+        let result = ctx.tpdlmcall(&ctl.svcname(), &mut request, &mut reply, 0);
+        if action == "fail" {
+            assert_eq!(result.unwrap_err().code, AtmiError::TPESVCFAIL);
+        } else {
+            result?;
+        }
+        assert_eq!(
+            reply.bget_bytes(ubf_fields::T_CARRAY_FLD, 0)?,
+            vec![8_u8; 12000]
+        );
+        assert_eq!(request.bget_long(EX_DLM_WAIT_TIME, 0)?, 1000);
+        if action == "retry" {
+            assert_eq!(reply.bget_long(ubf_fields::T_LONG_FLD, 0)?, 2);
+        }
+    }
+    request.bchg(ubf_fields::T_STRING_FLD, 0, "success", true)?;
+    ctx.tpdlmmkcall(&mut request, &mut ctl)?;
+    let mut cd = ctx.tpdlmacall(&ctl.svcname(), &request, 0)?;
+    ctx.tpgetrply(&mut cd, &mut reply, 0)?;
+    assert_eq!(
+        reply.bget_bytes(ubf_fields::T_CARRAY_FLD, 0)?,
+        vec![8_u8; 12000]
+    );
+    let cd = ctx.tpdlmconnect(&ctl.svcname(), &request, TPRECVONLY)?;
+    let mut event = 0;
+    assert_eq!(
+        ctx.tprecv(cd, &mut reply, 0, &mut event).unwrap_err().code,
+        AtmiError::TPEEVENT
+    );
+    assert_ne!(event, 0);
+    assert_eq!(
+        reply.bget_bytes(ubf_fields::T_CARRAY_FLD, 0)?,
+        vec![8_u8; 12000]
+    );
+    assert_eq!(
+        ctx.tpdlmcall(
+            &ctl.svcname(),
+            &mut request,
+            &mut reply,
+            endurox_rs::TPNOREPLY
+        )
+        .unwrap_err()
+        .code,
+        AtmiError::TPEINVAL
+    );
     Ok(())
 }

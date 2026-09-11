@@ -1,3 +1,4 @@
+//! Enduro/X standard configuration parsing with owned Rust results.
 use crate::{raw, AtmiCtx, NstdError, NstdResult};
 use core::ffi::{c_char, c_int};
 use std::{
@@ -14,12 +15,18 @@ pub struct NdrxStdCfgStr {
     pub value: Option<String>,
 }
 
+/// Standard configuration-string parsing through Enduro/X.
 impl AtmiCtx {
     /// Parse an Enduro/X standard configuration string into a `Vec` of
     /// key/value entries.
     ///
-    /// Wraps the C `ndrx_stdcfgstr_parse` (or `Ondrx_stdcfgstr_parse` under
-    /// the `ctx-send` feature). The intermediate C linked list is freed with
+    /// # Arguments
+    ///
+    /// - `input`: Configuration text containing keys and optional values; embedded NUL bytes
+    ///   are rejected.
+    ///
+    /// Wraps the C `ndrx_stdcfgstr_parse` utility in both context modes.
+    /// The intermediate C linked list is freed with
     /// `ndrx_stdcfgstr_free` before returning, so the caller only sees plain
     /// owned Rust values.
     pub fn ndrx_stdcfgstr_parse(&self, input: &str) -> NstdResult<Vec<NdrxStdCfgStr>> {
@@ -42,6 +49,16 @@ impl AtmiCtx {
     }
 }
 
+/// Copy a native configuration list into owned Rust entries without freeing the list.
+///
+/// # Arguments
+///
+/// - `head`: Head of a valid native configuration list, or null for an empty list.
+///
+/// # Safety
+///
+/// The list must be finite and readable, with valid C-string fields, and must not be mutated
+/// during traversal.
 unsafe fn collect_entries(head: *mut raw::ndrx_stdcfgstr_t) -> Vec<NdrxStdCfgStr> {
     let mut out = Vec::new();
     let mut cur = head;
@@ -56,12 +73,26 @@ unsafe fn collect_entries(head: *mut raw::ndrx_stdcfgstr_t) -> Vec<NdrxStdCfgStr
     out
 }
 
+/// Copy a C character array up to its first NUL, replacing invalid UTF-8.
+///
+/// # Arguments
+///
+/// - `src`: Character array to read; reading stops at its first NUL or its end.
 fn c_array_to_string(src: &[c_char]) -> String {
     let len = src.iter().position(|&b| b == 0).unwrap_or(src.len());
     let bytes = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u8, len) };
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+/// Copy a nullable C string, returning `None` for a null pointer.
+///
+/// # Arguments
+///
+/// - `p`: Null or a pointer to a readable NUL-terminated string.
+///
+/// # Safety
+///
+/// A non-null pointer must refer to a readable NUL-terminated string for the duration of the copy.
 unsafe fn c_ptr_to_string(p: *const c_char) -> Option<String> {
     if p.is_null() {
         None

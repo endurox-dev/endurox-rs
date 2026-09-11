@@ -1,3 +1,4 @@
+//! XATMI calls, conversations, transactions, events, queues, and timeout configuration.
 use crate::{raw, AtmiCtx, AtmiError, AtmiResult, TpTranId, TypedBuffer, TypedUbf};
 use core::ffi::{c_char, c_int, c_long};
 use std::ffi::{CStr, CString};
@@ -11,8 +12,15 @@ struct PendingCall<'ctx> {
     armed: bool,
 }
 
+/// Cancellation guard for a synchronous call collected through the reply queue.
 #[cfg(endurox_pollable)]
 impl<'ctx> PendingCall<'ctx> {
+    /// Arm a guard that cancels a call if its reply is not collected.
+    ///
+    /// # Arguments
+    ///
+    /// - `ctx`: Context that owns the pending call.
+    /// - `cd`: Outstanding call descriptor returned by `tpacall`.
     fn new(ctx: &'ctx AtmiCtx, cd: i32) -> Self {
         Self {
             ctx,
@@ -21,13 +29,16 @@ impl<'ctx> PendingCall<'ctx> {
         }
     }
 
+    /// Disarm cancellation after the reply has been collected.
     fn complete(&mut self) {
         self.armed = false;
     }
 }
 
+/// Cancel the guarded call if reply collection did not complete.
 #[cfg(endurox_pollable)]
 impl Drop for PendingCall<'_> {
+    /// Cancel the guarded call if reply collection did not complete.
     fn drop(&mut self) {
         if self.armed {
             let _ = self.ctx.tpcancel(self.cd);
@@ -36,17 +47,31 @@ impl Drop for PendingCall<'_> {
 }
 
 /// Read a NUL-terminated string out of a byte buffer the C side filled.
+///
+/// # Arguments
+///
+/// - `bytes`: Native output bytes; decoding stops at the first NUL or the slice end.
 fn cstr_prefix_to_string(bytes: &[u8]) -> String {
     let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
+/// Request/reply messaging, transactions, queues, and native context settings.
 impl AtmiCtx {
     /// Synchronous RPC call with separate input and output buffers.
     ///
+    /// # Arguments
+    ///
+    /// - `svc`: Advertised destination service name, without embedded NUL bytes.
+    /// - `idata`: Borrowed request buffer; the call uses its tracked payload length.
+    /// - `odata`: Reply buffer, updated with native pointer and length changes even when the
+    ///   call fails.
+    /// - `flags`: Call flags such as `TPNOBLOCK`, `TPNOTIME`, or `TPNOCHANGE`; `TPNOREPLY` is
+    ///   invalid.
+    ///
     /// This mirrors the C API: `idata` is the request buffer, and `odata` is the
-    /// reply buffer. Enduro/X may reallocate `odata`; on success this wrapper is
-    /// updated to the returned pointer.
+    /// reply buffer. Enduro/X may reallocate `odata`; this wrapper adopts the
+    /// returned pointer and length on both success and failure.
     pub fn tpcall(
         &self,
         svc: &str,
@@ -102,7 +127,17 @@ impl AtmiCtx {
         }
     }
 
-    /// Asynchronous RPC call.  Returns a call descriptor used with `tpgetrply`.
+    /// Submit a request without waiting for its reply, returning a call descriptor.
+    ///
+    /// Submission itself is synchronous and may block unless `TPNOBLOCK` is set.
+    /// Collect the reply with `tpgetrply`; `TPNOREPLY` returns zero after sending.
+    ///
+    /// # Arguments
+    ///
+    /// - `svc`: Advertised destination service name, without embedded NUL bytes.
+    /// - `data`: Borrowed payload to send; its tracked length supplies the native message length.
+    /// - `flags`: Submission flags; `TPNOBLOCK` fails on a full queue, and `TPNOREPLY` requests
+    ///   no reply.
     pub fn tpacall(&self, svc: &str, data: &TypedBuffer<'_>, flags: i64) -> AtmiResult<i32> {
         let c_svc = CString::new(svc).map_err(|_| self.atmi_last_error())?;
         let ilen = data.len() as c_long;
@@ -136,6 +171,14 @@ impl AtmiCtx {
     }
 
     /// Retrieve the reply for a previous `tpacall`.
+    ///
+    /// # Arguments
+    ///
+    /// - `cd`: Requested descriptor on input; updated to the received descriptor, including
+    ///   with `TPGETANY`.
+    /// - `data`: Reply buffer; native pointer and length updates are retained even on failure.
+    /// - `flags`: Receive flags; `TPGETANY` selects any reply, and `TPNOBLOCK` returns
+    ///   immediately if none is ready.
     ///
     /// `cd` is updated by the framework when `TPGETANY` is used.
     pub fn tpgetrply(
@@ -184,6 +227,10 @@ impl AtmiCtx {
     }
 
     /// Cancel a pending asynchronous call descriptor returned by `tpacall`.
+    ///
+    /// # Arguments
+    ///
+    /// - `cd`: Outstanding call descriptor returned by `tpacall`.
     pub fn tpcancel(&self, cd: i32) -> AtmiResult<()> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpcancel(cd as c_int) };
@@ -220,6 +267,15 @@ impl AtmiCtx {
     /// Synchronous call that uses the async/reply-queue path only on pollable
     /// Enduro/X builds.
     ///
+    /// # Arguments
+    ///
+    /// - `svc`: Advertised destination service name, without embedded NUL bytes.
+    /// - `idata`: Borrowed request buffer; the call uses its tracked payload length.
+    /// - `odata`: Reply buffer, updated with native pointer and length changes even when the
+    ///   call fails.
+    /// - `flags`: Call flags such as `TPNOBLOCK`, `TPNOTIME`, or `TPNOCHANGE`; `TPNOREPLY` is
+    ///   invalid.
+    ///
     /// On `EX_USE_EPOLL` and `EX_USE_KQUEUE` builds this performs `tpacall`,
     /// waits for readiness on the internal reply queue descriptor, then drains
     /// the requested call descriptor with `tpgetrply(TPNOBLOCK)`. Other queue
@@ -246,6 +302,17 @@ impl AtmiCtx {
         }
     }
 
+    /// Submit a request and collect its reply using the native queue descriptor and one deadline.
+    ///
+    /// # Arguments
+    ///
+    /// - `svc`: Advertised destination service name, without embedded NUL bytes.
+    /// - `idata`: Borrowed request buffer; the call uses its tracked payload length.
+    /// - `odata`: Reply buffer, updated with native pointer and length changes even when the
+    ///   call fails.
+    /// - `flags`: Call flags such as `TPNOBLOCK`, `TPNOTIME`, or `TPNOCHANGE`; `TPNOREPLY` is
+    ///   invalid.
+    ///
     #[cfg(endurox_pollable)]
     fn tpcall_pollable(
         &self,
@@ -282,6 +349,15 @@ impl AtmiCtx {
         result
     }
 
+    /// Collect a reply, blocking in `poll` between nonblocking native receive attempts.
+    ///
+    /// # Arguments
+    ///
+    /// - `cd`: Descriptor to collect, updated by the native receive call.
+    /// - `data`: Reply buffer whose pointer and length may change on either success or failure.
+    /// - `flags`: XATMI operation flags; use `0` for the native default behavior.
+    /// - `deadline`: Absolute end of the wait, or `None` to wait without an adapter deadline.
+    ///
     #[cfg(endurox_pollable)]
     fn tpgetrply_polled(
         &self,
@@ -315,6 +391,7 @@ impl AtmiCtx {
         }
     }
 
+    /// Borrow the native reply queue descriptor, or return `TPEINVAL` on an unsupported backend.
     pub(crate) fn reply_queue_fd(&self) -> AtmiResult<c_int> {
         #[cfg(not(endurox_pollable))]
         {
@@ -340,6 +417,13 @@ impl AtmiCtx {
         }
     }
 
+    /// Wait for reply-queue readability; return `false` when the deadline expires.
+    ///
+    /// # Arguments
+    ///
+    /// - `reply_fd`: Borrowed native reply queue descriptor; this function does not close it.
+    /// - `deadline`: Absolute end of the wait, or `None` to wait without an adapter deadline.
+    ///
     #[cfg(endurox_pollable)]
     fn poll_reply_queue(&self, reply_fd: c_int, deadline: Option<Instant>) -> AtmiResult<bool> {
         let mut pfd = libc::pollfd {
@@ -397,6 +481,13 @@ impl AtmiCtx {
 
     /// Open a conversational connection.
     ///
+    /// # Arguments
+    ///
+    /// - `svc`: Advertised destination service name, without embedded NUL bytes.
+    /// - `data`: Borrowed payload to send; its tracked length supplies the native message length.
+    /// - `flags`: Conversation flags, including `TPSENDONLY` or `TPRECVONLY` to select initial
+    ///   control.
+    ///
     /// The payload length comes from the buffer itself. An independent `len`
     /// argument bypassed the allocation checks on `set_len`, so a value larger
     /// than the buffer reached the native copy.
@@ -431,6 +522,11 @@ impl AtmiCtx {
         }
     }
 
+    /// Close a conversational connection and release its descriptor.
+    ///
+    /// # Arguments
+    ///
+    /// - `cd`: Conversation descriptor returned by `tpconnect` or supplied to a service.
     pub fn tpdiscon(&self, cd: i32) -> AtmiResult<()> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpdiscon(cd as c_int) };
@@ -442,6 +538,14 @@ impl AtmiCtx {
     }
 
     /// Receive on a conversational connection.
+    ///
+    /// # Arguments
+    ///
+    /// - `cd`: Conversation descriptor to receive from.
+    /// - `data`: Receive buffer; native pointer and length changes are retained even on failure.
+    /// - `flags`: Receive options, including `TPNOBLOCK` for an immediate attempt.
+    /// - `revent`: Output conversation event code, also updated when the operation returns
+    ///   `TPEEVENT`.
     ///
     /// `revent` is an out-parameter, mirroring the C API, because the event is
     /// the whole point of the `TPEEVENT` error: returning it only on success
@@ -501,6 +605,14 @@ impl AtmiCtx {
 
     /// Send on a conversational connection.
     ///
+    /// # Arguments
+    ///
+    /// - `cd`: Conversation descriptor to send on.
+    /// - `data`: Borrowed payload to send; its tracked length supplies the native message length.
+    /// - `flags`: Send options, including `TPRECVONLY` to hand control to the peer.
+    /// - `revent`: Output conversation event code, also updated when the operation returns
+    ///   `TPEEVENT`.
+    ///
     /// `revent` is an out-parameter for the same reason as [`Self::tprecv`]:
     /// the event carries the meaning of a `TPEEVENT` failure and must survive
     /// the error return. The payload length comes from the buffer, not from a
@@ -546,6 +658,11 @@ impl AtmiCtx {
         }
     }
 
+    /// Roll back the current global transaction.
+    ///
+    /// # Arguments
+    ///
+    /// - `flags`: Reserved by the native abort API; pass `0`.
     pub fn tpabort(&self, flags: i64) -> AtmiResult<()> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpabort(flags as c_long) };
@@ -556,6 +673,12 @@ impl AtmiCtx {
         self.rc_to_result(rc)
     }
 
+    /// Set whether transaction commit waits for completion or only for the commit decision to
+    /// be logged.
+    ///
+    /// # Arguments
+    ///
+    /// - `flags`: Native `TP_CMT_COMPLETE` or `TP_CMT_LOGGED` commit-return mode.
     pub fn tpscmt(&self, flags: i64) -> AtmiResult<()> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpscmt(flags as c_long) };
@@ -566,6 +689,12 @@ impl AtmiCtx {
         self.rc_to_result(rc)
     }
 
+    /// Start a global transaction with a transaction timeout.
+    ///
+    /// # Arguments
+    ///
+    /// - `timeout`: Maximum transaction lifetime in seconds.
+    /// - `flags`: Reserved by the native begin API; pass `0`.
     pub fn tpbegin(&self, timeout: u64, flags: i64) -> AtmiResult<()> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpbegin(timeout as _, flags as c_long) };
@@ -576,6 +705,12 @@ impl AtmiCtx {
         self.rc_to_result(rc)
     }
 
+    /// Commit the current global transaction using the configured commit mode.
+    ///
+    /// # Arguments
+    ///
+    /// - `flags`: `0` uses the configured commit mode; native `TPTXCOMMITDLOG` returns after
+    ///   the commit decision is logged.
     pub fn tpcommit(&self, flags: i64) -> AtmiResult<()> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpcommit(flags as c_long) };
@@ -588,6 +723,10 @@ impl AtmiCtx {
 
     /// Suspend the current global transaction. Returns a `TpTranId` that can
     /// later be passed to `tpresume` to rejoin the transaction.
+    ///
+    /// # Arguments
+    ///
+    /// - `flags`: XATMI operation flags; use `0` for the native default behavior.
     pub fn tpsuspend(&self, flags: i64) -> AtmiResult<TpTranId> {
         let mut tranid: raw::TPTRANID = unsafe { std::mem::zeroed() };
 
@@ -605,6 +744,11 @@ impl AtmiCtx {
     }
 
     /// Resume a previously suspended global transaction.
+    ///
+    /// # Arguments
+    ///
+    /// - `tranid`: Identifier returned when the transaction was suspended.
+    /// - `flags`: XATMI operation flags; use `0` for the native default behavior.
     pub fn tpresume(&self, tranid: &TpTranId, flags: i64) -> AtmiResult<()> {
         let mut inner = tranid.0;
 
@@ -639,6 +783,7 @@ impl AtmiCtx {
         self.rc_to_result(rc)
     }
 
+    /// Return the transaction level: zero outside a global transaction, one inside it.
     pub fn tpgetlev(&self) -> AtmiResult<i32> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpgetlev() };
@@ -653,6 +798,11 @@ impl AtmiCtx {
         }
     }
 
+    /// Query the native extended error-detail code.
+    ///
+    /// # Arguments
+    ///
+    /// - `flags`: Reserved by the native API; pass `0`.
     pub fn tperrordetail(&self, flags: i64) -> AtmiResult<i32> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tperrordetail(flags as c_long) };
@@ -667,6 +817,12 @@ impl AtmiCtx {
         }
     }
 
+    /// Return explanatory text for an extended error-detail code.
+    ///
+    /// # Arguments
+    ///
+    /// - `err`: Native error-detail code to describe.
+    /// - `flags`: Reserved by the native API; pass `0`.
     pub fn tpstrerrordetail(&self, err: i32, flags: i64) -> AtmiResult<String> {
         #[cfg(not(feature = "ctx-send"))]
         let ptr = unsafe { raw::tpstrerrordetail(err as c_int, flags as c_long) };
@@ -684,6 +840,11 @@ impl AtmiCtx {
         }
     }
 
+    /// Return the symbolic name of an ATMI error code, such as `TPEINVAL`.
+    ///
+    /// # Arguments
+    ///
+    /// - `err`: ATMI error number whose symbolic name is requested.
     pub fn tpecodestr(&self, err: i32) -> AtmiResult<String> {
         #[cfg(not(feature = "ctx-send"))]
         let ptr = unsafe { raw::tpecodestr(err as c_int) };
@@ -700,6 +861,7 @@ impl AtmiCtx {
         }
     }
 
+    /// Return the local Enduro/X node identifier.
     pub fn tpgetnodeid(&self) -> AtmiResult<i64> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpgetnodeid() };
@@ -714,23 +876,33 @@ impl AtmiCtx {
         }
     }
 
+    /// Register an event subscription and return its identifier.
+    ///
+    /// # Arguments
+    ///
+    /// - `eventexpr`: Regular expression matching event names to subscribe to.
+    /// - `filter`: Optional buffer-specific filter expression; `None` disables payload filtering.
+    /// - `ctl`: Event-delivery control block with a destination service in `name1`.
+    /// - `flags`: XATMI operation flags; use `0` for the native default behavior.
     pub fn tpsubscribe(
         &self,
         eventexpr: &str,
         filter: Option<&str>,
-        ctl: Option<&mut crate::TpEvCtl>,
+        ctl: &crate::TpEvCtl,
         flags: i64,
     ) -> AtmiResult<i64> {
-        let c_expr = CString::new(eventexpr).map_err(|_| self.atmi_last_error())?;
+        let c_expr = CString::new(eventexpr)
+            .map_err(|_| AtmiError::new(AtmiError::TPEINVAL, "event expression contains NUL"))?;
         let c_filter = filter
             .map(CString::new)
             .transpose()
-            .map_err(|_| self.atmi_last_error())?;
+            .map_err(|_| AtmiError::new(AtmiError::TPEINVAL, "event filter contains NUL"))?;
         let filter_ptr = c_filter
             .as_ref()
             .map(|v| v.as_ptr() as *mut c_char)
             .unwrap_or(ptr::null_mut());
-        let ctl_ptr = ctl.map_or(ptr::null_mut(), |ctl| ctl.as_mut_ptr());
+        let mut native_ctl = ctl.inner;
+        let ctl_ptr = &mut native_ctl;
 
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe {
@@ -760,7 +932,15 @@ impl AtmiCtx {
         }
     }
 
-    pub fn tpunsubscribe(&self, subscription: i64, flags: i64) -> AtmiResult<()> {
+    /// Remove an event subscription from the event broker.
+    ///
+    /// # Arguments
+    ///
+    /// - `subscription`: Subscription identifier, or `-1` to remove this client’s subscriptions.
+    /// - `flags`: XATMI operation flags; use `0` for the native default behavior.
+    ///
+    /// Returns the number of subscriptions removed.
+    pub fn tpunsubscribe(&self, subscription: i64, flags: i64) -> AtmiResult<i32> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpunsubscribe(subscription as c_long, flags as c_long) };
 
@@ -769,11 +949,25 @@ impl AtmiCtx {
             raw::Otpunsubscribe(self.c_ctx_ptr(), subscription as c_long, flags as c_long)
         };
 
-        self.rc_to_result(rc)
+        if rc < 0 {
+            Err(self.atmi_last_error())
+        } else {
+            Ok(rc)
+        }
     }
 
-    pub fn tppost(&self, eventname: &str, data: &TypedBuffer<'_>, flags: i64) -> AtmiResult<()> {
-        let c_event = CString::new(eventname).map_err(|_| self.atmi_last_error())?;
+    /// Publish an event and its payload to matching subscribers.
+    ///
+    /// # Arguments
+    ///
+    /// - `eventname`: Event name tested against registered subscription expressions.
+    /// - `data`: Borrowed payload to send; its tracked length supplies the native message length.
+    /// - `flags`: XATMI operation flags; use `0` for the native default behavior.
+    ///
+    /// Returns the number of servers that consumed the event.
+    pub fn tppost(&self, eventname: &str, data: &TypedBuffer<'_>, flags: i64) -> AtmiResult<i32> {
+        let c_event = CString::new(eventname)
+            .map_err(|_| AtmiError::new(AtmiError::TPEINVAL, "event name contains NUL"))?;
 
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe {
@@ -796,7 +990,11 @@ impl AtmiCtx {
             )
         };
 
-        self.rc_to_result(rc)
+        if rc < 0 {
+            Err(self.atmi_last_error())
+        } else {
+            Ok(rc)
+        }
     }
 
     /// Initialize an application thread with no authentication (null TPINIT).
@@ -810,6 +1008,7 @@ impl AtmiCtx {
         self.rc_to_result(rc)
     }
 
+    /// Release the application-thread state initialized by `tpappthrinit`.
     pub fn tpappthrterm(&self) -> AtmiResult<()> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpappthrterm() };
@@ -820,6 +1019,10 @@ impl AtmiCtx {
         self.rc_to_result(rc)
     }
 
+    /// Check the native client-authentication requirement.
+    ///
+    /// This signature returns `Ok(())` for native `TPNOAUTH`; it does not expose an
+    /// authentication-mode value.
     pub fn tpchkauth(&self) -> AtmiResult<()> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpchkauth() };
@@ -831,6 +1034,12 @@ impl AtmiCtx {
     }
 
     /// Send an unsolicited message to a specific client.
+    ///
+    /// # Arguments
+    ///
+    /// - `clientid`: Destination client identifier, usually obtained from `TpSvcInfo::cltid`.
+    /// - `data`: Borrowed payload to send; its tracked length supplies the native message length.
+    /// - `flags`: XATMI operation flags; use `0` for the native default behavior.
     pub fn tpnotify(
         &self,
         clientid: &mut crate::ClientId,
@@ -862,6 +1071,14 @@ impl AtmiCtx {
     }
 
     /// Broadcast an unsolicited message to matching clients.
+    ///
+    /// # Arguments
+    ///
+    /// - `lmid`: Optional logical machine identifier filter; `None` matches any machine.
+    /// - `usrname`: Optional user-name filter; `None` matches any user.
+    /// - `cltname`: Optional client-name filter; `None` matches any client name.
+    /// - `data`: Borrowed payload to send; its tracked length supplies the native message length.
+    /// - `flags`: XATMI operation flags; use `0` for the native default behavior.
     pub fn tpbroadcast(
         &self,
         lmid: Option<&str>,
@@ -924,6 +1141,7 @@ impl AtmiCtx {
         self.rc_to_result(rc)
     }
 
+    /// Ask Enduro/X to dispatch pending unsolicited messages.
     pub fn tpchkunsol(&self) -> AtmiResult<()> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpchkunsol() };
@@ -934,6 +1152,12 @@ impl AtmiCtx {
         self.rc_to_result(rc)
     }
 
+    /// Set the process-wide XATMI timeout in seconds. Call after initialization and serialize
+    /// updates.
+    ///
+    /// # Arguments
+    ///
+    /// - `tout`: Positive process-wide timeout in seconds; context overrides can take precedence.
     pub fn tptoutset(&self, tout: i32) -> AtmiResult<()> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tptoutset(tout as c_int) };
@@ -944,6 +1168,7 @@ impl AtmiCtx {
         self.rc_to_result(rc)
     }
 
+    /// Return the process-wide XATMI timeout in seconds.
     pub fn tptoutget(&self) -> AtmiResult<i32> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tptoutget() };
@@ -958,6 +1183,13 @@ impl AtmiCtx {
         }
     }
 
+    /// Decode an Enduro/X exported representation into a newly owned typed buffer.
+    ///
+    /// # Arguments
+    ///
+    /// - `payload`: Exported buffer bytes to decode.
+    /// - `flags`: Import options; `0` reads JSON export data, and `TPEX_STRING` reads
+    ///   base64-encoded export data.
     pub fn tpimport<'ctx>(&'ctx self, payload: &[u8], flags: i64) -> AtmiResult<TypedBuffer<'ctx>> {
         let mut obuf: *mut c_char = ptr::null_mut();
         let mut olen: c_long = 0;
@@ -996,6 +1228,12 @@ impl AtmiCtx {
         }
     }
 
+    /// Encode a typed buffer in Enduro/X export format using a 64 KiB output area.
+    ///
+    /// # Arguments
+    ///
+    /// - `ibuf`: Typed buffer to export; this wrapper passes zero as the native input length.
+    /// - `flags`: `0` for JSON export data, or `TPEX_STRING` for its base64 encoding.
     pub fn tpexport(&self, ibuf: &TypedBuffer<'_>, flags: i64) -> AtmiResult<Vec<u8>> {
         let mut out = vec![0u8; 65536];
         let mut olen = out.len() as c_long;
@@ -1031,6 +1269,12 @@ impl AtmiCtx {
         }
     }
 
+    /// Return the resource manager’s native connection pointer without taking ownership.
+    ///
+    /// # Safety
+    ///
+    /// Any use of the returned pointer must obey the selected resource manager’s type,
+    /// lifetime, and thread rules.
     pub(crate) unsafe fn tpgetconn(&self) -> *mut ::std::os::raw::c_void {
         #[cfg(not(feature = "ctx-send"))]
         {
@@ -1043,6 +1287,13 @@ impl AtmiCtx {
         }
     }
 
+    /// Read call metadata attached to a message into a native UBF output buffer.
+    ///
+    /// # Arguments
+    ///
+    /// - `msg`: Valid native typed-buffer pointer whose call metadata is accessed.
+    /// - `cibuf`: Writable UBF pointer slot; Enduro/X may allocate or replace the output buffer.
+    /// - `flags`: XATMI operation flags; use `0` for the native default behavior.
     pub(crate) fn tpgetcallinfo(
         &self,
         msg: *const c_char,
@@ -1058,6 +1309,13 @@ impl AtmiCtx {
         self.rc_to_result(rc)
     }
 
+    /// Attach call metadata from a native UBF buffer to a message.
+    ///
+    /// # Arguments
+    ///
+    /// - `msg`: Valid native typed-buffer pointer whose call metadata is accessed.
+    /// - `cibuf`: Valid native UBF containing metadata to attach.
+    /// - `flags`: XATMI operation flags; use `0` for the native default behavior.
     pub(crate) fn tpsetcallinfo(
         &self,
         msg: *const c_char,
@@ -1074,6 +1332,11 @@ impl AtmiCtx {
     }
 
     /// Populate a UBF buffer from a JSON string.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF to populate; it must have enough free capacity.
+    /// - `json`: JSON text in Enduro/X field format, without embedded NUL bytes.
     pub fn tpjsontoubf(&self, ubf: &mut TypedUbf<'_>, json: &str) -> AtmiResult<()> {
         use std::ffi::CString;
         let c_json = CString::new(json).map_err(|_| self.atmi_last_error())?;
@@ -1094,6 +1357,10 @@ impl AtmiCtx {
     }
 
     /// Serialize a UBF buffer to a JSON string.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: UBF buffer whose fields are converted to JSON.
     pub fn tpubftojson(&self, ubf: &TypedUbf<'_>) -> AtmiResult<String> {
         // Allocate a reasonably-sized output buffer; grow on first call if needed.
         let mut out = vec![0u8; 65536];
@@ -1125,6 +1392,15 @@ impl AtmiCtx {
         }
     }
 
+    /// Write a VIEW’s JSON representation into caller-provided native storage.
+    ///
+    /// # Arguments
+    ///
+    /// - `cstruct`: Readable native VIEW allocation matching the named layout.
+    /// - `view`: Pointer to the NUL-terminated compiled VIEW name.
+    /// - `buffer`: Writable output storage for JSON, including a trailing NUL.
+    /// - `bufsize`: Capacity of the JSON output storage in bytes.
+    /// - `flags`: XATMI operation flags; use `0` for the native default behavior.
     pub(crate) fn tpviewtojson(
         &self,
         cstruct: *mut c_char,
@@ -1152,6 +1428,17 @@ impl AtmiCtx {
         self.rc_to_result(rc)
     }
 
+    /// Allocate a VIEW from JSON and write its compiled layout name to the output field.
+    ///
+    /// # Arguments
+    ///
+    /// - `view`: Writable native VIEW-name output field, with at least 34 bytes.
+    /// - `buffer`: Readable NUL-terminated JSON text whose outer key names the VIEW layout.
+    ///
+    /// # Safety
+    ///
+    /// The name output must be writable for 34 bytes and the JSON input must be a readable C
+    /// string. The returned allocation transfers to the caller.
     pub(crate) unsafe fn tpjsontoview(
         &self,
         view: *mut c_char,
@@ -1171,6 +1458,15 @@ impl AtmiCtx {
     }
 
     /// Enqueue a buffer into a persistent queue.
+    ///
+    /// # Arguments
+    ///
+    /// - `qspace`: Configured persistent queue-space name.
+    /// - `qname`: Queue name within the selected queue space or server.
+    /// - `ctl`: Queue options on input and message metadata or diagnostics on output, including
+    ///   on failure.
+    /// - `data`: Borrowed payload to send; its tracked length supplies the native message length.
+    /// - `flags`: XATMI operation flags; use `0` for the native default behavior.
     pub fn tpenqueue(
         &self,
         qspace: &str,
@@ -1212,6 +1508,14 @@ impl AtmiCtx {
     }
 
     /// Dequeue a buffer from a persistent queue. Returns the dequeued buffer.
+    ///
+    /// # Arguments
+    ///
+    /// - `qspace`: Configured persistent queue-space name.
+    /// - `qname`: Queue name within the selected queue space or server.
+    /// - `ctl`: Queue options on input and message metadata or diagnostics on output, including
+    ///   on failure.
+    /// - `flags`: XATMI operation flags; use `0` for the native default behavior.
     pub fn tpdequeue<'ctx>(
         &'ctx self,
         qspace: &str,
@@ -1261,6 +1565,17 @@ impl AtmiCtx {
         }
     }
 
+    /// Enqueue a payload using an explicit queue-server node and server identifier.
+    ///
+    /// # Arguments
+    ///
+    /// - `nodeid`: Enduro/X node hosting the queue server.
+    /// - `srvid`: Server identifier of the queue server on that node.
+    /// - `qname`: Queue name within the selected queue space or server.
+    /// - `ctl`: Queue options on input and message metadata or diagnostics on output, including
+    ///   on failure.
+    /// - `data`: Borrowed payload to send; its tracked length supplies the native message length.
+    /// - `flags`: XATMI operation flags; use `0` for the native default behavior.
     pub fn tpenqueueex(
         &self,
         nodeid: i16,
@@ -1304,6 +1619,15 @@ impl AtmiCtx {
     }
 
     /// Dequeue a buffer by node/server ID. Returns the dequeued buffer.
+    ///
+    /// # Arguments
+    ///
+    /// - `nodeid`: Enduro/X node hosting the queue server.
+    /// - `srvid`: Server identifier of the queue server on that node.
+    /// - `qname`: Queue name within the selected queue space or server.
+    /// - `ctl`: Queue options on input and message metadata or diagnostics on output, including
+    ///   on failure.
+    /// - `flags`: XATMI operation flags; use `0` for the native default behavior.
     pub fn tpdequeueex<'ctx>(
         &'ctx self,
         nodeid: i16,
@@ -1371,6 +1695,11 @@ impl AtmiCtx {
 
     /// Reject `TPEX_STRING` on the byte-slice APIs.
     ///
+    /// # Arguments
+    ///
+    /// - `flags`: XATMI operation flags; use `0` for the native default behavior.
+    /// - `what`: Operation name included in a validation error.
+    ///
     /// In string mode Enduro/X calls `ndrx_crypto_enc_string(input, output,
     /// olen)`, which takes no input length and therefore reads to the first NUL.
     /// A `&[u8]` carries no such guarantee, so the native side would read past
@@ -1392,6 +1721,11 @@ impl AtmiCtx {
 
     /// Encrypt a byte payload. `TPEX_STRING` is rejected; see
     /// [`AtmiCtx::tpencrypt_string`].
+    ///
+    /// # Arguments
+    ///
+    /// - `input`: Binary payload to encrypt.
+    /// - `flags`: Native encryption options; pass `0` for binary mode. `TPEX_STRING` is rejected.
     pub fn tpencrypt(&self, input: &[u8], flags: i64) -> AtmiResult<Vec<u8>> {
         Self::reject_string_mode(flags, "tpencrypt")?;
         let mut out = vec![0u8; input.len().saturating_mul(2).max(256)];
@@ -1430,6 +1764,11 @@ impl AtmiCtx {
 
     /// Decrypt a byte payload. `TPEX_STRING` is rejected; see
     /// [`AtmiCtx::tpdecrypt_string`].
+    ///
+    /// # Arguments
+    ///
+    /// - `input`: Encrypted binary payload produced by the native encryption API.
+    /// - `flags`: Native encryption options; pass `0` for binary mode. `TPEX_STRING` is rejected.
     pub fn tpdecrypt(&self, input: &[u8], flags: i64) -> AtmiResult<Vec<u8>> {
         Self::reject_string_mode(flags, "tpdecrypt")?;
         let mut out = vec![0u8; input.len().max(256)];
@@ -1467,6 +1806,10 @@ impl AtmiCtx {
     }
 
     /// Encrypt a string with `TPEX_STRING`, producing base64 output.
+    ///
+    /// # Arguments
+    ///
+    /// - `input`: Plaintext without embedded NUL bytes.
     ///
     /// The native call reads the input to its first NUL and NUL-terminates the
     /// result, so both sides are handled as C strings here rather than as byte
@@ -1509,6 +1852,10 @@ impl AtmiCtx {
     }
 
     /// Decrypt a base64 string produced by [`AtmiCtx::tpencrypt_string`].
+    ///
+    /// # Arguments
+    ///
+    /// - `input`: Base64 ciphertext produced by `tpencrypt_string`, without embedded NUL bytes.
     pub fn tpdecrypt_string(&self, input: &str) -> AtmiResult<String> {
         let c_input = CString::new(input)
             .map_err(|_| AtmiError::new(raw::TPEINVAL, "input contains a NUL byte"))?;
@@ -1545,6 +1892,13 @@ impl AtmiCtx {
         }
     }
 
+    /// Set the priority for the next native message submission.
+    ///
+    /// # Arguments
+    ///
+    /// - `prio`: Absolute priority from 1 to 100, or a relative adjustment from -100 to 100.
+    /// - `flags`: `TPABSOLUTE` to use an absolute priority, or `0` for a service-relative
+    ///   adjustment.
     pub fn tpsprio(&self, prio: i32, flags: i64) -> AtmiResult<()> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpsprio(prio as c_int, flags as c_long) };
@@ -1555,6 +1909,7 @@ impl AtmiCtx {
         self.rc_to_result(rc)
     }
 
+    /// Return the resolved priority of the last native message submission.
     pub fn tpgprio(&self) -> AtmiResult<i32> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpgprio() };
@@ -1569,6 +1924,13 @@ impl AtmiCtx {
         }
     }
 
+    /// Set a context-specific timeout for the next applicable call or for all calls.
+    ///
+    /// # Arguments
+    ///
+    /// - `tout`: Nonnegative timeout in seconds; `0` clears the selected override.
+    /// - `flags`: `TPBLK_NEXT` for the next applicable call, or `TPBLK_ALL` for this context’s
+    ///   calls.
     pub fn tpsblktime(&self, tout: i32, flags: i64) -> AtmiResult<()> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpsblktime(tout as c_int, flags as c_long) };
@@ -1579,6 +1941,12 @@ impl AtmiCtx {
         self.rc_to_result(rc)
     }
 
+    /// Return a selected context timeout, or the effective timeout, in seconds.
+    ///
+    /// # Arguments
+    ///
+    /// - `flags`: `TPBLK_NEXT` or `TPBLK_ALL` to query an override; `0` resolves the effective
+    ///   timeout.
     pub fn tpgblktime(&self, flags: i64) -> AtmiResult<i32> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpgblktime(flags as c_long) };

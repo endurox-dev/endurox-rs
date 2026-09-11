@@ -1,5 +1,63 @@
 Rust bindings for Enduro/X.
 
+# Events, request logging and DLM
+
+Event subscriptions require a destination service. Configure `TpEvCtl::set_name1`
+and `set_flags(TPEVSERVICE)`, then call
+`ctx.tpsubscribe(expression, filter, &ctl, flags)` from a server. `tppost` returns
+the number of servers that consumed the event; `tpunsubscribe` returns the number
+removed. `TPEVPERSIST` retains a subscription
+when its destination service is unavailable.
+
+Request logging uses `AtmiCtx::tplogsetreqfile(data, filename, filesvc)`, with optional
+parameters. A UBF carries the request filename; a filename service can replace it,
+including on a service failure. Use `tploggetbufreqfile`/`tplogdelbufreqfile` for that
+field, `tploggetreqfile` for the active request log, and `tplogclosereqfile` to close
+it. `tplogsetreqfile_direct` selects a file without a buffer, and `tplogclosethread`
+closes thread loggers. Use a request filename distinct from the process log when
+threads are involved. All three logging macros honor the context under `ctx-send`.
+
+The `dlm` module exports the native `EX_DLM_*` fields and `NDRX_DLM_*` constants.
+Prepare a request before calling the DLM service:
+
+```rust,no_run
+use endurox_rs::{AtmiCtx, TpDlmCtl, dlm::*};
+
+fn lock(ctx: &AtmiCtx) -> Result<(), Box<dyn std::error::Error>> {
+    let mut request = ctx.tpalloc_ubf(1024)?;
+    request.bchg(EX_DLM_OP, 0, NDRX_DLM_OP_DLMCMD, true)?;
+    request.bchg(EX_DLM_CMD, 0, NDRX_DLM_CMD_LOCK, true)?;
+    request.bchg(EX_DLM_KEY, 0, "example-key", true)?;
+    request.bchg(EX_DLM_LOCK_MODE, 0, NDRX_DLM_LM_EXCLUSIVE, true)?;
+    let mut ctl = TpDlmCtl::default();
+    ctl.set_dlmspace("MYSPACE")?.set_wait_time(2500)?;
+    ctx.tpdlmmkcall(&mut request, &mut ctl)?;
+    let mut reply = ctx.tpalloc_ubf(1024)?;
+    ctx.tpdlmcall(&ctl.svcname(), &mut request, &mut reply, 0)?;
+    Ok(())
+}
+```
+
+`tpdlmacall` submits with native retries and returns a descriptor for `tpgetrply`;
+`tpdlmconnect` retries conversation establishment. These are synchronous native
+operations. `tpdlmtoutget` returns total/per-attempt milliseconds and block seconds;
+`tpdlmattemptsget` returns the native attempt count. The core owns retry policy and
+enforces `TPNOTRAN`. DLM operations require the native `tpdlmsv` service; the Rust
+integration fixture validates the call protocol against a test service.
+
+Preparation supports flat and pointer-command layouts, validates unique ownership,
+and preserves partial changes on failure. The matching core must preserve nested
+command pointers when preparation fails after reallocation (`libatmi/eeapi.c`).
+
+# UBF occurrence search
+
+`TypedUbf::bfindocc(field, &value, regex)` searches using the exact native field
+type; `regex` enables full STRING regular-expression matching. No match returns
+`BNOTPRES`. `bfindlast` returns `(occurrence, UbfFieldRef)` with borrowed variable-size
+data. `bgetlast` returns `(occurrence, UbfValue)` with independent complex-buffer
+copies; NULL PTR/VIEW occurrences return `BNOTPRES`. `AtmiCtx::bneeded(count, bytes)`
+estimates UBF allocation size from a positive field count and total value size.
+
 # Mapping Rust structures to UBF and VIEW
 
 `UbfSerialize` / `UbfDeserialize` map named Rust structs to native UBF fields.
@@ -209,32 +267,32 @@ reading it.
 # Scripting plugins
 
 The native `tpscr*` API is available through `AtmiCtx::tpscrinit` and the returned
-`ScriptVm`. Enduro/X selects the language backend through `NDRX_PLUGINS`; Rust
+`TpScrVm`. Enduro/X selects the language backend through `NDRX_PLUGINS`; Rust
 does not embed or link directly to Python. See the runnable
 [scripting example](examples/scripting.rs) for Python calling a Rust closure.
 
 ```rust,no_run
-use endurox_rs::{AtmiCtx, ScriptBuffers, ScriptSlot, NDRX_TPSCR_FLAT};
+use endurox_rs::{AtmiCtx, TpScrBuffers, TpScrSlot, NDRX_TPSCR_FLAT};
 # fn example() -> Result<(), Box<dyn std::error::Error>> {
 let ctx = AtmiCtx::new()?;
 ctx.tpinit()?;
 let mut vm = ctx.tpscrinit(None, 0)?;
 vm.tpscrregcb("host", |call, args| {
-    args.set(ScriptSlot::Output,
+    args.set(TpScrSlot::Output,
              Some(call.context().tpalloc_carray(b"hello from Rust")?))
 }, 0)?;
 vm.tpscrloadstr("example",
     "def main(name, param, incoming, flags):\n    return host(param, incoming, flags)\n",
     NDRX_TPSCR_FLAT)?;
-let mut buffers = ScriptBuffers::new(&ctx);
+let mut buffers = TpScrBuffers::new(&ctx);
 vm.tpscrexec("example", &mut buffers, 0)?;
-let output = buffers.take(ScriptSlot::Output)?.unwrap();
+let output = buffers.take(TpScrSlot::Output)?.unwrap();
 assert_eq!(output.as_bytes(), b"hello from Rust");
 # Ok(())
 # }
 ```
 
-- `tpscrcomp` returns `ScriptBytecode`, which exposes `as_bytes()` and frees
+- `tpscrcomp` returns `TpScrBytecode`, which exposes `as_bytes()` and frees
   compiler storage with native `tpscrfree` on drop. `tpscrfree()` releases it
   explicitly; `tpscrload` also accepts serialized byte slices. Compiler output
   uses the plugin allocator, not `tpfree`.
@@ -242,7 +300,7 @@ assert_eq!(output.as_bytes(), b"hello from Rust");
   `tpscrunregcb`, `tpscrerrno`, `tpscrerror`, and `tpscrseterror` are VM methods.
   `tpscruninit` consumes the VM; Drop also shuts it down. Load flags
   `NDRX_TPSCR_PACKAGE`, `NDRX_TPSCR_REPLACE`, and `NDRX_TPSCR_FLAT` are exported.
-- `ScriptBuffers` owns the parameter, input and output slots. `set` replaces one
+- `TpScrBuffers` owns the parameter, input and output slots. `set` replaces one
   slot, `alias` shares an allocation between slots, and `take` transfers its
   ownership while clearing all aliases. `edit` and `edit_ubf` allow mutation and
   growth while updating aliases, including during unwinding. A returned input
@@ -251,15 +309,15 @@ assert_eq!(output.as_bytes(), b"hello from Rust");
   structured UBF/VIEW buffers keep Rust's tracked byte length at zero so their
   padding and unused capacity are not exposed. Use typed access for those buffers.
 - Execution updates buffer pointers and lengths on success and failure. Inspect
-  the same `ScriptBuffers` after an error to retrieve a failure output or a
-  relocated input. `ScriptError` retains both native and engine error codes.
+  the same `TpScrBuffers` after an error to retrieve a failure output or a
+  relocated input. `TpScrError` retains both native and engine error codes.
 - Registered closures may capture owned Rust state. Their callback context
   exposes the current `AtmiCtx`, callback name/flags, script error APIs, and nested
   `tpscrexec` when the backend supports it. Rust panics are caught and reported as
   scripting failures. Native TLS is restored after callbacks under `ctx-send`.
 - VMs and callbacks are local to their creating thread; callbacks must be
   synchronous. A VM borrows its `AtmiCtx`. Default configuration is `None`;
-  `ScriptConfig::from_raw` is an unsafe escape hatch for backend-specific
+  `TpScrCfg::from_raw` is an unsafe escape hatch for backend-specific
   configuration because the portable core leaves that structure opaque.
 
 The scripting integration fixture checks `ENDUROX_TPSCRIPT_PLUGIN`, installed

@@ -1,8 +1,8 @@
 //! Requires a configured Enduro/X environment and its Python scripting plugin
 //! in NDRX_PLUGINS, with the corresponding endurox Python package importable.
-use endurox_rs::{AtmiCtx, ScriptBuffers, ScriptResult, ScriptSlot as S, NDRX_TPSCR_FLAT};
+use endurox_rs::{AtmiCtx, TpScrBuffers, TpScrResult, TpScrSlot as S, NDRX_TPSCR_FLAT};
 
-fn main() -> ScriptResult<()> {
+fn main() -> TpScrResult<()> {
     let ctx = AtmiCtx::new()?;
     ctx.tpinit()?;
     let mut vm = ctx.tpscrinit(None, 0)?;
@@ -23,7 +23,7 @@ fn main() -> ScriptResult<()> {
         "def main(name, param, incoming, flags):\n    return host(param, incoming, flags)\n",
         NDRX_TPSCR_FLAT,
     )?;
-    let mut buffers = ScriptBuffers::new(&ctx);
+    let mut buffers = TpScrBuffers::new(&ctx);
     buffers.set(S::Input, Some(ctx.tpalloc_carray(b"hello")?))?;
     vm.tpscrexec("example", &mut buffers, 0)?;
     let output = buffers.take(S::Output)?.unwrap();

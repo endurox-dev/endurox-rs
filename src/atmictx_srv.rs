@@ -1,3 +1,4 @@
+//! Service registration, reply ownership transfer, server lifecycle hooks, and poll callbacks.
 use crate::{raw, AtmiCtx, AtmiError, AtmiResult, TpSvcInfo, TypedBuffer, TypedUbf};
 use core::ffi::{c_char, c_int, c_long};
 use std::ffi::{CStr, CString};
@@ -26,7 +27,7 @@ type ServerDoneHook = unsafe extern "C" fn();
 /// Returning `Err(...)` aborts server startup.
 pub type RustServerInitHook = fn(&AtmiCtx, &[String]) -> AtmiResult<()>;
 
-/// High-level server shutdown callback.
+/// High-level server shutdown callback receiving the still-active main context.
 pub type RustServerDoneHook = fn(&AtmiCtx);
 
 /// Per-worker-thread init callback, mirroring C `tpsvrthrinit`.
@@ -61,8 +62,14 @@ pub struct ServerHooks {
     thread_done: Option<RustServerThreadDoneHook>,
 }
 
+/// Builder methods for main-thread and worker-thread lifecycle hooks.
 impl ServerHooks {
     /// Start from the mandatory `tpsvrinit` hook.
+    ///
+    /// # Arguments
+    ///
+    /// - `init`: Main initialization function, receiving the active context and processed
+    ///   server arguments.
     pub fn new(init: RustServerInitHook) -> Self {
         Self {
             init,
@@ -73,18 +80,32 @@ impl ServerHooks {
     }
 
     /// Set the `tpsvrdone` hook.
+    ///
+    /// # Arguments
+    ///
+    /// - `done`: Main shutdown function, called while its context remains usable.
     pub fn done(mut self, done: RustServerDoneHook) -> Self {
         self.done = Some(done);
         self
     }
 
     /// Set the per-worker-thread `tpsvrthrinit` hook.
+    ///
+    /// # Arguments
+    ///
+    /// - `thread_init`: Worker initialization function; receives that worker’s context and
+    ///   server arguments.
     pub fn thread_init(mut self, thread_init: RustServerThreadInitHook) -> Self {
         self.thread_init = Some(thread_init);
         self
     }
 
     /// Set the per-worker-thread `tpsvrthrdone` hook.
+    ///
+    /// # Arguments
+    ///
+    /// - `thread_done`: Worker cleanup function; runs before Enduro/X terminates the worker
+    ///   context.
     pub fn thread_done(mut self, thread_done: RustServerThreadDoneHook) -> Self {
         self.thread_done = Some(thread_done);
         self
@@ -96,28 +117,37 @@ impl ServerHooks {
 /// When Enduro/X dispatch threading is configured, the same function may be
 /// invoked concurrently on several libatmisrv worker threads. Any application
 /// state accessed by the handler must therefore be thread-safe.
+///
+/// Arguments are the invoking ATMI context and mutable request metadata. Take the
+/// request buffer from the metadata before returning or forwarding it.
 pub type RustServiceCallback = for<'ctx> fn(&'ctx AtmiCtx, &mut TpSvcInfo<'ctx>);
 
 /// Event delivered to a Rust poller callback registered with
 /// [`AtmiCtx::tpext_addpollerfd`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PollerEvent {
+    /// Registered descriptor reporting readiness.
     pub fd: i32,
+    /// Native poll-event bitmask reported for this descriptor.
     pub events: u32,
+    /// Application value supplied when this descriptor was registered.
     pub user_data: usize,
 }
 
 /// High-level poller callback used by [`AtmiCtx::tpext_addpollerfd`].
 /// The context is the owning main server context because extension events are
 /// always dispatched by the main poll loop, never by service workers.
+/// Receives that context and a `PollerEvent`; return `0` for success or `-1` for failure.
 pub type RustPollerCallback = for<'ctx> fn(&'ctx AtmiCtx, PollerEvent) -> i32;
 
 /// High-level periodic callback used by [`AtmiCtx::tpext_addperiodcb`].
 /// The callback receives the owning main server context.
+/// Return `0` for success or `-1` to report failure to the native event loop.
 pub type RustPeriodCallback = for<'ctx> fn(&'ctx AtmiCtx) -> i32;
 
 /// High-level before-poll callback used by [`AtmiCtx::tpext_addb4pollcb`].
 /// The callback receives the owning main server context.
+/// Return `0` for success or `-1` to report failure to the native event loop.
 pub type RustBeforePollCallback = for<'ctx> fn(&'ctx AtmiCtx) -> i32;
 
 /// Service return status for [`AtmiCtx::tpreturn`].
@@ -127,7 +157,9 @@ pub enum TpReturnStatus {
     Fail,
 }
 
+/// Conversion of Rust service outcomes to native status values.
 impl TpReturnStatus {
+    /// Convert the service outcome to native `TPSUCCESS` or `TPFAIL`.
     #[inline]
     fn to_raw(self) -> c_int {
         match self {
@@ -152,7 +184,9 @@ struct ServerRuntime {
     services: HashMap<String, RustServiceCallback>,
 }
 
+/// Reset of process-wide service and lifecycle registrations.
 impl ServerRuntime {
+    /// Clear the active context, lifecycle hooks, saved failures, and service registry.
     fn reset(&mut self) {
         self.ctx_addr = 0;
         self.main_thread_id = None;
@@ -177,16 +211,19 @@ struct ExtensionRuntime {
 
 static EXTENSION_RUNTIME: OnceLock<Mutex<ExtensionRuntime>> = OnceLock::new();
 
+/// Return the lazily initialized server-state mutex.
 #[inline]
 fn server_runtime() -> &'static Mutex<ServerRuntime> {
     SERVER_RUNTIME.get_or_init(|| Mutex::new(ServerRuntime::default()))
 }
 
+/// Return the lazily initialized poll-extension registry mutex.
 #[inline]
 fn extension_runtime() -> &'static Mutex<ExtensionRuntime> {
     EXTENSION_RUNTIME.get_or_init(|| Mutex::new(ExtensionRuntime::default()))
 }
 
+/// Create the error reported when a panic has poisoned server-state locking.
 #[inline]
 fn runtime_lock_err() -> AtmiError {
     AtmiError::new(raw::TPESYSTEM, "server runtime state is poisoned")
@@ -194,7 +231,9 @@ fn runtime_lock_err() -> AtmiError {
 
 struct ServerRuntimeGuard;
 
+/// Clear the active server state when the server runner exits.
 impl Drop for ServerRuntimeGuard {
+    /// Clear the active server state when the server runner exits.
     fn drop(&mut self) {
         if let Ok(mut rt) = server_runtime().lock() {
             rt.reset();
@@ -208,7 +247,14 @@ struct ServerThreadModeGuard {
     previous_thread_done: Option<ServerDoneHook>,
 }
 
+/// Temporary installation of native dispatch-thread settings and Rust worker hooks.
 impl ServerThreadModeGuard {
+    /// Install Rust worker hooks and enable native dispatch-thread support until this guard is
+    /// dropped.
+    ///
+    /// # Safety
+    ///
+    /// No other server runner may mutate native dispatch globals while this guard is alive.
     unsafe fn enable() -> Self {
         let previous = raw::_tmbuilt_with_thread_option;
         let previous_thread_init = raw::ndrx_G_tpsvrthrinit;
@@ -226,7 +272,9 @@ impl ServerThreadModeGuard {
     }
 }
 
+/// Restore the native thread mode and worker hooks saved by this guard.
 impl Drop for ServerThreadModeGuard {
+    /// Restore the native thread mode and worker hooks saved by this guard.
     fn drop(&mut self) {
         unsafe {
             raw::_tmbuilt_with_thread_option = self.previous;
@@ -236,12 +284,34 @@ impl Drop for ServerThreadModeGuard {
     }
 }
 
+/// Return the original native request buffer with a failure status.
+///
+/// # Arguments
+///
+/// - `svc_ptr`: Live native request metadata; its data allocation must remain available for
+///   reply ownership transfer.
+///
+/// # Safety
+///
+/// The request must be live on the current service context, with its buffer available for
+/// transfer. Native returns must not long-jump across Rust frames.
 unsafe fn fail_current_service(svc_ptr: *mut raw::TPSVCINFO) {
     let data = (*svc_ptr).data;
     let len = (*svc_ptr).len.max(0) as c_long;
     raw::tpreturn(TpReturnStatus::Fail.to_raw(), 0, data, len, 0);
 }
 
+/// Invoke the registered Rust service with its active context and convert panics to failed replies.
+///
+/// # Arguments
+///
+/// - `svc_ptr`: Live native request metadata; its data allocation must remain available for
+///   reply ownership transfer.
+///
+/// # Safety
+///
+/// Enduro/X must invoke this with live request metadata on an initialized dispatch thread. The
+/// runner must remain active and use `ATMI_SRVLIB_NOLONGJUMP`.
 unsafe extern "C" fn rust_service_dispatch(svc_ptr: *mut raw::TPSVCINFO) {
     if svc_ptr.is_null() {
         return;
@@ -324,6 +394,17 @@ unsafe extern "C" fn rust_service_dispatch(svc_ptr: *mut raw::TPSVCINFO) {
     }
 }
 
+/// Deliver a native descriptor event to its Rust callback on the main server context.
+///
+/// # Arguments
+///
+/// - `fd`: File descriptor to register, remove, or dispatch; ownership stays with the caller.
+/// - `events`: Native poll-event bitmask selecting or reporting descriptor readiness.
+/// - `_ptr1`: Unused native userdata pointer; Rust looks up userdata by descriptor.
+///
+/// # Safety
+///
+/// Invoke only from Enduro/X’s main poll loop while the registered server context is alive.
 unsafe extern "C" fn rust_poller_dispatch(
     fd: c_int,
     events: u32,
@@ -354,6 +435,11 @@ unsafe extern "C" fn rust_poller_dispatch(
     .unwrap_or(-1)
 }
 
+/// Invoke the registered periodic callback, converting a panic to native failure.
+///
+/// # Safety
+///
+/// Invoke only from Enduro/X’s main poll loop while the registered server context is alive.
 unsafe extern "C" fn rust_period_dispatch() -> c_int {
     let ctx = match main_extension_context() {
         Some(ctx) => ctx,
@@ -370,6 +456,11 @@ unsafe extern "C" fn rust_period_dispatch() -> c_int {
     }
 }
 
+/// Invoke the callback that runs before polling, converting a panic to native failure.
+///
+/// # Safety
+///
+/// Invoke only from Enduro/X’s main poll loop while the registered server context is alive.
 unsafe extern "C" fn rust_before_poll_dispatch() -> c_int {
     let ctx = match main_extension_context() {
         Some(ctx) => ctx,
@@ -386,20 +477,11 @@ unsafe extern "C" fn rust_before_poll_dispatch() -> c_int {
     }
 }
 
-/// Resolve the `tp_run` context for an extension callback, or `None` when it is
-/// unavailable or the caller is not the main poll-loop thread.
-///
-/// # Safety
-///
-/// The returned `'static` lifetime is wider than the context actually lives:
-/// `ctx_addr` points at a stack local owned by [`AtmiCtx::tp_run`]. Two
-/// invariants keep it from escaping. `ServerRuntimeGuard` clears `ctx_addr`
-/// before `tp_run` returns, so a stale address is never resolved, and the
-/// extension callback types are higher-ranked (`for<'ctx> fn(&'ctx AtmiCtx,
-/// ..)`), so a callback cannot store the reference it receives. Callers must
-/// therefore only narrow this lifetime into a callback invocation and never
-/// retain the reference past that call.
 /// Reject a poll-extension mutation issued from anywhere but the main thread.
+///
+/// # Arguments
+///
+/// - `what`: Operation name included when rejecting a call from a dispatch worker.
 ///
 /// Enduro/X keeps these in one unsynchronised global list that the main
 /// dispatch thread walks on every poll iteration, so mutating it from a worker
@@ -426,6 +508,19 @@ fn require_main_thread(what: &str) -> AtmiResult<()> {
     }
 }
 
+/// Resolve the `tp_run` context for an extension callback, or `None` when it is
+/// unavailable or the caller is not the main poll-loop thread.
+///
+/// # Safety
+///
+/// The returned `'static` lifetime is wider than the context actually lives:
+/// `ctx_addr` points at a stack local owned by [`AtmiCtx::tp_run`]. Two
+/// invariants keep it from escaping. `ServerRuntimeGuard` clears `ctx_addr`
+/// before `tp_run` returns, so a stale address is never resolved, and the
+/// extension callback types are higher-ranked (`for<'ctx> fn(&'ctx AtmiCtx,
+/// ..)`), so a callback cannot store the reference it receives. Callers must
+/// therefore only narrow this lifetime into a callback invocation and never
+/// retain the reference past that call.
 unsafe fn main_extension_context() -> Option<&'static AtmiCtx> {
     let current_thread = std::thread::current().id();
     let ctx_addr = match server_runtime().lock() {
@@ -444,6 +539,16 @@ unsafe fn main_extension_context() -> Option<&'static AtmiCtx> {
 }
 
 /// Collect `argc`/`argv` as Enduro/X hands them to a C hook.
+///
+/// # Arguments
+///
+/// - `argc`: Number of entries in the native argument array.
+/// - `argv`: Readable array of `argc` C-string pointers, valid for the hook or server run.
+///
+/// # Safety
+///
+/// A non-null `argv` must contain at least `argc` readable pointers. Non-null entries must be
+/// valid C strings.
 unsafe fn hook_args(argc: c_int, argv: *mut *mut c_char) -> Vec<String> {
     if argv.is_null() || argc <= 0 {
         return Vec::new();
@@ -462,13 +567,27 @@ unsafe fn hook_args(argc: c_int, argv: *mut *mut c_char) -> Vec<String> {
 
 /// `tpsvrthrinit` trampoline, run on each dispatch thread.
 ///
+/// # Arguments
+///
+/// - `argc`: Number of entries in the native argument array.
+/// - `argv`: Readable array of `argc` C-string pointers, valid for the hook or server run.
+///
 /// Enduro/X calls this from `ndrx_call_tpsvrthrinit`, which has already done
 /// `tpinit(NULL)` for the worker, so the thread has a usable ATMI context. The
 /// library default runs first for its `tx_open()`; a Rust hook runs after it and
 /// on top of it, never instead.
+///
+/// # Safety
+///
+/// Enduro/X must have initialized the worker’s ATMI TLS. The argument array and registered
+/// hooks must remain valid during the call.
 unsafe extern "C" fn rust_thread_init(argc: c_int, argv: *mut *mut c_char) -> c_int {
     /// Keep the first failure only: later workers may fail for knock-on
     /// reasons, and the first one is the useful diagnosis.
+    ///
+    /// # Arguments
+    ///
+    /// - `err`: Worker initialization error to preserve if no earlier worker error was recorded.
     fn record(err: AtmiError) -> c_int {
         if let Ok(mut rt) = server_runtime().lock() {
             if rt.thread_init_error.is_none() {
@@ -514,6 +633,11 @@ unsafe extern "C" fn rust_thread_init(argc: c_int, argv: *mut *mut c_char) -> c_
 /// `ndrx_call_tpsvrthrdone` invokes this *before* `tpterm()`, so the worker
 /// context is still live. The Rust hook runs first, then the library default
 /// for its `tx_close()`.
+///
+/// # Safety
+///
+/// Call on the initialized worker before its ATMI session is terminated, while the server
+/// runner remains active.
 unsafe extern "C" fn rust_thread_done() {
     let hook = match server_runtime().lock() {
         Ok(rt) => rt.thread_done_hook,
@@ -529,6 +653,17 @@ unsafe extern "C" fn rust_thread_done() {
     raw::tpsvrthrdone();
 }
 
+/// Run the Rust main initialization hook and preserve its error for the server runner.
+///
+/// # Arguments
+///
+/// - `argc`: Number of entries in the native argument array.
+/// - `argv`: Readable array of `argc` C-string pointers, valid for the hook or server run.
+///
+/// # Safety
+///
+/// The runner’s context and hook must remain alive; `argv` must contain `argc` readable
+/// C-string pointers when non-null.
 unsafe extern "C" fn rust_server_init(argc: c_int, argv: *mut *mut c_char) -> c_int {
     let (ctx_addr, init_hook) = match server_runtime().lock() {
         Ok(rt) => (rt.ctx_addr, rt.init_hook),
@@ -579,6 +714,11 @@ unsafe extern "C" fn rust_server_init(argc: c_int, argv: *mut *mut c_char) -> c_
     }
 }
 
+/// Run the Rust main shutdown hook without allowing a panic across the C boundary.
+///
+/// # Safety
+///
+/// Call on the main server thread while the runner’s context and shutdown hook remain alive.
 unsafe extern "C" fn rust_server_done() {
     let (ctx_addr, done_hook) = match server_runtime().lock() {
         Ok(rt) => (rt.ctx_addr, rt.done_hook),
@@ -597,7 +737,14 @@ unsafe extern "C" fn rust_server_done() {
     let _ = catch_unwind(AssertUnwindSafe(|| done_cb(ctx)));
 }
 
+/// Service dispatch, ownership transfer, and native server-loop integration.
 impl AtmiCtx {
+    /// Translate a zero native status to success and any other status to the current ATMI error.
+    ///
+    /// # Arguments
+    ///
+    /// - `rc`: Native return status; only `EXSUCCEED` is treated as success.
+    ///
     #[inline]
     pub(crate) fn rc_to_result(&self, rc: c_int) -> AtmiResult<()> {
         if rc == raw::EXSUCCEED as c_int {
@@ -607,6 +754,14 @@ impl AtmiCtx {
         }
     }
 
+    /// Advertise a service using a native C callback and an explicit function name.
+    ///
+    /// # Arguments
+    ///
+    /// - `svc_nm`: Advertised service name, without embedded NUL bytes.
+    /// - `p_func`: C-compatible service entry point; `None` passes a null callback to Enduro/X.
+    /// - `fn_nm`: Function name recorded in service metadata, which may differ from the service
+    ///   name.
     pub fn tpadvertise_full(
         &self,
         svc_nm: &str,
@@ -634,6 +789,11 @@ impl AtmiCtx {
 
     /// High-level Rust service advertisement.
     ///
+    /// # Arguments
+    ///
+    /// - `svc_nm`: Advertised service name, without embedded NUL bytes.
+    /// - `handler`: Rust handler receiving the active context and mutable service request metadata.
+    ///
     /// This avoids `extern "C"` callbacks in user code. Register these from
     /// the `tp_run(...)` init hook.
     pub fn tpadvertise(&self, svc_nm: &str, handler: RustServiceCallback) -> AtmiResult<()> {
@@ -658,6 +818,11 @@ impl AtmiCtx {
         Ok(())
     }
 
+    /// Remove a service advertisement and its matching Rust handler registration.
+    ///
+    /// # Arguments
+    ///
+    /// - `svc_nm`: Advertised service name, without embedded NUL bytes.
     pub fn tpunadvertise(&self, svc_nm: &str) -> AtmiResult<()> {
         let c_svc = CString::new(svc_nm).map_err(|_| self.atmi_last_error())?;
         let self_addr = self as *const AtmiCtx as usize;
@@ -677,6 +842,20 @@ impl AtmiCtx {
         Ok(())
     }
 
+    /// Transfer a native reply buffer to Enduro/X with the service outcome.
+    ///
+    /// # Arguments
+    ///
+    /// - `rval`: Native service return status, normally `TPSUCCESS` or `TPFAIL`.
+    /// - `rcode`: Application-defined service return code delivered to the caller.
+    /// - `data`: Reply or forwarded buffer whose ownership transfers to Enduro/X.
+    /// - `len`: Payload length in bytes; must be valid for the supplied native allocation.
+    /// - `flags`: Native service-operation flags; use `0` for default behavior.
+    ///
+    /// # Safety
+    ///
+    /// The native buffer and length must be valid and exclusively available for ownership
+    /// transfer. Call only during service dispatch with long jumps disabled.
     unsafe fn tpreturn_raw(
         &self,
         rval: i32,
@@ -705,6 +884,19 @@ impl AtmiCtx {
         );
     }
 
+    /// Transfer the current request to another service through the native forwarding API.
+    ///
+    /// # Arguments
+    ///
+    /// - `svc`: Destination service name, without embedded NUL bytes.
+    /// - `data`: Reply or forwarded buffer whose ownership transfers to Enduro/X.
+    /// - `len`: Payload length in bytes; must be valid for the supplied native allocation.
+    /// - `flags`: Native service-operation flags; use `0` for default behavior.
+    ///
+    /// # Safety
+    ///
+    /// The service name must be a valid C string and the buffer must be exclusively available
+    /// for transfer with a valid length. Call during service dispatch with long jumps disabled.
     pub(crate) unsafe fn tpforward(&self, svc: &str, data: *mut c_char, len: usize, flags: i64) {
         let c_svc = match CString::new(svc) {
             Ok(s) => s,
@@ -731,13 +923,25 @@ impl AtmiCtx {
 
     /// Forward a UBF request from the current service to another service.
     ///
+    /// # Arguments
+    ///
+    /// - `svc`: Destination service name, without embedded NUL bytes.
+    /// - `data`: Reply or forwarded buffer whose ownership transfers to Enduro/X.
+    /// - `flags`: Native service-operation flags; use `0` for default behavior.
+    ///
     /// This consumes `data` and transfers ownership to Enduro/X. The function
-    /// does not return to the caller in normal Enduro/X control flow.
+    /// returns normally under `tp_run`; return from the handler after forwarding.
     pub fn tpforward_ubf(&self, svc: &str, data: TypedUbf<'_>, flags: i64) {
         let ptr = data.into_raw();
         unsafe { self.tpforward(svc, ptr, 0, flags) };
     }
 
+    /// Request termination of the native server from a service callback.
+    ///
+    /// # Safety
+    ///
+    /// Call only from a native service callback with control-flow settings that cannot
+    /// long-jump across Rust frames.
     pub(crate) unsafe fn tpexit(&self) {
         #[cfg(not(feature = "ctx-send"))]
         raw::tpexit();
@@ -746,6 +950,12 @@ impl AtmiCtx {
         raw::Otpexit(self.c_ctx_ptr());
     }
 
+    /// Release the current service dispatch without sending a reply.
+    ///
+    /// # Safety
+    ///
+    /// Call only during service dispatch with long jumps disabled, preserving any request
+    /// ownership needed for later completion.
     pub(crate) unsafe fn tpcontinue(&self) {
         #[cfg(not(feature = "ctx-send"))]
         raw::tpcontinue();
@@ -754,6 +964,12 @@ impl AtmiCtx {
         raw::Otpcontinue(self.c_ctx_ptr());
     }
 
+    /// Capture native service context data for transfer to another thread.
+    ///
+    /// # Safety
+    ///
+    /// Call during an active service invocation. The returned allocation must be released with
+    /// `tpsrvfreectxdata`.
     pub(crate) unsafe fn tpsrvgetctxdata(&self) -> *mut c_char {
         #[cfg(not(feature = "ctx-send"))]
         {
@@ -766,6 +982,18 @@ impl AtmiCtx {
         }
     }
 
+    /// Capture service context data using caller-provided or native-allocated storage.
+    ///
+    /// # Arguments
+    ///
+    /// - `p_buf`: Writable context-data storage, or null to request a native allocation.
+    /// - `p_len`: Writable length slot carrying storage capacity on input and the captured size
+    ///   on output.
+    ///
+    /// # Safety
+    ///
+    /// Call during active service dispatch. `p_len` must be writable, and a non-null `p_buf`
+    /// must satisfy the native storage and allocation contract.
     pub(crate) unsafe fn tpsrvgetctxdata2(
         &self,
         p_buf: *mut c_char,
@@ -782,6 +1010,16 @@ impl AtmiCtx {
         }
     }
 
+    /// Free context data returned by the native service-context capture API.
+    ///
+    /// # Arguments
+    ///
+    /// - `p_buf`: Owned native context-data allocation to release exactly once.
+    ///
+    /// # Safety
+    ///
+    /// The pointer must be a live native context-data allocation owned by the caller and must
+    /// not be used after this call.
     pub(crate) unsafe fn tpsrvfreectxdata(&self, p_buf: *mut c_char) {
         #[cfg(not(feature = "ctx-send"))]
         raw::tpsrvfreectxdata(p_buf);
@@ -790,6 +1028,12 @@ impl AtmiCtx {
         raw::Otpsrvfreectxdata(self.c_ctx_ptr(), p_buf);
     }
 
+    /// Restore previously captured service context data on the current context.
+    ///
+    /// # Arguments
+    ///
+    /// - `data`: Valid context-data block captured by `tpsrvgetctxdata` or `tpsrvgetctxdata2`.
+    /// - `flags`: Native service-operation flags; use `0` for default behavior.
     pub(crate) fn tpsrvsetctxdata(&self, data: *mut c_char, flags: i64) -> AtmiResult<()> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpsrvsetctxdata(data, flags as c_long) };
@@ -800,6 +1044,17 @@ impl AtmiCtx {
         self.rc_to_result(rc)
     }
 
+    /// Register a descriptor and callback in the server’s main event loop.
+    ///
+    /// # Arguments
+    ///
+    /// - `fd`: File descriptor to register, remove, or dispatch; ownership stays with the caller.
+    /// - `events`: Native poll-event bitmask selecting or reporting descriptor readiness.
+    /// - `user_data`: Application value copied into each `PollerEvent`; no pointer ownership is
+    ///   inferred.
+    /// - `callback`: Function called with the main server context; return `0` for success or
+    ///   `-1` for failure.
+    ///
     /// # Main-thread only
     ///
     /// Enduro/X keeps the poller extensions in a single global list
@@ -857,6 +1112,12 @@ impl AtmiCtx {
         }
     }
 
+    /// Remove a descriptor’s poll callback without closing the descriptor.
+    ///
+    /// # Arguments
+    ///
+    /// - `fd`: File descriptor to register, remove, or dispatch; ownership stays with the caller.
+    ///
     /// # Main-thread only
     ///
     /// Enduro/X keeps the poller extensions in a single global list
@@ -888,6 +1149,14 @@ impl AtmiCtx {
         }
     }
 
+    /// Register the callback that runs at a configured interval on the main server thread.
+    ///
+    /// # Arguments
+    ///
+    /// - `secs`: Positive interval in seconds between periodic callback invocations.
+    /// - `callback`: Function called with the main server context; return `0` for success or
+    ///   `-1` for failure.
+    ///
     /// # Main-thread only
     ///
     /// Enduro/X keeps the poller extensions in a single global list
@@ -926,6 +1195,8 @@ impl AtmiCtx {
         }
     }
 
+    /// Remove the server’s periodic callback.
+    ///
     /// # Main-thread only
     ///
     /// Enduro/X keeps the poller extensions in a single global list
@@ -957,6 +1228,13 @@ impl AtmiCtx {
         }
     }
 
+    /// Register the callback that runs before each main-loop poll.
+    ///
+    /// # Arguments
+    ///
+    /// - `callback`: Function called with the main server context; return `0` for success or
+    ///   `-1` for failure.
+    ///
     /// # Main-thread only
     ///
     /// Enduro/X keeps the poller extensions in a single global list
@@ -994,6 +1272,8 @@ impl AtmiCtx {
         }
     }
 
+    /// Remove the server’s before-poll callback.
+    ///
     /// # Main-thread only
     ///
     /// Enduro/X keeps the poller extensions in a single global list
@@ -1025,6 +1305,7 @@ impl AtmiCtx {
         }
     }
 
+    /// Return the configured identifier of this server instance.
     pub fn tpgetsrvid(&self) -> AtmiResult<i32> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpgetsrvid() };
@@ -1039,6 +1320,17 @@ impl AtmiCtx {
         }
     }
 
+    /// Run the native server entry point using C command-line arguments.
+    ///
+    /// # Arguments
+    ///
+    /// - `argc`: Number of entries in the native argument array.
+    /// - `argv`: Readable array of `argc` C-string pointers, valid for the hook or server run.
+    ///
+    /// # Safety
+    ///
+    /// The arguments must remain valid throughout the server run. Native control flow must not
+    /// long-jump across Rust callbacks.
     pub(crate) unsafe fn ndrx_main(&self, argc: i32, argv: *mut *mut c_char) -> i32 {
         #[cfg(not(feature = "ctx-send"))]
         {
@@ -1051,6 +1343,20 @@ impl AtmiCtx {
         }
     }
 
+    /// Run the native server entry point with explicit lifecycle callbacks and integration flags.
+    ///
+    /// # Arguments
+    ///
+    /// - `argc`: Number of entries in the native argument array.
+    /// - `argv`: Readable array of `argc` C-string pointers, valid for the hook or server run.
+    /// - `in_tpsvrinit`: Optional native initialization callback, valid for the server run.
+    /// - `in_tpsvrdone`: Optional native shutdown callback, valid for the server run.
+    /// - `flags`: Server integration options; Rust dispatch requires `ATMI_SRVLIB_NOLONGJUMP`.
+    ///
+    /// # Safety
+    ///
+    /// Argument strings and callback pointers must remain valid throughout the server run. Rust
+    /// callbacks require `ATMI_SRVLIB_NOLONGJUMP`.
     pub(crate) unsafe fn ndrx_main_integra(
         &self,
         argc: i32,
@@ -1086,9 +1392,15 @@ impl AtmiCtx {
     /// High-level server runner: hands the four C lifecycle hooks to Enduro/X
     /// and does not return until the server shuts down.
     ///
+    /// # Arguments
+    ///
+    /// - `hooks`: Main and optional worker lifecycle hooks; services are advertised from the
+    ///   main init hook.
+    ///
     /// Handles argv conversion and the low-level C callback wiring.
     ///
     /// ```no_run
+    ///
     /// # use endurox_rs::{AtmiCtx, AtmiResult, ServerHooks};
     /// # fn my_init(_: &AtmiCtx, _: &[String]) -> AtmiResult<()> { Ok(()) }
     /// # fn my_done(_: &AtmiCtx) {}
@@ -1105,6 +1417,13 @@ impl AtmiCtx {
         self.tp_run_inner(hooks)
     }
 
+    /// Install server state, run Enduro/X, and report the saved initialization failure if
+    /// startup fails.
+    ///
+    /// # Arguments
+    ///
+    /// - `hooks`: Main and optional worker lifecycle hooks; services are advertised from the
+    ///   main init hook.
     fn tp_run_inner(&self, hooks: ServerHooks) -> AtmiResult<()> {
         let self_addr = self as *const AtmiCtx as usize;
         {
@@ -1166,6 +1485,13 @@ impl AtmiCtx {
 
     /// Return a typed buffer from a service callback.
     ///
+    /// # Arguments
+    ///
+    /// - `status`: Whether the service completed successfully or failed.
+    /// - `rcode`: Application-defined service return code delivered to the caller.
+    /// - `data`: Reply or forwarded buffer whose ownership transfers to Enduro/X.
+    /// - `flags`: Native service-operation flags; use `0` for default behavior.
+    ///
     /// Consumes `data` so its `Drop` is **not** called — ownership is
     /// transferred to the XATMI framework. The buffer's tracked `len()` is
     /// forwarded as the `tpreturn` length argument (relevant for CARRAY/STRING;
@@ -1177,6 +1503,13 @@ impl AtmiCtx {
     }
 
     /// Return a UBF buffer from a service callback.
+    ///
+    /// # Arguments
+    ///
+    /// - `status`: Whether the service completed successfully or failed.
+    /// - `rcode`: Application-defined service return code delivered to the caller.
+    /// - `data`: Reply or forwarded buffer whose ownership transfers to Enduro/X.
+    /// - `flags`: Native service-operation flags; use `0` for default behavior.
     ///
     /// Convenience wrapper over [`AtmiCtx::tpreturn`] for the common UBF case.
     pub fn tpreturn_ubf(&self, status: TpReturnStatus, rcode: i64, data: TypedUbf<'_>, flags: i64) {

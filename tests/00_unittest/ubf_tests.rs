@@ -1594,3 +1594,6 @@ mod serde_complex;
 
 #[path = "script_buffer_tests.rs"]
 mod script_buffer_tests;
+
+#[path = "api_additions.rs"]
+mod api_additions;

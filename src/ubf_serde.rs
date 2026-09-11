@@ -1,3 +1,4 @@
+//! Structure, scalar, repeated-field, and flat-group mappings for UBF buffers.
 use crate::{TypedUbf, UbfError, UbfResult, UbfValue};
 
 std::thread_local! {
@@ -6,7 +7,13 @@ std::thread_local! {
 }
 
 struct ReadScope;
+/// Cycle and nesting checks for recursive UBF deserialization.
 impl ReadScope {
+    /// Track a nested mapping read and reject cyclic or excessively deep native buffer graphs.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
     fn enter(ubf: &TypedUbf<'_>) -> UbfResult<Self> {
         READ_PATH.with(|path| {
             let mut path = path.borrow_mut();
@@ -22,7 +29,9 @@ impl ReadScope {
         })
     }
 }
+/// Remove the completed mapping read from the current thread’s recursion path.
 impl Drop for ReadScope {
+    /// Remove the completed mapping read from the current thread’s recursion path.
     fn drop(&mut self) {
         READ_PATH.with(|path| {
             path.borrow_mut().pop();
@@ -31,6 +40,12 @@ impl Drop for ReadScope {
 }
 
 /// Delete every occurrence of `field_id` from `first` upward.
+///
+/// # Arguments
+///
+/// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+/// - `field_id`: Typed UBF identifier selecting the mapped field.
+/// - `first`: Nonnegative starting occurrence.
 ///
 /// Occurrences are removed from the end so the indices below `first` keep their
 /// positions while the list shrinks.
@@ -53,11 +68,22 @@ fn clear_from(ubf: &mut TypedUbf<'_>, field_id: i32, first: i32) -> UbfResult<()
 /// mappings. A derive can call [`UbfFieldSerialize::ubf_write_field`] for each
 /// annotated field.
 pub trait UbfSerialize {
+    /// Write this structure’s mapped fields into a UBF; an error may leave earlier fields updated.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     fn ubf_serialize<'ctx>(&self, ubf: &mut TypedUbf<'ctx>, realloc: bool) -> UbfResult<()>;
 }
 
 /// Deserialize a Rust structure from a UBF buffer.
 pub trait UbfDeserialize: Sized {
+    /// Read this structure from a UBF without extracting native pointer targets.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
     fn ubf_deserialize<'ctx>(ubf: &TypedUbf<'ctx>) -> UbfResult<Self>;
 }
 
@@ -66,6 +92,15 @@ pub trait UbfFieldSerialize {
     /// Set to false if this mapper can consume zero or multiple occurrences.
     /// Collection elements must always consume exactly one occurrence.
     const SINGLE: bool = true;
+    /// Write this value to its mapped field occurrences; errors may leave partial updates.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `field_id`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     fn ubf_write_field<'ctx>(
         &self,
         ubf: &mut TypedUbf<'ctx>,
@@ -79,6 +114,14 @@ pub trait UbfFieldSerialize {
 pub trait UbfFieldDeserialize: Sized {
     /// Must agree with the corresponding serializer's occurrence width.
     const SINGLE: bool = true;
+    /// Read this value from its mapped field occurrences into owned Rust data.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
+    /// - `field_id`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
     fn ubf_read_field<'ctx>(
         ubf: &TypedUbf<'ctx>,
         field_id: i32,
@@ -100,8 +143,14 @@ pub struct UbfCarray(pub Vec<u8>);
 #[derive(Debug)]
 pub struct UbfAdhoc<'ctx>(pub TypedUbf<'ctx>);
 
+/// Convenience methods for writing and reading mapped Rust structures.
 impl TypedUbf<'_> {
     /// Write mapped fields. On error, earlier fields may already be updated.
+    ///
+    /// # Arguments
+    ///
+    /// - `value`: Rust value whose mapped fields are written to the destination.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     pub fn ubf_write<T: UbfSerialize>(&mut self, value: &T, realloc: bool) -> UbfResult<()> {
         value.ubf_serialize(self, realloc)
     }
@@ -112,6 +161,16 @@ impl TypedUbf<'_> {
     }
 }
 
+/// Check native integer bounds before writing one numeric occurrence.
+///
+/// # Arguments
+///
+/// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+/// - `field`: Typed UBF identifier selecting the mapped field.
+/// - `occurrence`: Zero-based starting occurrence; collections occupy successive occurrences
+///   from here.
+/// - `value`: Signed integer checked against the destination field’s native width.
+/// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
 fn write_integer(
     ubf: &mut TypedUbf<'_>,
     field: i32,
@@ -134,9 +193,21 @@ fn write_integer(
     }
     ubf.bchg(field, occurrence, UbfValue::Long(value), realloc)
 }
+/// Implement integer field mappings with checked native and Rust ranges.
 macro_rules! integer_field {
     ($($ty:ty),* $(,)?) => { $(
+        /// Write one integer after checking both Rust-to-native and native field-width bounds.
         impl UbfFieldSerialize for $ty {
+            /// Write one integer after checking both Rust-to-native and native field-width bounds.
+            ///
+            /// # Arguments
+            ///
+            /// - `ubf`: Destination UBF; serialization can leave partial updates if a later
+            ///   write fails.
+            /// - `field`: Typed UBF identifier selecting the mapped field.
+            /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+            ///   occurrences from here.
+            /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
             fn ubf_write_field<'ctx>(&self, ubf: &mut TypedUbf<'ctx>, field: i32,
                 occurrence: i32, realloc: bool) -> UbfResult<()> {
                 let value = i64::try_from(*self)
@@ -144,7 +215,17 @@ macro_rules! integer_field {
                 write_integer(ubf, field, occurrence, value, realloc)
             }
         }
+        /// Read one integer with native conversion and reject values outside the Rust type’s range.
         impl UbfFieldDeserialize for $ty {
+            /// Read one integer with native conversion and reject values outside the Rust
+            /// type’s range.
+            ///
+            /// # Arguments
+            ///
+            /// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
+            /// - `field`: Typed UBF identifier selecting the mapped field.
+            /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+            ///   occurrences from here.
             fn ubf_read_field<'ctx>(ubf: &TypedUbf<'ctx>, field: i32, occurrence: i32) -> UbfResult<Self> {
                 ubf_occurrence(occurrence, 0)?;
                 <$ty>::try_from(ubf.bget_long(field, occurrence)?)
@@ -154,9 +235,21 @@ macro_rules! integer_field {
     )* };
 }
 integer_field!(i8, u8, i16, u16, i32, u32, i64, u64, isize, usize);
+/// Implement floating-point field mappings using the selected native getter.
 macro_rules! float_field {
     ($ty:ty, $getter:ident) => {
+        /// Write one floating-point occurrence using native type conversion.
         impl UbfFieldSerialize for $ty {
+            /// Write one floating-point occurrence using native type conversion.
+            ///
+            /// # Arguments
+            ///
+            /// - `ubf`: Destination UBF; serialization can leave partial updates if a later
+            ///   write fails.
+            /// - `field`: Typed UBF identifier selecting the mapped field.
+            /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+            ///   occurrences from here.
+            /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
             fn ubf_write_field<'ctx>(
                 &self,
                 ubf: &mut TypedUbf<'ctx>,
@@ -167,7 +260,16 @@ macro_rules! float_field {
                 ubf.bchg(field, occurrence, *self, realloc)
             }
         }
+        /// Read one floating-point occurrence using native conversion.
         impl UbfFieldDeserialize for $ty {
+            /// Read one floating-point occurrence using native conversion.
+            ///
+            /// # Arguments
+            ///
+            /// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
+            /// - `field`: Typed UBF identifier selecting the mapped field.
+            /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+            ///   occurrences from here.
             fn ubf_read_field<'ctx>(
                 ubf: &TypedUbf<'ctx>,
                 field: i32,
@@ -180,7 +282,17 @@ macro_rules! float_field {
 }
 float_field!(f32, bget_float);
 float_field!(f64, bget_double);
+/// Write a boolean as integer zero or one after checking the native field width.
 impl UbfFieldSerialize for bool {
+    /// Write a boolean as integer zero or one after checking the native field width.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `field`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     fn ubf_write_field<'ctx>(
         &self,
         ubf: &mut TypedUbf<'ctx>,
@@ -191,7 +303,16 @@ impl UbfFieldSerialize for bool {
         write_integer(ubf, field, occurrence, i64::from(*self), realloc)
     }
 }
+/// Read integer zero or one as a boolean; reject any other value.
 impl UbfFieldDeserialize for bool {
+    /// Read integer zero or one as a boolean; reject any other value.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
+    /// - `field`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
     fn ubf_read_field<'ctx>(ubf: &TypedUbf<'ctx>, field: i32, occurrence: i32) -> UbfResult<Self> {
         match ubf.bget_long(field, occurrence)? {
             0 => Ok(false),
@@ -204,7 +325,17 @@ impl UbfFieldDeserialize for bool {
     }
 }
 
+/// Write an owned string’s contents into one occurrence.
 impl UbfFieldSerialize for String {
+    /// Write an owned string’s contents into one occurrence.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `field_id`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     fn ubf_write_field<'ctx>(
         &self,
         ubf: &mut TypedUbf<'ctx>,
@@ -216,7 +347,17 @@ impl UbfFieldSerialize for String {
     }
 }
 
+/// Copy this string slice into one occurrence.
 impl UbfFieldSerialize for str {
+    /// Copy this string slice into one occurrence.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `field_id`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     fn ubf_write_field<'ctx>(
         &self,
         ubf: &mut TypedUbf<'ctx>,
@@ -228,7 +369,16 @@ impl UbfFieldSerialize for str {
     }
 }
 
+/// Read one occurrence into an owned string.
 impl UbfFieldDeserialize for String {
+    /// Read one occurrence into an owned string.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
+    /// - `field_id`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
     fn ubf_read_field<'ctx>(
         ubf: &TypedUbf<'ctx>,
         field_id: i32,
@@ -238,7 +388,17 @@ impl UbfFieldDeserialize for String {
     }
 }
 
+/// Write the byte vector as one CARRAY occurrence, preserving its byte length.
 impl UbfFieldSerialize for UbfCarray {
+    /// Write the byte vector as one CARRAY occurrence, preserving its byte length.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `field_id`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     fn ubf_write_field<'ctx>(
         &self,
         ubf: &mut TypedUbf<'ctx>,
@@ -255,7 +415,16 @@ impl UbfFieldSerialize for UbfCarray {
     }
 }
 
+/// Read one binary occurrence into a CARRAY wrapper.
 impl UbfFieldDeserialize for UbfCarray {
+    /// Read one binary occurrence into a CARRAY wrapper.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
+    /// - `field_id`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
     fn ubf_read_field<'ctx>(
         ubf: &TypedUbf<'ctx>,
         field_id: i32,
@@ -265,11 +434,21 @@ impl UbfFieldDeserialize for UbfCarray {
     }
 }
 
+/// Delegate field serialization to the referenced value.
 impl<'value, T> UbfFieldSerialize for &'value T
 where
     T: UbfFieldSerialize + ?Sized,
 {
     const SINGLE: bool = T::SINGLE;
+    /// Delegate field serialization to the referenced value.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `field_id`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     fn ubf_write_field<'ctx>(
         &self,
         ubf: &mut TypedUbf<'ctx>,
@@ -281,11 +460,22 @@ where
     }
 }
 
+/// Write `Some` as one value; for `None`, remove this field’s suffix from the starting occurrence.
 impl<T> UbfFieldSerialize for Option<T>
 where
     T: UbfFieldSerialize,
 {
     const SINGLE: bool = false;
+    /// Write `Some` as one value; for `None`, remove this field’s suffix from the starting
+    /// occurrence.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `field_id`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     fn ubf_write_field<'ctx>(
         &self,
         ubf: &mut TypedUbf<'ctx>,
@@ -306,11 +496,20 @@ where
     }
 }
 
+/// Read an optional scalar; absence becomes `None`, while malformed values remain errors.
 impl<T> UbfFieldDeserialize for Option<T>
 where
     T: UbfFieldDeserialize,
 {
     const SINGLE: bool = false;
+    /// Read an optional scalar; absence becomes `None`, while malformed values remain errors.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
+    /// - `field_id`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
     fn ubf_read_field<'ctx>(
         ubf: &TypedUbf<'ctx>,
         field_id: i32,
@@ -325,11 +524,21 @@ where
     }
 }
 
+/// Write consecutive vector elements and remove stale occurrences after the new suffix.
 impl<T> UbfFieldSerialize for Vec<T>
 where
     T: UbfFieldSerialize,
 {
     const SINGLE: bool = false;
+    /// Write consecutive vector elements and remove stale occurrences after the new suffix.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `field_id`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     fn ubf_write_field<'ctx>(
         &self,
         ubf: &mut TypedUbf<'ctx>,
@@ -346,11 +555,20 @@ where
     }
 }
 
+/// Read the field’s suffix into a vector, starting at the requested occurrence.
 impl<T> UbfFieldDeserialize for Vec<T>
 where
     T: UbfFieldDeserialize,
 {
     const SINGLE: bool = false;
+    /// Read the field’s suffix into a vector, starting at the requested occurrence.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
+    /// - `field_id`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
     fn ubf_read_field<'ctx>(
         ubf: &TypedUbf<'ctx>,
         field_id: i32,
@@ -367,7 +585,17 @@ where
     }
 }
 
+/// Deep-copy an ad-hoc UBF and embed the copy, transferring ownership of its copied targets.
 impl UbfFieldSerialize for UbfAdhoc<'_> {
+    /// Deep-copy an ad-hoc UBF and embed the copy, transferring ownership of its copied targets.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `field_id`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     fn ubf_write_field<'buf>(
         &self,
         ubf: &mut TypedUbf<'buf>,
@@ -383,6 +611,16 @@ impl UbfFieldSerialize for UbfAdhoc<'_> {
 }
 
 /// Write an owned ad-hoc embedded UBF field.
+///
+/// # Arguments
+///
+/// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+/// - `field_id`: Typed UBF identifier selecting the mapped field.
+/// - `occurrence`: Zero-based starting occurrence; collections occupy successive occurrences
+///   from here.
+/// - `value`: Owned ad-hoc UBF to consume and embed; this path requires it to contain no
+///   pointer fields.
+/// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
 pub fn ubf_write_adhoc<'ctx>(
     ubf: &mut TypedUbf<'ctx>,
     field_id: i32,
@@ -394,6 +632,17 @@ pub fn ubf_write_adhoc<'ctx>(
 }
 
 /// Write a nested Rust structure as an embedded UBF field.
+///
+/// # Arguments
+///
+/// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+/// - `field_id`: Typed UBF identifier selecting the mapped field.
+/// - `occurrence`: Zero-based starting occurrence; collections occupy successive occurrences
+///   from here.
+/// - `value`: Rust value whose mapped fields are written to the destination.
+/// - `initial_size`: Initial child UBF allocation size in bytes; VIEW mappings use their
+///   compiled layout size.
+/// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
 pub fn ubf_write_nested<T: UbfSerialize>(
     ubf: &mut TypedUbf<'_>,
     field_id: i32,
@@ -414,6 +663,13 @@ pub fn ubf_write_nested<T: UbfSerialize>(
 }
 
 /// Read a nested Rust structure from an embedded UBF field.
+///
+/// # Arguments
+///
+/// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
+/// - `field_id`: Typed UBF identifier selecting the mapped field.
+/// - `occurrence`: Zero-based starting occurrence; collections occupy successive occurrences
+///   from here.
 pub fn ubf_read_nested<T: UbfDeserialize>(
     ubf: &TypedUbf<'_>,
     field_id: i32,
@@ -426,6 +682,15 @@ pub fn ubf_read_nested<T: UbfDeserialize>(
 }
 
 /// Read an embedded UBF with a caller supplied mapper.
+///
+/// # Arguments
+///
+/// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
+/// - `field_id`: Typed UBF identifier selecting the mapped field.
+/// - `occurrence`: Zero-based starting occurrence; collections occupy successive occurrences
+///   from here.
+/// - `f`: Mapper called with a read-only borrowed child; its result must not retain that child
+///   borrow.
 ///
 /// This is the ad-hoc escape hatch for sub-structures that need to inspect a
 /// nested UBF without declaring a fixed Rust schema for it.
@@ -442,6 +707,12 @@ pub fn ubf_read_adhoc<R>(
 }
 
 /// Add an occurrence offset without truncating or overflowing XATMI's index.
+///
+/// # Arguments
+///
+/// - `first`: Nonnegative starting occurrence.
+/// - `index`: Unsigned offset to add using checked native occurrence arithmetic.
+///
 #[doc(hidden)]
 pub fn ubf_occurrence(first: i32, index: usize) -> UbfResult<i32> {
     if first < 0 {
@@ -465,15 +736,19 @@ pub struct PointerUbf;
 pub struct EmbeddedView;
 /// Store a structure in an owned VIEW allocation referenced by `BFLD_PTR`.
 pub struct PointerView;
+/// Native field kind used by the `EmbeddedUbf` storage strategy.
 impl UbfMapping for EmbeddedUbf {
     const FIELD_TYPE: crate::UbfFieldType = crate::UbfFieldType::Ubf;
 }
+/// Native field kind used by the `PointerUbf` storage strategy.
 impl UbfMapping for PointerUbf {
     const FIELD_TYPE: crate::UbfFieldType = crate::UbfFieldType::Ptr;
 }
+/// Native field kind used by the `EmbeddedView` storage strategy.
 impl UbfMapping for EmbeddedView {
     const FIELD_TYPE: crate::UbfFieldType = crate::UbfFieldType::View;
 }
+/// Native field kind used by the `PointerView` storage strategy.
 impl UbfMapping for PointerView {
     const FIELD_TYPE: crate::UbfFieldType = crate::UbfFieldType::Ptr;
 }
@@ -484,6 +759,17 @@ pub trait UbfMappedSerialize<M: UbfMapping> {
     const SINGLE: bool = true;
     /// Marks a nullable wrapper to reject ambiguous nested optional values.
     const OPTIONAL: bool = false;
+    /// Write a complex value using storage strategy `M`, which selects inline or pointer storage.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `field`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
+    /// - `initial_size`: Initial child UBF allocation size in bytes; VIEW mappings use their
+    ///   compiled layout size.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     fn ubf_write_mapped(
         &self,
         ubf: &mut TypedUbf<'_>,
@@ -493,6 +779,16 @@ pub trait UbfMappedSerialize<M: UbfMapping> {
         realloc: bool,
     ) -> UbfResult<()>;
     /// Write an element inside a collection, preserving its physical position.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `field`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
+    /// - `initial_size`: Initial child UBF allocation size in bytes; VIEW mappings use their
+    ///   compiled layout size.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     fn ubf_write_occurrence(
         &self,
         ubf: &mut TypedUbf<'_>,
@@ -510,15 +806,43 @@ pub trait UbfMappedDeserialize<M: UbfMapping>: Sized {
     const SINGLE: bool = true;
     /// Must agree with the corresponding mapped serializer.
     const OPTIONAL: bool = false;
+    /// Read a complex value using storage strategy `M` without extracting native ownership.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
+    /// - `field`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
     fn ubf_read_mapped(ubf: &TypedUbf<'_>, field: i32, occurrence: i32) -> UbfResult<Self>;
 }
 
+/// Validate the occurrence and ensure the native field kind matches the mapping strategy.
+///
+/// # Arguments
+///
+/// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
+/// - `field`: Typed UBF identifier selecting the mapped field.
+/// - `occurrence`: Zero-based starting occurrence; collections occupy successive occurrences
+///   from here.
 fn mapped_field<M: UbfMapping>(ubf: &TypedUbf<'_>, field: i32, occurrence: i32) -> UbfResult<()> {
     ubf_occurrence(occurrence, 0)?;
     ubf.require_field_type(field, M::FIELD_TYPE, "structure mapping")
 }
 
+/// Serialize one structure into a pointer-free inline UBF occurrence.
 impl<T: UbfSerialize> UbfMappedSerialize<EmbeddedUbf> for T {
+    /// Serialize one structure into a pointer-free inline UBF occurrence.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `field`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
+    /// - `size`: Initial child UBF allocation size in bytes, forwarded through the selected
+    ///   mapping.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     fn ubf_write_mapped(
         &self,
         ubf: &mut TypedUbf<'_>,
@@ -531,7 +855,16 @@ impl<T: UbfSerialize> UbfMappedSerialize<EmbeddedUbf> for T {
         ubf_write_nested(ubf, field, occurrence, self, size, realloc)
     }
 }
+/// Deserialize a structure from an inline UBF while retaining the parent’s ownership.
 impl<T: UbfDeserialize> UbfMappedDeserialize<EmbeddedUbf> for T {
+    /// Deserialize a structure from an inline UBF while retaining the parent’s ownership.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
+    /// - `field`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
     fn ubf_read_mapped(ubf: &TypedUbf<'_>, field: i32, occurrence: i32) -> UbfResult<Self> {
         mapped_field::<EmbeddedUbf>(ubf, field, occurrence)?;
         ubf_read_nested(ubf, field, occurrence)
@@ -539,6 +872,17 @@ impl<T: UbfDeserialize> UbfMappedDeserialize<EmbeddedUbf> for T {
 }
 
 /// Serialize one structure into a newly owned UBF pointer target.
+///
+/// # Arguments
+///
+/// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+/// - `field`: Typed UBF identifier selecting the mapped field.
+/// - `occurrence`: Zero-based starting occurrence; collections occupy successive occurrences
+///   from here.
+/// - `value`: Rust value whose mapped fields are written to the destination.
+/// - `initial_size`: Initial child UBF allocation size in bytes; VIEW mappings use their
+///   compiled layout size.
+/// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
 pub fn ubf_write_ptr<T: UbfSerialize>(
     ubf: &mut TypedUbf<'_>,
     field: i32,
@@ -557,6 +901,13 @@ pub fn ubf_write_ptr<T: UbfSerialize>(
 }
 
 /// Deserialize through a UBF pointer without extracting or taking its ownership.
+///
+/// # Arguments
+///
+/// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
+/// - `field`: Typed UBF identifier selecting the mapped field.
+/// - `occurrence`: Zero-based starting occurrence; collections occupy successive occurrences
+///   from here.
 pub fn ubf_read_ptr<T: UbfDeserialize>(
     ubf: &TypedUbf<'_>,
     field: i32,
@@ -568,7 +919,19 @@ pub fn ubf_read_ptr<T: UbfDeserialize>(
     let _scope = ReadScope::enter(&target)?;
     T::ubf_deserialize(&target)
 }
+/// Serialize one structure into a new UBF allocation owned by a pointer occurrence.
 impl<T: UbfSerialize> UbfMappedSerialize<PointerUbf> for T {
+    /// Serialize one structure into a new UBF allocation owned by a pointer occurrence.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `field`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
+    /// - `size`: Initial child UBF allocation size in bytes, forwarded through the selected
+    ///   mapping.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     fn ubf_write_mapped(
         &self,
         ubf: &mut TypedUbf<'_>,
@@ -580,13 +943,33 @@ impl<T: UbfSerialize> UbfMappedSerialize<PointerUbf> for T {
         ubf_write_ptr(ubf, field, occurrence, self, size, realloc)
     }
 }
+/// Deserialize a structure through a UBF pointer while retaining the parent’s ownership.
 impl<T: UbfDeserialize> UbfMappedDeserialize<PointerUbf> for T {
+    /// Deserialize a structure through a UBF pointer while retaining the parent’s ownership.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
+    /// - `field`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
     fn ubf_read_mapped(ubf: &TypedUbf<'_>, field: i32, occurrence: i32) -> UbfResult<Self> {
         ubf_read_ptr(ubf, field, occurrence)
     }
 }
 
+/// Serialize one structure into a VIEW and copy its layout into an inline occurrence.
 impl<T: crate::ViewSerialize> UbfMappedSerialize<EmbeddedView> for T {
+    /// Serialize one structure into a VIEW and copy its layout into an inline occurrence.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `field`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
+    /// - `_size`: Unused allocation hint; VIEW storage size comes from its compiled layout.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     fn ubf_write_mapped(
         &self,
         ubf: &mut TypedUbf<'_>,
@@ -600,13 +983,33 @@ impl<T: crate::ViewSerialize> UbfMappedSerialize<EmbeddedView> for T {
         ubf.bchg_view(field, occurrence, &view, realloc)
     }
 }
+/// Copy an inline VIEW and deserialize its mapped members.
 impl<T: crate::ViewDeserialize> UbfMappedDeserialize<EmbeddedView> for T {
+    /// Copy an inline VIEW and deserialize its mapped members.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
+    /// - `field`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
     fn ubf_read_mapped(ubf: &TypedUbf<'_>, field: i32, occurrence: i32) -> UbfResult<Self> {
         mapped_field::<EmbeddedView>(ubf, field, occurrence)?;
         ubf.bget_view(field, occurrence)?.view_read()
     }
 }
+/// Serialize one structure into a VIEW allocation owned by a pointer occurrence.
 impl<T: crate::ViewSerialize> UbfMappedSerialize<PointerView> for T {
+    /// Serialize one structure into a VIEW allocation owned by a pointer occurrence.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `field`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
+    /// - `_size`: Unused allocation hint; VIEW storage size comes from its compiled layout.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     fn ubf_write_mapped(
         &self,
         ubf: &mut TypedUbf<'_>,
@@ -620,7 +1023,16 @@ impl<T: crate::ViewSerialize> UbfMappedSerialize<PointerView> for T {
         ubf.bchg(field, occurrence, view.into_inner(), realloc)
     }
 }
+/// Validate a VIEW pointer’s type and layout, then deserialize an independent copy.
 impl<T: crate::ViewDeserialize> UbfMappedDeserialize<PointerView> for T {
+    /// Validate a VIEW pointer’s type and layout, then deserialize an independent copy.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
+    /// - `field`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
     fn ubf_read_mapped(ubf: &TypedUbf<'_>, field: i32, occurrence: i32) -> UbfResult<Self> {
         mapped_field::<PointerView>(ubf, field, occurrence)?;
         let info = ubf
@@ -638,6 +1050,11 @@ impl<T: crate::ViewDeserialize> UbfMappedDeserialize<PointerView> for T {
     }
 }
 
+/// Require a mapping that consumes exactly one native occurrence per element.
+///
+/// # Arguments
+///
+/// - `single`: Whether each mapped element occupies exactly one occurrence.
 pub(crate) fn require_single(single: bool) -> UbfResult<()> {
     if single {
         Ok(())
@@ -647,12 +1064,24 @@ pub(crate) fn require_single(single: bool) -> UbfResult<()> {
     }
 }
 
+/// Write `Some` using the selected strategy; for `None`, clear the field’s suffix.
 impl<T: UbfMappedSerialize<M>, M: UbfMapping> UbfMappedSerialize<M> for Option<T> {
     const SINGLE: bool = matches!(
         M::FIELD_TYPE,
         crate::UbfFieldType::Ptr | crate::UbfFieldType::View
     );
     const OPTIONAL: bool = true;
+    /// Write `Some` using the selected strategy; for `None`, clear the field’s suffix.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `field`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
+    /// - `size`: Initial child UBF allocation size in bytes, forwarded through the selected
+    ///   mapping.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     fn ubf_write_mapped(
         &self,
         ubf: &mut TypedUbf<'_>,
@@ -668,6 +1097,17 @@ impl<T: UbfMappedSerialize<M>, M: UbfMapping> UbfMappedSerialize<M> for Option<T
             None => clear_from(ubf, field, occurrence),
         }
     }
+    /// Write one optional collection element, using a native NULL PTR/VIEW placeholder for `None`.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `field`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
+    /// - `size`: Initial child UBF allocation size in bytes, forwarded through the selected
+    ///   mapping.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     fn ubf_write_occurrence(
         &self,
         ubf: &mut TypedUbf<'_>,
@@ -684,12 +1124,22 @@ impl<T: UbfMappedSerialize<M>, M: UbfMapping> UbfMappedSerialize<M> for Option<T
         }
     }
 }
+/// Read an optional complex value; absent occurrences and native NULL placeholders become `None`.
 impl<T: UbfMappedDeserialize<M>, M: UbfMapping> UbfMappedDeserialize<M> for Option<T> {
     const SINGLE: bool = matches!(
         M::FIELD_TYPE,
         crate::UbfFieldType::Ptr | crate::UbfFieldType::View
     );
     const OPTIONAL: bool = true;
+    /// Read an optional complex value; absent occurrences and native NULL placeholders become
+    /// `None`.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
+    /// - `field`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
     fn ubf_read_mapped(ubf: &TypedUbf<'_>, field: i32, occurrence: i32) -> UbfResult<Self> {
         mapped_field::<M>(ubf, field, occurrence)?;
         require_single(T::SINGLE && !T::OPTIONAL)?;
@@ -700,8 +1150,20 @@ impl<T: UbfMappedDeserialize<M>, M: UbfMapping> UbfMappedDeserialize<M> for Opti
         }
     }
 }
+/// Write consecutive complex values, preserve nullable positions, and trim the stale suffix.
 impl<T: UbfMappedSerialize<M>, M: UbfMapping> UbfMappedSerialize<M> for Vec<T> {
     const SINGLE: bool = false;
+    /// Write consecutive complex values, preserve nullable positions, and trim the stale suffix.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `field`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
+    /// - `size`: Initial child UBF allocation size in bytes, forwarded through the selected
+    ///   mapping.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     fn ubf_write_mapped(
         &self,
         ubf: &mut TypedUbf<'_>,
@@ -725,8 +1187,17 @@ impl<T: UbfMappedSerialize<M>, M: UbfMapping> UbfMappedSerialize<M> for Vec<T> {
         clear_from(ubf, field, end)
     }
 }
+/// Read the complex field’s suffix into a vector, including nullable positions.
 impl<T: UbfMappedDeserialize<M>, M: UbfMapping> UbfMappedDeserialize<M> for Vec<T> {
     const SINGLE: bool = false;
+    /// Read the complex field’s suffix into a vector, including nullable positions.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
+    /// - `field`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
     fn ubf_read_mapped(ubf: &TypedUbf<'_>, field: i32, occurrence: i32) -> UbfResult<Self> {
         mapped_field::<M>(ubf, field, occurrence)?;
         require_single(T::SINGLE)?;
@@ -736,8 +1207,22 @@ impl<T: UbfMappedDeserialize<M>, M: UbfMapping> UbfMappedDeserialize<M> for Vec<
             .collect()
     }
 }
+/// Write exactly `N` complex occurrences, preserving nullable positions and neighboring
+/// occurrences.
 impl<T: UbfMappedSerialize<M>, M: UbfMapping, const N: usize> UbfMappedSerialize<M> for [T; N] {
     const SINGLE: bool = false;
+    /// Write exactly `N` complex occurrences, preserving nullable positions and neighboring
+    /// occurrences.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `field`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
+    /// - `size`: Initial child UBF allocation size in bytes, forwarded through the selected
+    ///   mapping.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     fn ubf_write_mapped(
         &self,
         ubf: &mut TypedUbf<'_>,
@@ -761,8 +1246,17 @@ impl<T: UbfMappedSerialize<M>, M: UbfMapping, const N: usize> UbfMappedSerialize
         Ok(())
     }
 }
+/// Read exactly `N` complex occurrences into a fixed array, including nullable positions.
 impl<T: UbfMappedDeserialize<M>, M: UbfMapping, const N: usize> UbfMappedDeserialize<M> for [T; N] {
     const SINGLE: bool = false;
+    /// Read exactly `N` complex occurrences into a fixed array, including nullable positions.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
+    /// - `field`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
     fn ubf_read_mapped(ubf: &TypedUbf<'_>, field: i32, occurrence: i32) -> UbfResult<Self> {
         mapped_field::<M>(ubf, field, occurrence)?;
         require_single(T::SINGLE)?;
@@ -776,19 +1270,42 @@ impl<T: UbfMappedDeserialize<M>, M: UbfMapping, const N: usize> UbfMappedDeseria
     }
 }
 
+/// Delegate structure serialization to the boxed value.
 impl<T: UbfSerialize> UbfSerialize for Box<T> {
+    /// Delegate structure serialization to the boxed value.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     fn ubf_serialize<'ctx>(&self, ubf: &mut TypedUbf<'ctx>, realloc: bool) -> UbfResult<()> {
         (**self).ubf_serialize(ubf, realloc)
     }
 }
+/// Deserialize the structure and allocate it in a Rust box.
 impl<T: UbfDeserialize> UbfDeserialize for Box<T> {
+    /// Deserialize the structure and allocate it in a Rust box.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
     fn ubf_deserialize<'ctx>(ubf: &TypedUbf<'ctx>) -> UbfResult<Self> {
         T::ubf_deserialize(ubf).map(Box::new)
     }
 }
 
+/// Write exactly `N` consecutive occurrences, preserving occurrences outside the array window.
 impl<T: UbfFieldSerialize, const N: usize> UbfFieldSerialize for [T; N] {
     const SINGLE: bool = false;
+    /// Write exactly `N` consecutive occurrences, preserving occurrences outside the array window.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `field`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     fn ubf_write_field<'ctx>(
         &self,
         ubf: &mut TypedUbf<'ctx>,
@@ -804,8 +1321,17 @@ impl<T: UbfFieldSerialize, const N: usize> UbfFieldSerialize for [T; N] {
         Ok(())
     }
 }
+/// Read exactly `N` consecutive occurrences into a fixed array.
 impl<T: UbfFieldDeserialize, const N: usize> UbfFieldDeserialize for [T; N] {
     const SINGLE: bool = false;
+    /// Read exactly `N` consecutive occurrences into a fixed array.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
+    /// - `field`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
     fn ubf_read_field<'ctx>(ubf: &TypedUbf<'ctx>, field: i32, occurrence: i32) -> UbfResult<Self> {
         require_single(T::SINGLE)?;
         ubf_occurrence(occurrence, N)?;
@@ -820,14 +1346,32 @@ impl<T: UbfFieldDeserialize, const N: usize> UbfFieldDeserialize for [T; N] {
 
 /// Presence check used for `#[ubf(default)]`; malformed child contents are not
 /// mistaken for a missing parent occurrence.
+///
+/// # Arguments
+///
+/// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
+/// - `field`: Typed UBF identifier selecting the mapped field.
+/// - `occurrence`: Zero-based starting occurrence; collections occupy successive occurrences
+///   from here.
+///
 #[doc(hidden)]
 pub fn ubf_mapping_present(ubf: &TypedUbf<'_>, field: i32, occurrence: i32) -> UbfResult<bool> {
     ubf_occurrence(occurrence, 0)?;
     Ok((occurrence as usize) < ubf.ctx().boccur(ubf, field)?)
 }
 
+/// Delegate field serialization to the boxed value.
 impl<T: UbfFieldSerialize + ?Sized> UbfFieldSerialize for Box<T> {
     const SINGLE: bool = T::SINGLE;
+    /// Delegate field serialization to the boxed value.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `field`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     fn ubf_write_field<'ctx>(
         &self,
         ubf: &mut TypedUbf<'ctx>,
@@ -838,14 +1382,30 @@ impl<T: UbfFieldSerialize + ?Sized> UbfFieldSerialize for Box<T> {
         (**self).ubf_write_field(ubf, field, occurrence, realloc)
     }
 }
+/// Deserialize the field value and allocate it in a Rust box.
 impl<T: UbfFieldDeserialize> UbfFieldDeserialize for Box<T> {
     const SINGLE: bool = T::SINGLE;
+    /// Deserialize the field value and allocate it in a Rust box.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
+    /// - `field`: Typed UBF identifier selecting the mapped field.
+    /// - `occurrence`: Zero-based starting occurrence; collections occupy successive
+    ///   occurrences from here.
     fn ubf_read_field<'ctx>(ubf: &TypedUbf<'ctx>, field: i32, occurrence: i32) -> UbfResult<Self> {
         T::ubf_read_field(ubf, field, occurrence).map(Box::new)
     }
 }
 
+/// Delegate structure serialization to the referenced value.
 impl<T: UbfSerialize + ?Sized> UbfSerialize for &T {
+    /// Delegate structure serialization to the referenced value.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     fn ubf_serialize<'ctx>(&self, ubf: &mut TypedUbf<'ctx>, realloc: bool) -> UbfResult<()> {
         (**self).ubf_serialize(ubf, realloc)
     }
@@ -863,11 +1423,27 @@ impl<T: UbfSerialize + ?Sized> UbfSerialize for &T {
 /// occurrence offset). A flat `Vec<Self>` advances `base` per element.
 pub trait UbfGroupSerialize {
     /// Validate the row layout and all member offsets before modifying a buffer.
+    ///
+    /// # Arguments
+    ///
+    /// - `base`: Zero-based row position before adding each member’s occurrence offset.
     fn ubf_validate_group(base: i32) -> UbfResult<()> {
         ubf_occurrence(base, 0).map(|_| ())
     }
+    /// Write one group row into the parent’s fields at the base plus each member’s offset.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `base`: Zero-based row position before adding each member’s occurrence offset.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     fn ubf_write_at(&self, ubf: &mut TypedUbf<'_>, base: i32, realloc: bool) -> UbfResult<()>;
     /// Delete each member's suffix at `from` plus that member's offset.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `from`: First row or occurrence to remove; group implementations add their member offsets.
     fn ubf_clear_from(ubf: &mut TypedUbf<'_>, from: i32) -> UbfResult<()>;
 }
 /// A structure read back from one occurrence column of the parent buffer.
@@ -876,14 +1452,32 @@ pub trait UbfGroupDeserialize: Sized {
     const ANCHOR: i32;
     /// Occurrence offset of the anchor within each row.
     const ANCHOR_OFFSET: i32 = 0;
+    /// Validate a group row’s base occurrence and member offsets before reading it.
+    ///
+    /// # Arguments
+    ///
+    /// - `base`: Zero-based row position before adding each member’s occurrence offset.
     fn ubf_validate_group(base: i32) -> UbfResult<()> {
         ubf_group_field_check(true, base, Self::ANCHOR_OFFSET).map(|_| ())
     }
+    /// Read one group row from the parent’s fields at the base plus each member’s offset.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
+    /// - `base`: Zero-based row position before adding each member’s occurrence offset.
     fn ubf_read_at(ubf: &TypedUbf<'_>, base: i32) -> UbfResult<Self>;
 }
 
 /// Field-position group mapping: a single structure, a `Vec`, or a fixed array.
 pub trait UbfGroupFieldSerialize {
+    /// Write one or more flat group rows into the parent’s occurrence columns.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `base`: Zero-based row position before adding each member’s occurrence offset.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     fn ubf_group_write_field(
         &self,
         ubf: &mut TypedUbf<'_>,
@@ -893,12 +1487,27 @@ pub trait UbfGroupFieldSerialize {
 }
 /// Read counterpart of [`UbfGroupFieldSerialize`].
 pub trait UbfGroupFieldDeserialize: Sized {
+    /// Read one or more flat group rows from the parent’s occurrence columns.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
+    /// - `base`: Zero-based row position before adding each member’s occurrence offset.
     fn ubf_group_read_field(ubf: &TypedUbf<'_>, base: i32) -> UbfResult<Self>;
 }
 
 // A single struct wrapper is emitted by the derive (concrete `impl ... for T`),
 // so these Vec/array blankets cannot overlap it.
+/// Write vector rows and clear stale suffixes in every member column, respecting member offsets.
 impl<T: UbfGroupSerialize> UbfGroupFieldSerialize for Vec<T> {
+    /// Write vector rows and clear stale suffixes in every member column, respecting member
+    /// offsets.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `base`: Zero-based row position before adding each member’s occurrence offset.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     fn ubf_group_write_field(
         &self,
         ubf: &mut TypedUbf<'_>,
@@ -914,7 +1523,14 @@ impl<T: UbfGroupSerialize> UbfGroupFieldSerialize for Vec<T> {
         T::ubf_clear_from(ubf, end)
     }
 }
+/// Read vector rows up to the anchor field’s count after subtracting its member offset.
 impl<T: UbfGroupDeserialize> UbfGroupFieldDeserialize for Vec<T> {
+    /// Read vector rows up to the anchor field’s count after subtracting its member offset.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
+    /// - `base`: Zero-based row position before adding each member’s occurrence offset.
     fn ubf_group_read_field(ubf: &TypedUbf<'_>, base: i32) -> UbfResult<Self> {
         T::ubf_validate_group(base)?;
         ubf_group_field_check(true, base, T::ANCHOR_OFFSET)?;
@@ -930,7 +1546,15 @@ impl<T: UbfGroupDeserialize> UbfGroupFieldDeserialize for Vec<T> {
             .collect()
     }
 }
+/// Write exactly `N` group rows without deleting neighboring rows.
 impl<T: UbfGroupSerialize, const N: usize> UbfGroupFieldSerialize for [T; N] {
+    /// Write exactly `N` group rows without deleting neighboring rows.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+    /// - `base`: Zero-based row position before adding each member’s occurrence offset.
+    /// - `realloc`: Whether writes may grow UBF allocations when they run out of space.
     fn ubf_group_write_field(
         &self,
         ubf: &mut TypedUbf<'_>,
@@ -945,7 +1569,14 @@ impl<T: UbfGroupSerialize, const N: usize> UbfGroupFieldSerialize for [T; N] {
         Ok(())
     }
 }
+/// Read exactly `N` consecutive group rows into a fixed array.
 impl<T: UbfGroupDeserialize, const N: usize> UbfGroupFieldDeserialize for [T; N] {
+    /// Read exactly `N` consecutive group rows into a fixed array.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Source UBF to read; its allocations remain owned by the original buffer.
+    /// - `base`: Zero-based row position before adding each member’s occurrence offset.
     fn ubf_group_read_field(ubf: &TypedUbf<'_>, base: i32) -> UbfResult<Self> {
         T::ubf_validate_group(base)?;
         T::ubf_validate_group(ubf_occurrence(base, N.saturating_sub(1))?)?;
@@ -959,12 +1590,26 @@ impl<T: UbfGroupDeserialize, const N: usize> UbfGroupFieldDeserialize for [T; N]
 }
 
 /// Delete every occurrence of one field at or after `from` (frees owned targets).
+///
+/// # Arguments
+///
+/// - `ubf`: Destination UBF; serialization can leave partial updates if a later write fails.
+/// - `field_id`: Typed UBF identifier selecting the mapped field.
+/// - `from`: First row or occurrence to remove; group implementations add their member offsets.
+///
 #[doc(hidden)]
 pub fn ubf_group_clear(ubf: &mut TypedUbf<'_>, field_id: i32, from: i32) -> UbfResult<()> {
     clear_from(ubf, field_id, from)
 }
 
 /// Validate one group member's width and add its nonnegative occurrence offset.
+///
+/// # Arguments
+///
+/// - `single`: Whether each mapped element occupies exactly one occurrence.
+/// - `base`: Zero-based row position before adding each member’s occurrence offset.
+/// - `offset`: Nonnegative occurrence offset for this member within each row.
+///
 #[doc(hidden)]
 pub fn ubf_group_field_check(single: bool, base: i32, offset: i32) -> UbfResult<i32> {
     require_single(single)?;

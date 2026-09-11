@@ -1,8 +1,10 @@
+//! Allocation and member access for compiled Enduro/X VIEW layouts.
 use core::ffi::{c_char, c_int, c_long};
 use std::ffi::{CStr, CString};
 
 use crate::{raw, AtmiCtx, AtmiError, TypedBuffer, UbfError, UbfResult};
 
+/// Reject native NULL values when reading a VIEW member.
 pub const BVACCESS_NOTNULL: i64 = 0x00000001;
 const VIEW_NAME_LEN: usize = 33;
 const VIEW_CNAME_LEN: usize = 256;
@@ -19,101 +21,135 @@ pub enum ViewValue {
     Carray(Vec<u8>),
 }
 
+/// Convert Rust scalar values and byte arrays into values accepted by VIEW writes.
 pub trait IntoViewValue {
+    /// Convert this value into the corresponding VIEW write variant.
     fn into_view_value(self) -> ViewValue;
 }
 
+/// Conversion of `ViewValue` into a VIEW write value.
 impl IntoViewValue for ViewValue {
+    /// Convert this value into the corresponding VIEW write variant.
     fn into_view_value(self) -> ViewValue {
         self
     }
 }
 
+/// Conversion of `i16` into a VIEW write value.
 impl IntoViewValue for i16 {
+    /// Convert this value into the corresponding VIEW write variant.
     fn into_view_value(self) -> ViewValue {
         ViewValue::Short(self)
     }
 }
 
+/// Conversion of `i64` into a VIEW write value.
 impl IntoViewValue for i64 {
+    /// Convert this value into the corresponding VIEW write variant.
     fn into_view_value(self) -> ViewValue {
         ViewValue::Long(self)
     }
 }
 
+/// Conversion of `isize` into a VIEW write value.
 impl IntoViewValue for isize {
+    /// Convert this value into the corresponding VIEW write variant.
     fn into_view_value(self) -> ViewValue {
         ViewValue::Long(self as i64)
     }
 }
 
+/// Conversion of `i32` into a VIEW write value.
 impl IntoViewValue for i32 {
+    /// Convert this value into the corresponding VIEW write variant.
     fn into_view_value(self) -> ViewValue {
         ViewValue::Int(self as i64)
     }
 }
 
+/// Conversion of `u64` into a VIEW write value.
 impl IntoViewValue for u64 {
+    /// Convert this value into the corresponding VIEW write variant.
     fn into_view_value(self) -> ViewValue {
         ViewValue::Long(self as i64)
     }
 }
 
+/// Conversion of `usize` into a VIEW write value.
 impl IntoViewValue for usize {
+    /// Convert this value into the corresponding VIEW write variant.
     fn into_view_value(self) -> ViewValue {
         ViewValue::Long(self as i64)
     }
 }
 
+/// Conversion of `u32` into a VIEW write value.
 impl IntoViewValue for u32 {
+    /// Convert this value into the corresponding VIEW write variant.
     fn into_view_value(self) -> ViewValue {
         ViewValue::Long(self as i64)
     }
 }
 
+/// Conversion of `u16` into a VIEW write value.
 impl IntoViewValue for u16 {
+    /// Convert this value into the corresponding VIEW write variant.
     fn into_view_value(self) -> ViewValue {
         ViewValue::Short(self as i16)
     }
 }
 
+/// Conversion of `u8` into a VIEW write value.
 impl IntoViewValue for u8 {
+    /// Convert this value into the corresponding VIEW write variant.
     fn into_view_value(self) -> ViewValue {
         ViewValue::Short(self as i16)
     }
 }
 
+/// Conversion of `i8` into a VIEW write value.
 impl IntoViewValue for i8 {
+    /// Convert this value into the corresponding VIEW write variant.
     fn into_view_value(self) -> ViewValue {
         ViewValue::Char(self)
     }
 }
 
+/// Conversion of `f32` into a VIEW write value.
 impl IntoViewValue for f32 {
+    /// Convert this value into the corresponding VIEW write variant.
     fn into_view_value(self) -> ViewValue {
         ViewValue::Float(self)
     }
 }
 
+/// Conversion of `f64` into a VIEW write value.
 impl IntoViewValue for f64 {
+    /// Convert this value into the corresponding VIEW write variant.
     fn into_view_value(self) -> ViewValue {
         ViewValue::Double(self)
     }
 }
 
+/// Conversion of `String` into a VIEW write value.
 impl IntoViewValue for String {
+    /// Convert this value into the corresponding VIEW write variant.
     fn into_view_value(self) -> ViewValue {
         ViewValue::String(self)
     }
 }
 
+/// Conversion of `&str` into a VIEW write value.
 impl IntoViewValue for &str {
+    /// Convert this value into the corresponding VIEW write variant.
     fn into_view_value(self) -> ViewValue {
         ViewValue::String(self.to_string())
     }
 }
 
+/// Conversion of `Vec<u8>` into a VIEW write value.
 impl IntoViewValue for Vec<u8> {
+    /// Convert this value into the corresponding VIEW write variant.
     fn into_view_value(self) -> ViewValue {
         ViewValue::Carray(self)
     }
@@ -132,7 +168,9 @@ pub struct BvNextState {
     inner: raw::Bvnext_state_t,
 }
 
+/// Cleared native initialization for `BvNextState`.
 impl Default for BvNextState {
+    /// Create a cleared cursor for a new VIEW field iteration.
     fn default() -> Self {
         Self {
             inner: unsafe { std::mem::zeroed() },
@@ -140,12 +178,32 @@ impl Default for BvNextState {
     }
 }
 
+/// Named VIEW validation, member conversion, iteration, and layout-aware copying.
 impl<'ctx> TypedView<'ctx> {
+    /// Wrap a validated inline VIEW without owning it. The caller must tie all
+    /// access to the parent borrow and prevent mutable access to this wrapper.
+    pub(crate) unsafe fn borrowed_from_raw(
+        ctx: &'ctx AtmiCtx,
+        view: String,
+        data: *mut std::os::raw::c_char,
+    ) -> Self {
+        Self {
+            view,
+            inner: TypedBuffer::borrowed_from_raw(ctx, data),
+        }
+    }
+
+    /// Borrow the underlying typed-buffer wrapper without transferring ownership.
     pub(crate) fn buffer(&self) -> &TypedBuffer<'ctx> {
         &self.inner
     }
 
     /// View an existing typed buffer as VIEW `view`.
+    ///
+    /// # Arguments
+    ///
+    /// - `view`: Compiled VIEW name; it must be available through `VIEWDIR` and `VIEWFILES`.
+    /// - `buf`: Owned typed buffer to validate and consume; it is dropped if validation fails.
     ///
     /// Validates three things, because every VIEW accessor addresses the buffer
     /// through the declared layout: the buffer really is a VIEW, its subtype is
@@ -188,26 +246,45 @@ impl<'ctx> TypedView<'ctx> {
         Ok(Self { view, inner: buf })
     }
 
+    /// Consume this VIEW wrapper and return its owned typed buffer.
     pub fn into_inner(self) -> TypedBuffer<'ctx> {
         self.inner
     }
 
+    /// Return the compiled VIEW layout name associated with this buffer.
     #[inline]
     pub fn bvname(&self) -> &str {
         &self.view
     }
 
+    /// Convert this buffer’s VIEW name to a native string, rejecting embedded NUL bytes.
     #[inline]
     fn view_cstring(&self) -> UbfResult<CString> {
         CString::new(self.view.as_str())
             .map_err(|e| UbfError::new(UbfError::BEINVAL, e.to_string()))
     }
 
+    /// Convert a VIEW member name to a native string, rejecting embedded NUL bytes.
+    ///
+    /// # Arguments
+    ///
+    /// - `cname`: Member’s C name from the VIEW definition, without embedded NUL bytes.
+    ///
     #[inline]
     fn cname_cstring(cname: &str) -> UbfResult<CString> {
         CString::new(cname).map_err(|e| UbfError::new(UbfError::BEINVAL, e.to_string()))
     }
 
+    /// Read and convert a VIEW member into caller-provided native storage.
+    ///
+    /// # Arguments
+    ///
+    /// - `cname`: Member’s C name from the VIEW definition, without embedded NUL bytes.
+    /// - `occ`: Zero-based array element; use `0` for a scalar member.
+    /// - `buf`: Writable storage matching `usrtype`, with at least the input `len` bytes available.
+    /// - `len`: Destination capacity in bytes on input; converted value length on output.
+    /// - `usrtype`: Native `BFLD_*` type describing the destination storage.
+    /// - `flags`: `0` to read any value, or `BVACCESS_NOTNULL` to reject native NULL values.
     fn cbvget(
         &self,
         cname: &str,
@@ -256,6 +333,13 @@ impl<'ctx> TypedView<'ctx> {
         }
     }
 
+    /// Read a VIEW member as `i16` using native type conversion.
+    ///
+    /// # Arguments
+    ///
+    /// - `cname`: Member’s C name from the VIEW definition, without embedded NUL bytes.
+    /// - `occ`: Zero-based array element; use `0` for a scalar member.
+    /// - `flags`: `0` to read any value, or `BVACCESS_NOTNULL` to reject native NULL values.
     pub fn bvget_i16(&self, cname: &str, occ: i32, flags: i64) -> UbfResult<i16> {
         let mut val: i16 = 0;
         let mut len = std::mem::size_of::<i16>() as raw::BFLDLEN;
@@ -270,6 +354,13 @@ impl<'ctx> TypedView<'ctx> {
         Ok(val)
     }
 
+    /// Read a VIEW member as `i64` using native type conversion.
+    ///
+    /// # Arguments
+    ///
+    /// - `cname`: Member’s C name from the VIEW definition, without embedded NUL bytes.
+    /// - `occ`: Zero-based array element; use `0` for a scalar member.
+    /// - `flags`: `0` to read any value, or `BVACCESS_NOTNULL` to reject native NULL values.
     pub fn bvget_i64(&self, cname: &str, occ: i32, flags: i64) -> UbfResult<i64> {
         let mut val: i64 = 0;
         let mut len = std::mem::size_of::<i64>() as raw::BFLDLEN;
@@ -284,6 +375,13 @@ impl<'ctx> TypedView<'ctx> {
         Ok(val)
     }
 
+    /// Read a VIEW member as `i32` using native type conversion.
+    ///
+    /// # Arguments
+    ///
+    /// - `cname`: Member’s C name from the VIEW definition, without embedded NUL bytes.
+    /// - `occ`: Zero-based array element; use `0` for a scalar member.
+    /// - `flags`: `0` to read any value, or `BVACCESS_NOTNULL` to reject native NULL values.
     pub fn bvget_i32(&self, cname: &str, occ: i32, flags: i64) -> UbfResult<i32> {
         let mut val: i64 = 0;
         let mut len = std::mem::size_of::<i64>() as raw::BFLDLEN;
@@ -298,6 +396,13 @@ impl<'ctx> TypedView<'ctx> {
         Ok(val as i32)
     }
 
+    /// Read a VIEW member as a signed byte using native type conversion.
+    ///
+    /// # Arguments
+    ///
+    /// - `cname`: Member’s C name from the VIEW definition, without embedded NUL bytes.
+    /// - `occ`: Zero-based array element; use `0` for a scalar member.
+    /// - `flags`: `0` to read any value, or `BVACCESS_NOTNULL` to reject native NULL values.
     pub fn bvget_char(&self, cname: &str, occ: i32, flags: i64) -> UbfResult<i8> {
         let mut val: i8 = 0;
         let mut len = std::mem::size_of::<i8>() as raw::BFLDLEN;
@@ -312,6 +417,13 @@ impl<'ctx> TypedView<'ctx> {
         Ok(val)
     }
 
+    /// Read a VIEW member as `f32` using native type conversion.
+    ///
+    /// # Arguments
+    ///
+    /// - `cname`: Member’s C name from the VIEW definition, without embedded NUL bytes.
+    /// - `occ`: Zero-based array element; use `0` for a scalar member.
+    /// - `flags`: `0` to read any value, or `BVACCESS_NOTNULL` to reject native NULL values.
     pub fn bvget_f32(&self, cname: &str, occ: i32, flags: i64) -> UbfResult<f32> {
         let mut val: f32 = 0.0;
         let mut len = std::mem::size_of::<f32>() as raw::BFLDLEN;
@@ -326,6 +438,13 @@ impl<'ctx> TypedView<'ctx> {
         Ok(val)
     }
 
+    /// Read a VIEW member as `f64` using native type conversion.
+    ///
+    /// # Arguments
+    ///
+    /// - `cname`: Member’s C name from the VIEW definition, without embedded NUL bytes.
+    /// - `occ`: Zero-based array element; use `0` for a scalar member.
+    /// - `flags`: `0` to read any value, or `BVACCESS_NOTNULL` to reject native NULL values.
     pub fn bvget_f64(&self, cname: &str, occ: i32, flags: i64) -> UbfResult<f64> {
         let mut val: f64 = 0.0;
         let mut len = std::mem::size_of::<f64>() as raw::BFLDLEN;
@@ -340,6 +459,13 @@ impl<'ctx> TypedView<'ctx> {
         Ok(val)
     }
 
+    /// Read a VIEW member as an owned string using native type conversion.
+    ///
+    /// # Arguments
+    ///
+    /// - `cname`: Member’s C name from the VIEW definition, without embedded NUL bytes.
+    /// - `occ`: Zero-based array element; use `0` for a scalar member.
+    /// - `flags`: `0` to read any value, or `BVACCESS_NOTNULL` to reject native NULL values.
     pub fn bvget_string(&self, cname: &str, occ: i32, flags: i64) -> UbfResult<String> {
         let mut buf = vec![0u8; raw::NDRX_ATMI_MSG_MAX_SIZE as usize];
         let mut len = buf.len() as raw::BFLDLEN;
@@ -356,6 +482,13 @@ impl<'ctx> TypedView<'ctx> {
             .into_owned())
     }
 
+    /// Read a VIEW member as owned binary bytes, preserving the returned byte length.
+    ///
+    /// # Arguments
+    ///
+    /// - `cname`: Member’s C name from the VIEW definition, without embedded NUL bytes.
+    /// - `occ`: Zero-based array element; use `0` for a scalar member.
+    /// - `flags`: `0` to read any value, or `BVACCESS_NOTNULL` to reject native NULL values.
     pub fn bvget_bytes(&self, cname: &str, occ: i32, flags: i64) -> UbfResult<Vec<u8>> {
         let mut buf = vec![0u8; raw::NDRX_ATMI_MSG_MAX_SIZE as usize];
         let mut len = buf.len() as raw::BFLDLEN;
@@ -371,6 +504,13 @@ impl<'ctx> TypedView<'ctx> {
         Ok(buf)
     }
 
+    /// Write one VIEW member occurrence using native conversion from the supplied value.
+    ///
+    /// # Arguments
+    ///
+    /// - `cname`: Member’s C name from the VIEW definition, without embedded NUL bytes.
+    /// - `occ`: Zero-based array element; use `0` for a scalar member.
+    /// - `value`: Value to convert and store; strings must not contain embedded NUL bytes.
     pub fn bvchg(&mut self, cname: &str, occ: i32, value: impl IntoViewValue) -> UbfResult<()> {
         let view = self.view_cstring()?;
         let cname = Self::cname_cstring(cname)?;
@@ -437,6 +577,14 @@ impl<'ctx> TypedView<'ctx> {
         }
     }
 
+    /// Return `(count, maximum, non_null_extent, element_bytes, field_type)` for a VIEW member.
+    ///
+    /// # Arguments
+    ///
+    /// - `cname`: Member’s C name from the VIEW definition, without embedded NUL bytes.
+    ///
+    /// `count` is the C count indicator, or the declared array size when no indicator exists.
+    /// `non_null_extent` ends just after the last non-NULL element within that count.
     pub fn bvoccur(&self, cname: &str) -> UbfResult<(usize, usize, usize, usize, i32)> {
         let view = self.view_cstring()?;
         let cname = Self::cname_cstring(cname)?;
@@ -485,10 +633,17 @@ impl<'ctx> TypedView<'ctx> {
         }
     }
 
+    /// Return the compiled VIEW layout size in bytes.
     pub fn bvsizeof(&self) -> UbfResult<usize> {
         self.inner.ctx.bvsizeof(&self.view)
     }
 
+    /// Set a VIEW member’s active occurrence count through its C count indicator.
+    ///
+    /// # Arguments
+    ///
+    /// - `cname`: Member’s C name from the VIEW definition, without embedded NUL bytes.
+    /// - `occ`: New active count, from zero through the member’s declared array capacity.
     pub fn bvsetoccur(&mut self, cname: &str, occ: i32) -> UbfResult<()> {
         let view = self.view_cstring()?;
         let cname = Self::cname_cstring(cname)?;
@@ -521,6 +676,11 @@ impl<'ctx> TypedView<'ctx> {
         }
     }
 
+    /// Serialize this VIEW to JSON, with the layout name as the outer object key.
+    ///
+    /// # Arguments
+    ///
+    /// - `flags`: Native VIEW-to-JSON options; use `0` to include the default set of fields.
     pub fn tpviewtojson(&self, flags: i64) -> Result<String, AtmiError> {
         let view = CString::new(self.view.as_str())
             .map_err(|e| AtmiError::new(raw::TPEINVAL, e.to_string()))?;
@@ -539,6 +699,14 @@ impl<'ctx> TypedView<'ctx> {
         Ok(String::from_utf8_lossy(&out[..end]).into_owned())
     }
 
+    /// Return the next member’s `(name, native_type, maximum_count, element_bytes)`, or `None`
+    /// at the end.
+    ///
+    /// # Arguments
+    ///
+    /// - `state`: Mutable iteration cursor; retain it between successive calls.
+    /// - `start`: `true` to begin or restart this VIEW’s iteration; `false` to continue with
+    ///   `state`.
     pub fn bvnext(
         &self,
         state: &mut BvNextState,
@@ -599,10 +767,12 @@ impl<'ctx> TypedView<'ctx> {
 
     /// Copy this view into `dst`.
     ///
-    /// Both views must name the same VIEW, and the destination must be at least
-    /// as large as the source. `Bvcpy` writes the source's layout into the
-    /// destination buffer without checking either, so a differently shaped or
-    /// smaller destination is a buffer overflow.
+    /// # Arguments
+    ///
+    /// - `dst`: Destination with the same compiled VIEW name and room for the full layout.
+    ///
+    /// Both buffers must name the same compiled VIEW and hold its full layout.
+    /// Returns the number of layout bytes copied; spare allocation capacity is not copied.
     pub fn bvcpy(&self, dst: &mut TypedView<'_>) -> UbfResult<usize> {
         if self.view != dst.view {
             return Err(UbfError::new(
@@ -662,12 +832,25 @@ impl<'ctx> TypedView<'ctx> {
         }
     }
 
+    /// Resize the native allocation while preserving enough storage for the compiled layout.
+    ///
+    /// # Arguments
+    ///
+    /// - `size`: Requested size in bytes, at least the compiled layout size.
     pub fn tprealloc(&mut self, size: usize) -> Result<(), AtmiError> {
         self.inner.tprealloc(size)
     }
 }
 
+/// VIEW allocation, compiled-layout lookup, and JSON import.
 impl AtmiCtx {
+    /// Allocate an owned VIEW buffer tied to this context and its compiled layout.
+    ///
+    /// # Arguments
+    ///
+    /// - `view`: Compiled VIEW name; it must be available through `VIEWDIR` and `VIEWFILES`.
+    /// - `size`: Requested allocation size in bytes; native VIEW allocation may use the
+    ///   compiled layout size.
     pub fn tpalloc_view<'ctx>(
         &'ctx self,
         view: &str,
@@ -678,6 +861,11 @@ impl AtmiCtx {
             .map_err(|e| AtmiError::new(crate::raw::TPEINVAL, e.message.into_owned()))
     }
 
+    /// Return the compiled VIEW layout size in bytes.
+    ///
+    /// # Arguments
+    ///
+    /// - `view`: Compiled VIEW name; it must be available through `VIEWDIR` and `VIEWFILES`.
     pub fn bvsizeof(&self, view: &str) -> UbfResult<usize> {
         let view =
             CString::new(view).map_err(|e| UbfError::new(UbfError::BEINVAL, e.to_string()))?;
@@ -695,6 +883,12 @@ impl AtmiCtx {
         }
     }
 
+    /// Allocate and populate a VIEW using the layout name in a JSON object.
+    ///
+    /// # Arguments
+    ///
+    /// - `json`: JSON text with a VIEW-name outer key and member-name inner keys; no embedded
+    ///   NUL bytes.
     pub fn tpjson_to_view<'ctx>(&'ctx self, json: &str) -> Result<TypedView<'ctx>, AtmiError> {
         let json = CString::new(json).map_err(|e| AtmiError::new(raw::TPEINVAL, e.to_string()))?;
         let mut view = vec![0u8; VIEW_NAME_LEN + 1];

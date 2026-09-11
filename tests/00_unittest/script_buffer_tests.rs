@@ -1,10 +1,10 @@
-use endurox_rs::{AtmiCtx, ScriptBuffers, ScriptResult, ScriptSlot as S};
+use endurox_rs::{AtmiCtx, TpScrBuffers, TpScrResult, TpScrSlot as S};
 
 #[test]
 fn script_buffers_replace_one_alias_and_take_unique_ownership() {
     let _guard = super::endurox_test_env();
     let ctx = AtmiCtx::new().unwrap();
-    let mut buffers = ScriptBuffers::new(&ctx);
+    let mut buffers = TpScrBuffers::new(&ctx);
     buffers
         .set(S::Input, Some(ctx.tpalloc_carray(b"input").unwrap()))
         .unwrap();
@@ -29,7 +29,7 @@ fn script_buffers_replace_one_alias_and_take_unique_ownership() {
 fn script_buffer_edits_restore_aliases_on_panic_and_preserve_wrong_types() {
     let _guard = super::endurox_test_env();
     let ctx = AtmiCtx::new().unwrap();
-    let mut buffers = ScriptBuffers::new(&ctx);
+    let mut buffers = TpScrBuffers::new(&ctx);
     buffers
         .set(S::Input, Some(ctx.tpalloc_carray(b"short").unwrap()))
         .unwrap();
@@ -37,7 +37,7 @@ fn script_buffer_edits_restore_aliases_on_panic_and_preserve_wrong_types() {
     assert!(buffers.edit_ubf(S::Input, |_| Ok(())).is_err());
     assert_eq!(buffers.get(S::Input).unwrap().unwrap().as_bytes(), b"short");
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        buffers.edit(S::Input, |buffer| -> ScriptResult<()> {
+        buffers.edit(S::Input, |buffer| -> TpScrResult<()> {
             buffer.set_bytes(&vec![7; 32768])?;
             panic!("intentional edit panic");
         })

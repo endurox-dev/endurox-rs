@@ -8,10 +8,16 @@ use std::{
 
 use crate::{raw, AtmiCtx, TypedBuffer, TypedUbf, TypedView, UbfError, UbfFieldType, UbfResult};
 
+/// Convert an ATMI allocation failure to UBF `BMALLOC`, preserving its diagnostic text.
+///
+/// # Arguments
+///
+/// - `error`: ATMI failure whose message is preserved in the UBF error.
 fn allocation_error(error: crate::AtmiError) -> UbfError {
     UbfError::new(UbfError::BMALLOC, error.message)
 }
 
+/// Deep copying and edits that preserve ownership of nested UBF pointer targets.
 impl<'ctx> TypedUbf<'ctx> {
     /// Copy this buffer and all pointer targets into independent allocations.
     /// Cyclic pointer graphs are rejected. Repeated references are copied separately.
@@ -19,6 +25,11 @@ impl<'ctx> TypedUbf<'ctx> {
         self.clone_into(self.ctx())
     }
 
+    /// Deep-copy this UBF and its pointer targets into allocations borrowing another context.
+    ///
+    /// # Arguments
+    ///
+    /// - `ctx`: Context used to allocate or release the affected buffers.
     pub(crate) fn clone_into<'new>(&self, ctx: &'new AtmiCtx) -> UbfResult<TypedUbf<'new>> {
         clone_ubf(self, ctx, &mut HashSet::new())
     }
@@ -27,6 +38,12 @@ impl<'ctx> TypedUbf<'ctx> {
     /// Unlike the C-compatible `AtmiCtx::bdel`, this releases owned children.
     /// Shared/cyclic native pointer graphs must first be normalized with
     /// `deep_clone`, so removing an occurrence cannot invalidate another one.
+    ///
+    /// # Arguments
+    ///
+    /// - `field`: Typed UBF identifier; complex operations require the matching UBF, PTR, or
+    ///   VIEW kind.
+    /// - `occurrence`: Zero-based occurrence to read, write, or remove.
     pub fn bdel_owned(&mut self, field: i32, occurrence: i32) -> UbfResult<()> {
         let roots = self.owned_field_roots(field, occurrence)?;
         if !roots.is_empty() {
@@ -37,6 +54,13 @@ impl<'ctx> TypedUbf<'ctx> {
         Ok(())
     }
 
+    /// Test whether an occurrence is absent or contains a native NULL PTR/VIEW placeholder.
+    ///
+    /// # Arguments
+    ///
+    /// - `field`: Typed UBF identifier; complex operations require the matching UBF, PTR, or
+    ///   VIEW kind.
+    /// - `occurrence`: Zero-based occurrence to read, write, or remove.
     pub(crate) fn null_complex(&self, field: i32, occurrence: i32) -> UbfResult<bool> {
         if !self.ctx().bpres(self, field, occurrence) {
             return Ok(true);
@@ -57,6 +81,14 @@ impl<'ctx> TypedUbf<'ctx> {
         }
     }
 
+    /// Store a PTR/VIEW NULL placeholder without shifting occurrences, freeing displaced targets.
+    ///
+    /// # Arguments
+    ///
+    /// - `field`: Typed UBF identifier; complex operations require the matching UBF, PTR, or
+    ///   VIEW kind.
+    /// - `occurrence`: Zero-based occurrence to read, write, or remove.
+    /// - `realloc`: Whether to grow the destination and retry on `BNOSPACE`.
     pub(crate) fn put_null_complex(
         &mut self,
         field: i32,
@@ -99,12 +131,20 @@ impl<'ctx> TypedUbf<'ctx> {
         Ok(())
     }
 
+    /// Reject shared targets, cycles, and excessive nesting before an ownership-changing edit.
     pub(crate) fn ensure_owned_tree(&self) -> UbfResult<()> {
         let mut seen = HashSet::new();
         seen.insert(self.as_ubfh() as usize);
         unique_targets(self, &mut seen, 0)
     }
 
+    /// Collect the pointer targets owned by one occurrence, including pointers inside inline UBFs.
+    ///
+    /// # Arguments
+    ///
+    /// - `field`: Typed UBF identifier; complex operations require the matching UBF, PTR, or
+    ///   VIEW kind.
+    /// - `occurrence`: Zero-based occurrence to read, write, or remove.
     pub(crate) fn owned_field_roots(
         &self,
         field: i32,
@@ -138,6 +178,17 @@ impl<'ctx> TypedUbf<'ctx> {
         }
     }
 
+    /// Write a native field value with optional growth; ownership checks belong to the caller.
+    ///
+    /// # Arguments
+    ///
+    /// - `field`: Typed UBF identifier; complex operations require the matching UBF, PTR, or
+    ///   VIEW kind.
+    /// - `occurrence`: Zero-based occurrence to read, write, or remove.
+    /// - `value`: Valid native field representation; pointer fields take the address of a
+    ///   pointer variable.
+    /// - `len`: Native value length in bytes, or `0` when the field type determines its own size.
+    /// - `realloc`: Whether to grow the destination and retry on `BNOSPACE`.
     pub(crate) fn put_native(
         &mut self,
         field: i32,
@@ -173,6 +224,15 @@ impl<'ctx> TypedUbf<'ctx> {
 
     /// Embed a UBF as one `BFLD_UBF` occurrence (public mapping path).
     ///
+    /// # Arguments
+    ///
+    /// - `field`: Typed UBF identifier; complex operations require the matching UBF, PTR, or
+    ///   VIEW kind.
+    /// - `occurrence`: Zero-based occurrence to read, write, or remove.
+    /// - `child`: Owned child consumed by the inline write; a failed write leaves cleanup to
+    ///   its Rust owner.
+    /// - `realloc`: Whether to grow the destination and retry on `BNOSPACE`.
+    ///
     /// Children that own `BFLD_PTR` targets are rejected: an inline embed
     /// byte-copies the child, so freeing the consumed shell would cascade into
     /// targets the parent now shares. Store such sub-structures behind a
@@ -191,6 +251,15 @@ impl<'ctx> TypedUbf<'ctx> {
     /// parent. Restricted to internal callers (deep-clone reconstruction and
     /// `UbfAdhoc`) that supply a fresh single-owner deep copy, so the shared-
     /// ownership hazard of the public path cannot arise.
+    ///
+    /// # Arguments
+    ///
+    /// - `field`: Typed UBF identifier; complex operations require the matching UBF, PTR, or
+    ///   VIEW kind.
+    /// - `occurrence`: Zero-based occurrence to read, write, or remove.
+    /// - `child`: Owned child consumed by the inline write; a failed write leaves cleanup to
+    ///   its Rust owner.
+    /// - `realloc`: Whether to grow the destination and retry on `BNOSPACE`.
     pub(crate) fn put_owned_ubf(
         &mut self,
         field: i32,
@@ -201,6 +270,19 @@ impl<'ctx> TypedUbf<'ctx> {
         self.embed_ubf(field, occurrence, child, realloc, true)
     }
 
+    /// Copy a child inline, optionally transferring its targets, and release replaced child
+    /// allocations.
+    ///
+    /// # Arguments
+    ///
+    /// - `field`: Typed UBF identifier; complex operations require the matching UBF, PTR, or
+    ///   VIEW kind.
+    /// - `occurrence`: Zero-based occurrence to read, write, or remove.
+    /// - `child`: Owned child consumed by the inline write; a failed write leaves cleanup to
+    ///   its Rust owner.
+    /// - `realloc`: Whether to grow the destination and retry on `BNOSPACE`.
+    /// - `transfer_pointers`: Whether a fresh, uniquely owned child may transfer its pointer
+    ///   targets to the parent.
     fn embed_ubf(
         &mut self,
         field: i32,
@@ -253,6 +335,14 @@ impl<'ctx> TypedUbf<'ctx> {
     }
 
     /// Copy a VIEW into one `BFLD_VIEW` occurrence.
+    ///
+    /// # Arguments
+    ///
+    /// - `field`: Typed UBF identifier; complex operations require the matching UBF, PTR, or
+    ///   VIEW kind.
+    /// - `occurrence`: Zero-based occurrence to read, write, or remove.
+    /// - `view`: Source VIEW whose compiled layout bytes are copied; it retains its ownership.
+    /// - `realloc`: Whether to grow the destination and retry on `BNOSPACE`.
     pub fn bchg_view(
         &mut self,
         field: i32,
@@ -281,6 +371,12 @@ impl<'ctx> TypedUbf<'ctx> {
     }
 
     /// Read a `BFLD_VIEW` occurrence into an independent typed VIEW allocation.
+    ///
+    /// # Arguments
+    ///
+    /// - `field`: Typed UBF identifier; complex operations require the matching UBF, PTR, or
+    ///   VIEW kind.
+    /// - `occurrence`: Zero-based occurrence to read, write, or remove.
     pub fn bget_view(&self, field: i32, occurrence: i32) -> UbfResult<TypedView<'ctx>> {
         self.require_field_type(field, UbfFieldType::View, "VIEW read")?;
         let mut len = 0;
@@ -316,6 +412,13 @@ impl<'ctx> TypedUbf<'ctx> {
         Ok(view)
     }
 
+    /// Deep-copy the buffer referenced by a pointer occurrence without extracting it.
+    ///
+    /// # Arguments
+    ///
+    /// - `field`: Typed UBF identifier; complex operations require the matching UBF, PTR, or
+    ///   VIEW kind.
+    /// - `occurrence`: Zero-based occurrence to read, write, or remove.
     pub(crate) fn clone_pointer_target(
         &self,
         field: i32,
@@ -326,6 +429,13 @@ impl<'ctx> TypedUbf<'ctx> {
     }
 }
 
+/// Collect pointer roots through inline UBFs, leaving each root’s descendants to native cleanup.
+///
+/// # Arguments
+///
+/// - `ubf`: UBF whose inline children and pointer occurrences are traversed.
+/// - `roots`: Pointer roots collected so far, excluding descendants already owned by those roots.
+/// - `depth`: Current nesting depth used to enforce the recursion limit.
 fn collect_roots(ubf: &TypedUbf<'_>, roots: &mut Vec<*mut c_char>, depth: usize) -> UbfResult<()> {
     if depth > 128 {
         return Err(UbfError::new(
@@ -350,6 +460,13 @@ fn collect_roots(ubf: &TypedUbf<'_>, roots: &mut Vec<*mut c_char>, depth: usize)
     Ok(())
 }
 
+/// Free each non-null root once using native recursive buffer cleanup.
+///
+/// # Arguments
+///
+/// - `ctx`: Context used to allocate or release the affected buffers.
+/// - `roots`: Owned roots detached from their parent; their recursive ownership trees must not
+///   overlap.
 pub(crate) fn free_roots(ctx: &AtmiCtx, roots: Vec<*mut c_char>) {
     let mut freed = HashSet::new();
     for root in roots {
@@ -359,6 +476,13 @@ pub(crate) fn free_roots(ctx: &AtmiCtx, roots: Vec<*mut c_char>) {
     }
 }
 
+/// Copy a typed allocation, recursively cloning UBF targets and using compiled sizes for VIEWs.
+///
+/// # Arguments
+///
+/// - `source`: Borrowed source allocation that remains unchanged.
+/// - `ctx`: Context used to allocate or release the affected buffers.
+/// - `path`: Addresses on the active recursive clone path, used to detect cycles.
 fn clone_buffer<'ctx>(
     source: &TypedBuffer<'_>,
     ctx: &'ctx AtmiCtx,
@@ -401,6 +525,13 @@ fn clone_buffer<'ctx>(
     Ok(copy)
 }
 
+/// Rebuild a UBF with independent child allocations while rejecting cycles on the active path.
+///
+/// # Arguments
+///
+/// - `source`: Borrowed source allocation that remains unchanged.
+/// - `ctx`: Context used to allocate or release the affected buffers.
+/// - `path`: Addresses on the active recursive clone path, used to detect cycles.
 fn clone_ubf<'ctx>(
     source: &TypedUbf<'_>,
     ctx: &'ctx AtmiCtx,
@@ -501,6 +632,13 @@ fn clone_ubf<'ctx>(
 // Native messages can contain shared pointers even though Rust's owned writes
 // cannot create them. Refuse destructive edits to those graphs: tpfree cascades
 // and would otherwise also free targets reachable from a surviving occurrence.
+/// Traverse an ownership graph and reject repeated target addresses or excessive depth.
+///
+/// # Arguments
+///
+/// - `ubf`: UBF whose inline children and pointer occurrences are traversed.
+/// - `seen`: All target addresses already encountered, used to reject sharing and cycles.
+/// - `depth`: Current nesting depth used to enforce the recursion limit.
 fn unique_targets(ubf: &TypedUbf<'_>, seen: &mut HashSet<usize>, depth: usize) -> UbfResult<()> {
     if depth >= 128 {
         return Err(UbfError::new(

@@ -1,3 +1,4 @@
+//! ATMI context initialization, native error access, and context-bound buffer allocation.
 use crate::{raw, AtmiError, AtmiResult, NstdError, TypedBuffer, TypedUbf, UbfError};
 #[cfg(not(feature = "ctx-send"))]
 use core::ffi::c_char;
@@ -41,9 +42,11 @@ pub struct AtmiCtx {
 // only for that call and detaches it before returning. `Cell` deliberately
 // keeps `AtmiCtx` !Sync, so the handle cannot be used concurrently. Buffers
 // borrow their context and therefore also prevent moving it while they exist.
+/// Allow ownership to move between threads with the detached native context.
 #[cfg(feature = "ctx-send")]
 unsafe impl Send for AtmiCtx {}
 
+/// Context lifecycle, allocation, and native error access.
 impl AtmiCtx {
     /// Create a new ATMI context handle.
     pub fn new() -> Result<Self, AtmiError> {
@@ -158,6 +161,13 @@ impl AtmiCtx {
     }
 
     /// Allocate a typed XATMI buffer tied to this context.
+    ///
+    /// # Arguments
+    ///
+    /// - `type_`: Native buffer type, such as `UBF`, `CARRAY`, `STRING`, or `VIEW`.
+    /// - `subtype`: Type-specific name, such as a compiled VIEW name; use an empty string when
+    ///   unused.
+    /// - `size`: Requested allocation size in bytes; the native buffer type may adjust this size.
     pub fn tpalloc<'ctx>(
         &'ctx self,
         type_: &str,
@@ -227,6 +237,10 @@ impl AtmiCtx {
 
     /// Allocate a CARRAY (binary array) buffer tied to this context, copy the
     /// provided bytes in, and set `len()` to `bytes.len()`.
+    ///
+    /// # Arguments
+    ///
+    /// - `bytes`: Initial binary payload to copy into the new CARRAY buffer.
     pub fn tpalloc_carray<'ctx>(&'ctx self, bytes: &[u8]) -> AtmiResult<TypedBuffer<'ctx>> {
         let size = bytes.len().max(1);
         let mut buf = self.tpalloc("CARRAY", "", size)?;
@@ -240,6 +254,10 @@ impl AtmiCtx {
     }
 
     /// Allocate a UBF buffer tied to this context.
+    ///
+    /// # Arguments
+    ///
+    /// - `size`: Requested allocation size in bytes; the native buffer type may adjust this size.
     pub fn tpalloc_ubf<'ctx>(&'ctx self, size: usize) -> AtmiResult<TypedUbf<'ctx>> {
         let type_c = CString::new("UBF").unwrap();
         let subtype_c = CString::new("").unwrap();
@@ -294,6 +312,7 @@ impl AtmiCtx {
         self.handle.get()
     }
 
+    /// Return the mutable context-handle slot used by native Object API calls.
     #[cfg(feature = "ctx-send")]
     #[inline]
     pub(crate) fn c_ctx_ptr(&self) -> *mut raw::TPCONTEXT_T {
@@ -340,6 +359,11 @@ impl AtmiCtx {
         }
     }
 
+    /// Copy the current thread’s ATMI error before another native call changes it.
+    ///
+    /// # Safety
+    ///
+    /// The current thread must have initialized native ATMI TLS and a readable error string.
     #[cfg(feature = "ctx-send")]
     unsafe fn current_thread_atmi_error() -> AtmiError {
         let code = *raw::_exget_tperrno_addr();
@@ -350,7 +374,9 @@ impl AtmiCtx {
     }
 }
 
+/// Terminate and free an owned context, or restore a borrowed callback context to native TLS.
 impl Drop for AtmiCtx {
+    /// Terminate and free an owned context, or restore a borrowed callback context to native TLS.
     fn drop(&mut self) {
         #[cfg(not(feature = "ctx-send"))]
         if !self.borrowed {

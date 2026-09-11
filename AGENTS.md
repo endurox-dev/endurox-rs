@@ -262,15 +262,15 @@ These are custom `UbfSerialize`/`UbfDeserialize` and
   backend through `NDRX_PLUGINS`; Rust does not directly embed a particular
   interpreter. The discovery code in `tests/08_tpscript` is test setup, not a
   replacement for the core plugin loader.
-- `AtmiCtx::tpscrinit(None, flags)` returns a `ScriptVm` borrowing that context.
+- `AtmiCtx::tpscrinit(None, flags)` returns a `TpScrVm` borrowing that context.
   The VM exposes compile/load/unload/execute, callback registration and script
   error operations. `tpscruninit` consumes it; Drop also shuts it down.
   `NDRX_TPSCR_PACKAGE`, `NDRX_TPSCR_REPLACE` and `NDRX_TPSCR_FLAT` are exported.
 - The portable core declares `tpscr_cfg_t` as opaque. Use `None` for defaults;
-  `ScriptConfig::from_raw` is an unsafe backend-specific escape hatch. Do not
+  `TpScrCfg::from_raw` is an unsafe backend-specific escape hatch. Do not
   invent a Rust configuration layout or assume the Python backend's treatment
   of configuration applies to every engine.
-- `tpscrcomp` returns `ScriptBytecode`. Its allocation belongs to the plugin
+- `tpscrcomp` returns `TpScrBytecode`. Its allocation belongs to the plugin
   and must be freed with `tpscrfree`, not `tpfree` or Rust's allocator. Bytecode
   can outlive the VM while its borrowed `AtmiCtx` remains alive.
 - Core callback registration already supports userdata:
@@ -279,7 +279,7 @@ These are custom `UbfSerialize`/`UbfDeserialize` and
   boxed callback entry containing the closure and its captured state.
 - Registration userdata and execution context have different lifetimes. The
   callback obtains the ATMI context currently executing the script through
-  `ScriptCallbackContext::context()`. Do not substitute a registration-time
+  `TpScrCallbackContext::context()`. Do not substitute a registration-time
   context when determining the current native context. No additional core
   userdata parameter is needed for the current binding; per-execution userdata
   would be a separate feature for arbitrary request-specific state.
@@ -302,7 +302,7 @@ These are custom `UbfSerialize`/`UbfDeserialize` and
   failure paths where the provider may have partially installed the pointer.
   A failed shutdown retains userdata to avoid dangling provider references;
   query thread-local script error state rather than a possibly consumed VM.
-- `ScriptBuffers` manages the parameter, input and output as references to unique
+- `TpScrBuffers` manages the parameter, input and output as references to unique
   allocations. `alias` shares an allocation; `take` clears every alias before
   returning ownership. Returning an input as output must never create a second
   owner. Adopt native pointer/length changes on failures as well as successes.
@@ -313,7 +313,7 @@ These are custom `UbfSerialize`/`UbfDeserialize` and
 - Distinguish equal buffer addresses from identical native pointer slots.
   Callback parameter/input slots can be the same `char **`; updates to such
   linked slots must agree. The trampoline validates this when returning buffers.
-- A safe Rust callback can replace its entire `ScriptBuffers` value. Dropping
+- A safe Rust callback can replace its entire `TpScrBuffers` value. Dropping
   the old collection must clear provider slots before freeing allocations;
   returning the new collection must transfer ownership back to C before its
   Rust temporary is dropped. Test this explicitly to prevent use-after-free.

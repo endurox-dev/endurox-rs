@@ -1,3 +1,4 @@
+//! Native UBF operations, field identifiers, expression evaluation, and callback I/O.
 use crate::raw::*;
 use crate::{raw, AtmiCtx, BorrowedUbf, TypedUbf, UbfResult};
 use core::ffi::{c_char, c_int, c_long, c_void};
@@ -20,7 +21,9 @@ pub struct BFldLocInfo {
     pub(crate) owner: *mut c_char,
 }
 
+/// Cleared native initialization for `BFldLocInfo`.
 impl Default for BFldLocInfo {
+    /// Create an unpositioned fast-append cursor with no buffer owner.
     fn default() -> Self {
         Self {
             inner: unsafe { std::mem::zeroed() },
@@ -29,14 +32,23 @@ impl Default for BFldLocInfo {
     }
 }
 
+/// Management of fast-append cursor state tied to a specific allocation.
 impl BFldLocInfo {
     /// Restart the cursor against `buffer`.
+    ///
+    /// # Arguments
+    ///
+    /// - `buffer`: Native buffer allocation associated with the cursor.
     pub(crate) fn rebase(&mut self, buffer: *mut c_char) {
         self.inner = unsafe { std::mem::zeroed() };
         self.owner = buffer;
     }
 
     /// Whether this cursor is currently positioned in `buffer`.
+    ///
+    /// # Arguments
+    ///
+    /// - `buffer`: Native buffer allocation associated with the cursor.
     pub(crate) fn belongs_to(&self, buffer: *mut c_char) -> bool {
         !self.owner.is_null() && self.owner == buffer
     }
@@ -49,12 +61,15 @@ pub struct UbfExprTree<'ctx> {
     ctx: &'ctx AtmiCtx,
 }
 
+/// Access and explicit cleanup of an owned compiled expression.
 impl<'ctx> UbfExprTree<'ctx> {
+    /// Borrow the compiled expression’s native pointer without transferring ownership.
     #[inline]
     pub(crate) fn as_ptr(&self) -> *mut c_char {
         self.ptr
     }
 
+    /// Free the compiled expression once and clear its pointer.
     fn free(&mut self) {
         if !self.ptr.is_null() {
             self.ctx.btreefree_value(self.ptr);
@@ -63,16 +78,24 @@ impl<'ctx> UbfExprTree<'ctx> {
     }
 }
 
+/// Release the owned native expression tree.
 impl Drop for UbfExprTree<'_> {
+    /// Release the owned native expression tree.
     fn drop(&mut self) {
         self.free();
     }
 }
 
 /// UBF expression callback registered with `Bboolsetcbf`.
+///
+/// Receives the evaluated UBF and registered function name; returns a native integer
+/// expression value. The UBF is borrowed only for this synchronous invocation.
 pub type UbfExprCallback = fn(&TypedUbf<'_>, &str) -> i64;
 
 /// UBF expression callback registered with `Bboolsetcbf2`.
+///
+/// Receives the evaluated UBF, registered function name, and the expression’s string
+/// argument; returns a native integer expression value.
 pub type UbfExprCallback2 = fn(&TypedUbf<'_>, &str, &str) -> i64;
 
 struct OutputState {
@@ -84,11 +107,13 @@ struct ReadState<'a> {
     offset: usize,
 }
 
+/// Return the process-wide registry for expression callbacks without a string argument.
 fn expr_callbacks() -> &'static Mutex<HashMap<String, UbfExprCallback>> {
     static CALLBACKS: OnceLock<Mutex<HashMap<String, UbfExprCallback>>> = OnceLock::new();
     CALLBACKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Return the process-wide registry for expression callbacks with a string argument.
 fn expr_callbacks2() -> &'static Mutex<HashMap<String, UbfExprCallback2>> {
     static CALLBACKS: OnceLock<Mutex<HashMap<String, UbfExprCallback2>>> = OnceLock::new();
     CALLBACKS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -106,7 +131,13 @@ struct ExprEvaluation<'ctx> {
     previous: *const AtmiCtx,
 }
 
+/// Scoped association of an expression evaluation with its ATMI context.
 impl<'ctx> ExprEvaluation<'ctx> {
+    /// Make the evaluating context available to synchronous callbacks until the guard is dropped.
+    ///
+    /// # Arguments
+    ///
+    /// - `ctx`: Context whose native evaluation is active for the lifetime of the guard.
     fn enter(ctx: &'ctx AtmiCtx) -> Self {
         Self {
             _ctx: ctx,
@@ -115,7 +146,9 @@ impl<'ctx> ExprEvaluation<'ctx> {
     }
 }
 
+/// Restore the context that was active before this expression evaluation.
 impl Drop for ExprEvaluation<'_> {
+    /// Restore the context that was active before this expression evaluation.
     fn drop(&mut self) {
         EXPR_CONTEXT.with(|current| current.set(self.previous));
     }
@@ -133,6 +166,7 @@ struct ExprCallbackTls<'ctx> {
     ubf_detached: bool,
 }
 
+/// Temporary release of native TLS locks during reentrant Rust callbacks.
 #[cfg(feature = "ctx-send")]
 impl<'ctx> ExprCallbackTls<'ctx> {
     const ATMI_FLAGS: c_long =
@@ -141,6 +175,17 @@ impl<'ctx> ExprCallbackTls<'ctx> {
         (raw::CTXT_PRIV_NSTD | raw::CTXT_PRIV_UBF | raw::CTXT_PRIV_IGN) as c_long;
 
     // SAFETY: called only from an expression callback within ExprEvaluation.
+    /// Temporarily release native TLS locks so a Rust expression callback can make nested
+    /// Object API calls.
+    ///
+    /// # Arguments
+    ///
+    /// - `ctx`: Context whose native evaluation is active for the lifetime of the guard.
+    ///
+    /// # Safety
+    ///
+    /// Call only from a synchronous native expression callback within an active
+    /// `ExprEvaluation` for `ctx`.
     unsafe fn suspend(ctx: &'ctx AtmiCtx) -> Option<Self> {
         let mut previous_atmi = std::ptr::null_mut();
         if raw::ndrx_tpgetctxt(&mut previous_atmi, 0, Self::ATMI_FLAGS) == raw::EXFAIL {
@@ -160,8 +205,10 @@ impl<'ctx> ExprCallbackTls<'ctx> {
     }
 }
 
+/// Restore the native TLS components temporarily detached for a Rust callback.
 #[cfg(feature = "ctx-send")]
 impl Drop for ExprCallbackTls<'_> {
+    /// Restore the native TLS components temporarily detached for a Rust callback.
     fn drop(&mut self) {
         // The evaluator still borrows the context, so these handles remain
         // valid. Restore only the components that were attached on entry.
@@ -176,6 +223,21 @@ impl Drop for ExprCallbackTls<'_> {
     }
 }
 
+/// Append a native text-print chunk while merging its trailing NUL with the previous chunk.
+///
+/// # Arguments
+///
+/// - `buffer`: Readable pointer slot containing the native print chunk.
+/// - `datalen`: Number of readable bytes in the print chunk, including its native terminator.
+/// - `dataptr1`: Non-null pointer to the mutable `OutputState` collecting text.
+/// - `_do_write`: Unused native output switch; output is captured in Rust.
+/// - `_outf`: Unused native FILE destination.
+/// - `_fid`: Unused native field identifier for the printed chunk.
+///
+/// # Safety
+///
+/// Non-null input slots must be valid for the indicated length, and userdata must exclusively
+/// reference a live `OutputState`.
 unsafe extern "C" fn bfprint_output_callback(
     buffer: *mut *mut c_char,
     datalen: c_long,
@@ -200,6 +262,18 @@ unsafe extern "C" fn bfprint_output_callback(
     raw::EXSUCCEED as c_int
 }
 
+/// Copy the next available input bytes into the native reader’s destination.
+///
+/// # Arguments
+///
+/// - `buffer`: Writable destination with at least `bufsz` bytes.
+/// - `bufsz`: Destination capacity in bytes.
+/// - `dataptr1`: Non-null pointer to `ReadState`, whose offset advances as bytes are copied.
+///
+/// # Safety
+///
+/// The output must be writable for `bufsz` bytes and userdata must exclusively reference a live
+/// `ReadState`.
 unsafe extern "C" fn read_callback(
     buffer: *mut c_char,
     bufsz: c_long,
@@ -225,6 +299,18 @@ unsafe extern "C" fn read_callback(
     to_copy as c_long
 }
 
+/// Append a native binary-output chunk to the Rust output vector.
+///
+/// # Arguments
+///
+/// - `buffer`: Readable native output chunk of `bufsz` bytes.
+/// - `bufsz`: Readable chunk length in bytes.
+/// - `dataptr1`: Non-null pointer to the mutable `OutputState` collecting bytes.
+///
+/// # Safety
+///
+/// The input must be readable for `bufsz` bytes and userdata must exclusively reference a live
+/// `OutputState`.
 unsafe extern "C" fn write_callback(
     buffer: *mut c_char,
     bufsz: c_long,
@@ -240,10 +326,34 @@ unsafe extern "C" fn write_callback(
     bufsz
 }
 
+/// Dispatch a native expression callback without an explicit string argument.
+///
+/// # Arguments
+///
+/// - `p_ub`: Live UBF being evaluated; it remains owned by the native caller.
+/// - `funcname`: Readable NUL-terminated native name identifying the registered callback.
+///
+/// # Safety
+///
+/// Invoke synchronously inside `ExprEvaluation`; the UBF and function-name C string must remain
+/// valid for the callback.
 unsafe extern "C" fn expr_callback_proxy(p_ub: *mut raw::UBFH, funcname: *mut c_char) -> c_long {
     expr_callback_proxy_impl(p_ub, funcname, std::ptr::null_mut())
 }
 
+/// Dispatch a native expression callback with one string argument.
+///
+/// # Arguments
+///
+/// - `p_ub`: Live UBF being evaluated; it remains owned by the native caller.
+/// - `funcname`: Readable NUL-terminated native name identifying the registered callback.
+/// - `arg1`: Nullable NUL-terminated callback argument; null selects the callback without an
+///   argument.
+///
+/// # Safety
+///
+/// Invoke synchronously inside `ExprEvaluation`; the UBF, function-name string, and optional
+/// argument must remain readable.
 unsafe extern "C" fn expr_callback_proxy2(
     p_ub: *mut raw::UBFH,
     funcname: *mut c_char,
@@ -252,6 +362,19 @@ unsafe extern "C" fn expr_callback_proxy2(
     expr_callback_proxy_impl(p_ub, funcname, arg1)
 }
 
+/// Resolve and invoke an expression callback on the evaluating context, returning zero on panic.
+///
+/// # Arguments
+///
+/// - `p_ub`: Live UBF being evaluated; it remains owned by the native caller.
+/// - `funcname`: Readable NUL-terminated native name identifying the registered callback.
+/// - `arg1`: Nullable NUL-terminated callback argument; null selects the callback without an
+///   argument.
+///
+/// # Safety
+///
+/// All non-null native arguments must remain valid during the callback, with the evaluator’s
+/// context active in `EXPR_CONTEXT`.
 unsafe fn expr_callback_proxy_impl(
     p_ub: *mut raw::UBFH,
     funcname: *mut c_char,
@@ -345,7 +468,9 @@ pub enum UbfFieldType {
     View,
 }
 
+/// Conversion between Rust field kinds and native `BFLD_*` codes.
 impl UbfFieldType {
+    /// Convert a Rust field kind to its native `BFLD_*` constant.
     #[inline]
     fn as_raw(self) -> c_int {
         match self {
@@ -362,6 +487,12 @@ impl UbfFieldType {
         }
     }
 
+    /// Convert a native field type, returning `None` for unknown type codes.
+    ///
+    /// # Arguments
+    ///
+    /// - `raw_type`: Native `BFLD_*` type code to convert.
+    ///
     #[inline]
     pub(crate) fn from_raw(raw_type: c_int) -> Option<Self> {
         match raw_type as u32 {
@@ -380,7 +511,14 @@ impl UbfFieldType {
     }
 }
 
+/// UBF field operations and native expression APIs for this context.
 impl AtmiCtx {
+    /// Convert a native UBF status to success or the current UBF error.
+    ///
+    /// # Arguments
+    ///
+    /// - `rc`: Native return status or count to translate.
+    ///
     #[inline]
     fn ubf_unit_result(&self, rc: c_int) -> UbfResult<()> {
         if rc == raw::EXSUCCEED as c_int {
@@ -390,6 +528,12 @@ impl AtmiCtx {
         }
     }
 
+    /// Convert a nonnegative native count to `usize`, or return the current UBF error.
+    ///
+    /// # Arguments
+    ///
+    /// - `rc`: Native return status or count to translate.
+    ///
     #[inline]
     fn ubf_count_result<T>(&self, rc: T) -> UbfResult<usize>
     where
@@ -403,6 +547,7 @@ impl AtmiCtx {
         }
     }
 
+    /// Borrow the native UBF error-number slot for this context.
     #[inline]
     pub(crate) fn ndrx_bget_ferror_addr(&self) -> *mut c_int {
         #[cfg(not(feature = "ctx-send"))]
@@ -416,6 +561,12 @@ impl AtmiCtx {
         }
     }
 
+    /// Borrow the native diagnostic string for a UBF error code.
+    ///
+    /// # Arguments
+    ///
+    /// - `err`: Native UBF error number to describe.
+    ///
     #[inline]
     pub(crate) fn bstrerror(&self, err: c_int) -> *mut c_char {
         #[cfg(not(feature = "ctx-send"))]
@@ -429,6 +580,16 @@ impl AtmiCtx {
         }
     }
 
+    /// Copy an inline UBF occurrence through the native API without managing pointer ownership.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF whose fields or native header may be changed.
+    /// - `bfldid`: Typed field identifier, including the native field-type bits.
+    /// - `occ`: Zero-based field occurrence to access.
+    /// - `value`: Child UBF whose inline bytes are copied; the caller must enforce pointer
+    ///   ownership rules.
+    ///
     #[inline]
     pub(crate) fn bchg_ubf_value(
         &self,
@@ -461,6 +622,18 @@ impl AtmiCtx {
         }
     }
 
+    /// Append a value with native type conversion and return the unmodified C status.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF whose fields or native header may be changed.
+    /// - `bfldid`: Typed field identifier, including the native field-type bits.
+    /// - `buf`: Readable native value storage matching `usrtype`; pointer fields require the
+    ///   address of a pointer variable.
+    /// - `len`: Value length in bytes for variable-length input; use the native type’s
+    ///   convention for fixed-size values.
+    /// - `usrtype`: Native `BFLD_*` type describing the value storage used for conversion.
+    ///
     #[inline]
     pub(crate) fn cbadd_value(
         &self,
@@ -481,6 +654,19 @@ impl AtmiCtx {
         }
     }
 
+    /// Write an occurrence with native type conversion and return the unmodified C status.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF whose fields or native header may be changed.
+    /// - `bfldid`: Typed field identifier, including the native field-type bits.
+    /// - `occ`: Zero-based field occurrence to access.
+    /// - `buf`: Readable native value storage matching `usrtype`; pointer fields require the
+    ///   address of a pointer variable.
+    /// - `len`: Value length in bytes for variable-length input; use the native type’s
+    ///   convention for fixed-size values.
+    /// - `usrtype`: Native `BFLD_*` type describing the value storage used for conversion.
+    ///
     #[inline]
     pub(crate) fn cbchg_value(
         &self,
@@ -510,6 +696,17 @@ impl AtmiCtx {
         }
     }
 
+    /// Read and convert an occurrence into native output storage, returning the C status.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: UBF buffer to inspect.
+    /// - `bfldid`: Typed field identifier, including the native field-type bits.
+    /// - `occ`: Zero-based field occurrence to access.
+    /// - `buf`: Writable native destination with at least the input `len` bytes.
+    /// - `len`: Destination capacity on input and returned value length on output, in bytes.
+    /// - `usrtype`: Native `BFLD_*` type describing the value storage used for conversion.
+    ///
     #[inline]
     pub(crate) fn cbget_value(
         &self,
@@ -539,6 +736,17 @@ impl AtmiCtx {
         }
     }
 
+    /// Read and convert a field in a borrowed UBF without taking ownership of the child.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: UBF buffer to inspect.
+    /// - `bfldid`: Typed field identifier, including the native field-type bits.
+    /// - `occ`: Zero-based field occurrence to access.
+    /// - `buf`: Writable native destination with at least the input `len` bytes.
+    /// - `len`: Destination capacity on input and returned value length on output, in bytes.
+    /// - `usrtype`: Native `BFLD_*` type describing the value storage used for conversion.
+    ///
     #[inline]
     pub(crate) fn cbget_borrowed_ubf_value(
         &self,
@@ -568,6 +776,15 @@ impl AtmiCtx {
         }
     }
 
+    /// Borrow native field storage and report its stored length; return null on failure.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: UBF buffer to inspect.
+    /// - `bfldid`: Typed field identifier, including the native field-type bits.
+    /// - `occ`: Zero-based field occurrence to access.
+    /// - `len`: Output slot receiving the native stored field length in bytes.
+    ///
     #[inline]
     pub(crate) fn bfind_value(
         &self,
@@ -588,6 +805,13 @@ impl AtmiCtx {
     }
 
     /// Advance a cursor that owns its iteration state.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: UBF buffer to inspect.
+    /// - `state`: This iterator’s native cursor, updated after each step.
+    /// - `bfldid`: Output slot receiving the next typed field identifier.
+    /// - `occ`: Output slot receiving the next zero-based occurrence.
     ///
     /// `Bnext` keeps its position in per-buffer native state, so two live
     /// iterators over one buffer corrupt each other and return `BEINVAL`.
@@ -629,6 +853,19 @@ impl AtmiCtx {
         }
     }
 
+    /// Append through the native conversion API using a caller-maintained location cursor.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF whose fields or native header may be changed.
+    /// - `bfldid`: Typed field identifier, including the native field-type bits.
+    /// - `buf`: Readable native value storage matching `usrtype`; pointer fields require the
+    ///   address of a pointer variable.
+    /// - `len`: Value length in bytes for variable-length input; use the native type’s
+    ///   convention for fixed-size values.
+    /// - `usrtype`: Native `BFLD_*` type describing the value storage used for conversion.
+    /// - `loc`: Valid fast-append cursor for the current destination allocation.
+    ///
     #[inline]
     pub(crate) fn baddfast_value(
         &self,
@@ -658,6 +895,16 @@ impl AtmiCtx {
         }
     }
 
+    /// Copy an occurrence in its stored native representation without type conversion.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: UBF buffer to inspect.
+    /// - `bfldid`: Typed field identifier, including the native field-type bits.
+    /// - `occ`: Zero-based field occurrence to access.
+    /// - `buf`: Writable native destination with at least the input `len` bytes.
+    /// - `len`: Destination capacity on input and returned value length on output, in bytes.
+    ///
     #[inline]
     pub(crate) fn bget_raw_value(
         &self,
@@ -678,6 +925,12 @@ impl AtmiCtx {
         }
     }
 
+    /// Compile a native expression string, returning an owned tree pointer or null on failure.
+    ///
+    /// # Arguments
+    ///
+    /// - `expr`: Readable NUL-terminated native expression string.
+    ///
     #[inline]
     pub(crate) fn bboolco_value(&self, expr: *mut c_char) -> *mut c_char {
         #[cfg(not(feature = "ctx-send"))]
@@ -691,6 +944,14 @@ impl AtmiCtx {
         }
     }
 
+    /// Evaluate a compiled expression with callback context tracking and return the native
+    /// boolean status.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: UBF buffer to inspect.
+    /// - `tree`: Compiled expression to evaluate or print.
+    ///
     #[inline]
     pub(crate) fn bboolev_value(&self, ubf: &TypedUbf<'_>, tree: &UbfExprTree<'_>) -> c_int {
         let _evaluation = ExprEvaluation::enter(self);
@@ -705,6 +966,13 @@ impl AtmiCtx {
         }
     }
 
+    /// Evaluate a compiled numeric expression with callback context tracking.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: UBF buffer to inspect.
+    /// - `tree`: Compiled expression to evaluate or print.
+    ///
     #[inline]
     pub(crate) fn bfloatev_value(&self, ubf: &TypedUbf<'_>, tree: &UbfExprTree<'_>) -> f64 {
         let _evaluation = ExprEvaluation::enter(self);
@@ -719,6 +987,12 @@ impl AtmiCtx {
         }
     }
 
+    /// Free a native compiled expression using the matching context API.
+    ///
+    /// # Arguments
+    ///
+    /// - `tree`: Owned tree pointer returned by native expression compilation; freed exactly once.
+    ///
     #[inline]
     pub(crate) fn btreefree_value(&self, tree: *mut c_char) {
         #[cfg(not(feature = "ctx-send"))]
@@ -732,6 +1006,11 @@ impl AtmiCtx {
         }
     }
 
+    /// Capture native UBF text output as a UTF-8 string without a trailing NUL.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: UBF buffer to inspect.
     pub(crate) fn bfprintcb_value(&self, ubf: &TypedUbf<'_>) -> UbfResult<String> {
         let mut state = OutputState { bytes: Vec::new() };
 
@@ -765,6 +1044,11 @@ impl AtmiCtx {
             .map_err(|e| crate::UbfError::new(crate::UbfError::BEUNIX, e.to_string()))
     }
 
+    /// Capture the native binary UBF representation in an owned byte vector.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: UBF buffer to inspect.
     pub(crate) fn bwritecb_value(&self, ubf: &TypedUbf<'_>) -> UbfResult<Vec<u8>> {
         let mut state = OutputState { bytes: Vec::new() };
 
@@ -794,6 +1078,12 @@ impl AtmiCtx {
         }
     }
 
+    /// Load binary UBF data through a temporary C memory stream.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF whose fields or native header may be changed.
+    /// - `dump`: Binary representation produced by native `Bwrite` or this binding’s `bwrite`.
     pub(crate) fn breadcb_value(&self, ubf: &mut TypedUbf<'_>, dump: &[u8]) -> UbfResult<()> {
         let mut data = dump.to_vec();
         let mode = CString::new("rb").expect("static mode has no NUL");
@@ -819,6 +1109,12 @@ impl AtmiCtx {
         self.ubf_unit_result(rc)
     }
 
+    /// Read UBF text with the Rust parser, falling back to native parsing when needed.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF whose fields or native header may be changed.
+    /// - `text`: UBF text with a field label and value separated by a tab on each line.
     pub(crate) fn bextreadcb_value(&self, ubf: &mut TypedUbf<'_>, text: &str) -> UbfResult<()> {
         if self.bextread_text_rust(ubf, text).is_ok() {
             return Ok(());
@@ -851,6 +1147,12 @@ impl AtmiCtx {
         self.ubf_unit_result(rc)
     }
 
+    /// Append tab-separated scalar field values, growing the destination as needed.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF whose fields or native header may be changed.
+    /// - `text`: UBF text with a field label and value separated by a tab on each line.
     fn bextread_text_rust(&self, ubf: &mut TypedUbf<'_>, text: &str) -> UbfResult<()> {
         for line in text.lines() {
             if line.trim().is_empty() {
@@ -906,6 +1208,11 @@ impl AtmiCtx {
         Ok(())
     }
 
+    /// Resolve a field name or a printed `((BFLDID32)number)` identifier.
+    ///
+    /// # Arguments
+    ///
+    /// - `field`: Field name or printed numeric field identifier.
     fn bextread_field_id(&self, field: &str) -> UbfResult<i32> {
         if let Some(id) = field
             .strip_prefix("((BFLDID32)")
@@ -917,6 +1224,11 @@ impl AtmiCtx {
         self.bfldid(field)
     }
 
+    /// Replace resolvable numeric field labels with names for native text parsing.
+    ///
+    /// # Arguments
+    ///
+    /// - `text`: UBF text with a field label and value separated by a tab on each line.
     fn normalize_bextread_text(&self, text: &str) -> String {
         let mut out = String::with_capacity(text.len());
         for line in text.lines() {
@@ -942,6 +1254,11 @@ impl AtmiCtx {
     }
 
     /// Return whether two UBF buffers contain the same fields and values.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf1`: First UBF buffer to compare.
+    /// - `ubf2`: Second UBF buffer to compare.
     pub fn bcmp(&self, ubf1: &TypedUbf<'_>, ubf2: &TypedUbf<'_>) -> bool {
         #[cfg(not(feature = "ctx-send"))]
         unsafe {
@@ -955,6 +1272,12 @@ impl AtmiCtx {
     }
 
     /// Append all fields from `src` into `dst`.
+    ///
+    /// # Arguments
+    ///
+    /// - `dst`: Destination UBF to modify; it must already have enough capacity.
+    /// - `src`: Source UBF to read; shallow copying rejects pointer fields, including inside
+    ///   inline UBFs.
     pub fn bconcat(&self, dst: &mut TypedUbf<'_>, src: &TypedUbf<'_>) -> UbfResult<()> {
         self.reject_pointer_copy(src, "Bconcat")?;
         #[cfg(not(feature = "ctx-send"))]
@@ -968,10 +1291,16 @@ impl AtmiCtx {
 
     /// Refuse a copying operation whose source holds `BFLD_PTR` fields.
     ///
+    /// # Arguments
+    ///
+    /// - `src`: Source UBF to read; shallow copying rejects pointer fields, including inside
+    ///   inline UBFs.
+    /// - `what`: Operation name included in a rejected-copy error.
+    ///
     /// Every one of these duplicates the stored pointer *addresses* without
     /// duplicating their targets, so the destination ends up referencing
-    /// allocations the source still owns and frees. Ownership-preserving deep
-    /// copies are not implemented.
+    /// allocations the source still owns and frees. Use `TypedUbf::deep_clone`
+    /// to copy the targets into independent allocations.
     fn reject_pointer_copy(&self, src: &TypedUbf<'_>, what: &str) -> UbfResult<()> {
         if self.ubf_has_pointer_fields(src)? {
             return Err(crate::UbfError::new(
@@ -987,6 +1316,10 @@ impl AtmiCtx {
     }
 
     /// Whether `ubf` holds a `BFLD_PTR` field at any depth.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: UBF buffer to inspect.
     ///
     /// Wraps `Bhasptr(3)`, which recurses through embedded `BFLD_UBF` fields
     /// because a pointer nested inside one carries the same ownership problem
@@ -1014,6 +1347,12 @@ impl AtmiCtx {
 
     /// Copy the full contents of `src` into `dst`.
     ///
+    /// # Arguments
+    ///
+    /// - `dst`: Destination UBF to modify; it must already have enough capacity.
+    /// - `src`: Source UBF to read; shallow copying rejects pointer fields, including inside
+    ///   inline UBFs.
+    ///
     /// Rejected with `BEINVAL` when `src` contains `BFLD_PTR` fields at any
     /// depth. `Bcpy` copies the stored *addresses*, so both buffers would then
     /// reference the same targets while each believes it owns them: dropping
@@ -1030,7 +1369,16 @@ impl AtmiCtx {
         self.ubf_unit_result(rc)
     }
 
-    /// Delete one occurrence of a field from a UBF buffer.
+    /// Delete one field occurrence and shift later occurrences down.
+    ///
+    /// Native deletion removes references without freeing pointer targets. Use
+    /// [`TypedUbf::bdel_owned`] when removing an occurrence that owns children.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF whose fields or native header may be changed.
+    /// - `bfldid`: Typed field identifier, including the native field-type bits.
+    /// - `occ`: Zero-based field occurrence to access.
     pub fn bdel(&self, ubf: &mut TypedUbf<'_>, bfldid: BFLDID, occ: BFLDOCC) -> UbfResult<()> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::Bdel(ubf.as_ubfh(), bfldid, occ) };
@@ -1041,7 +1389,12 @@ impl AtmiCtx {
         self.ubf_unit_result(rc)
     }
 
-    /// Delete all occurrences of a field from a UBF buffer.
+    /// Delete all occurrences of a field without freeing any referenced pointer targets.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF whose fields or native header may be changed.
+    /// - `bfldid`: Typed field identifier, including the native field-type bits.
     pub fn bdelall(&self, ubf: &mut TypedUbf<'_>, bfldid: BFLDID) -> UbfResult<()> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::Bdelall(ubf.as_ubfh(), bfldid) };
@@ -1052,10 +1405,15 @@ impl AtmiCtx {
         self.ubf_unit_result(rc)
     }
 
-    /// Delete all fields listed in `fldlist` from a UBF buffer.
+    /// Delete all listed fields without freeing any referenced pointer targets.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF whose fields or native header may be changed.
+    /// - `fldlist`: Typed field identifiers to select; no terminating zero is required.
     ///
     /// A terminating `0` is appended for the C API; callers should pass field
-    /// numbers only.
+    /// identifiers only, without a terminator.
     pub fn bdelete(&self, ubf: &mut TypedUbf<'_>, fldlist: &[i32]) -> UbfResult<()> {
         let mut fields: Vec<BFLDID> = fldlist.iter().copied().map(|f| f as BFLDID).collect();
         fields.push(0);
@@ -1069,7 +1427,11 @@ impl AtmiCtx {
         self.ubf_unit_result(rc)
     }
 
-    /// Return the number of index slots used by a UBF buffer.
+    /// Query the native index-size compatibility API; current Enduro/X returns zero.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: UBF buffer to inspect.
     pub fn bidxused(&self, ubf: &TypedUbf<'_>) -> UbfResult<usize> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::Bidxused(ubf.as_ubfh()) };
@@ -1080,7 +1442,12 @@ impl AtmiCtx {
         self.ubf_count_result(rc)
     }
 
-    /// Build or rebuild the UBF index.
+    /// Call the native indexing compatibility API; Enduro/X indexes UBF buffers automatically.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF whose fields or native header may be changed.
+    /// - `occ`: Legacy index interval; ignored by current Enduro/X.
     pub fn bindex(&self, ubf: &mut TypedUbf<'_>, occ: BFLDOCC) -> UbfResult<()> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::Bindex(ubf.as_ubfh(), occ) };
@@ -1092,6 +1459,10 @@ impl AtmiCtx {
     }
 
     /// Return whether a buffer is a valid UBF buffer.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: UBF buffer to inspect.
     pub fn bisubf(&self, ubf: &TypedUbf<'_>) -> bool {
         #[cfg(not(feature = "ctx-send"))]
         unsafe {
@@ -1104,7 +1475,14 @@ impl AtmiCtx {
         }
     }
 
-    /// Join fields from `src` into `dest`.
+    /// Keep matching field occurrences in `dest`, replacing their values from `src` and
+    /// removing unmatched ones.
+    ///
+    /// # Arguments
+    ///
+    /// - `dest`: Destination UBF to modify; it must already have enough capacity.
+    /// - `src`: Source UBF to read; shallow copying rejects pointer fields, including inside
+    ///   inline UBFs.
     pub fn bjoin(&self, dest: &mut TypedUbf<'_>, src: &TypedUbf<'_>) -> UbfResult<()> {
         self.reject_pointer_copy(src, "Bjoin")?;
         #[cfg(not(feature = "ctx-send"))]
@@ -1117,6 +1495,12 @@ impl AtmiCtx {
     }
 
     /// Return the stored length of a field occurrence.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: UBF buffer to inspect.
+    /// - `bfldid`: Typed field identifier, including the native field-type bits.
+    /// - `occ`: Zero-based field occurrence to access.
     pub fn blen(&self, ubf: &TypedUbf<'_>, bfldid: BFLDID, occ: BFLDOCC) -> UbfResult<usize> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::Blen(ubf.as_ubfh(), bfldid, occ) };
@@ -1128,6 +1512,10 @@ impl AtmiCtx {
     }
 
     /// Return the total number of field occurrences in a UBF buffer.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: UBF buffer to inspect.
     pub fn bnum(&self, ubf: &TypedUbf<'_>) -> UbfResult<usize> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::Bnum(ubf.as_ubfh()) };
@@ -1139,6 +1527,11 @@ impl AtmiCtx {
     }
 
     /// Return the number of occurrences for one field.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: UBF buffer to inspect.
+    /// - `bfldid`: Typed field identifier, including the native field-type bits.
     pub fn boccur(&self, ubf: &TypedUbf<'_>, bfldid: BFLDID) -> UbfResult<usize> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::Boccur(ubf.as_ubfh(), bfldid) };
@@ -1149,7 +1542,14 @@ impl AtmiCtx {
         self.ubf_count_result(rc)
     }
 
-    /// Outer-join fields from `src` into `dest`.
+    /// Update matching field occurrences from `src`, leaving unmatched destination occurrences
+    /// intact.
+    ///
+    /// # Arguments
+    ///
+    /// - `dest`: Destination UBF to modify; it must already have enough capacity.
+    /// - `src`: Source UBF to read; shallow copying rejects pointer fields, including inside
+    ///   inline UBFs.
     pub fn bojoin(&self, dest: &mut TypedUbf<'_>, src: &TypedUbf<'_>) -> UbfResult<()> {
         self.reject_pointer_copy(src, "Bojoin")?;
         #[cfg(not(feature = "ctx-send"))]
@@ -1162,6 +1562,12 @@ impl AtmiCtx {
     }
 
     /// Return whether a field occurrence is present.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: UBF buffer to inspect.
+    /// - `bfldid`: Typed field identifier, including the native field-type bits.
+    /// - `occ`: Zero-based field occurrence to access.
     pub fn bpres(&self, ubf: &TypedUbf<'_>, bfldid: BFLDID, occ: BFLDOCC) -> bool {
         #[cfg(not(feature = "ctx-send"))]
         unsafe {
@@ -1175,6 +1581,10 @@ impl AtmiCtx {
     }
 
     /// Return the UBF type for a field id.
+    ///
+    /// # Arguments
+    ///
+    /// - `bfldid`: Typed field identifier, including the native field-type bits.
     pub fn bfldtype(&self, bfldid: BFLDID) -> UbfResult<UbfFieldType> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::Bfldtype(bfldid) };
@@ -1191,6 +1601,11 @@ impl AtmiCtx {
     }
 
     /// Refuse to run Enduro/X's `BFLD_PTR` conversions on `bfldid`.
+    ///
+    /// # Arguments
+    ///
+    /// - `bfldid`: Typed field identifier, including the native field-type bits.
+    /// - `op`: Operation name included in a rejected pointer-conversion error.
     ///
     /// The conversion table pairs `BFLD_PTR` with the scalar types, so reading a
     /// pointer field as an integer hands out the address of a buffer that the
@@ -1213,6 +1628,10 @@ impl AtmiCtx {
     }
 
     /// Resolve a field name to its typed field id.
+    ///
+    /// # Arguments
+    ///
+    /// - `field_name`: UBF field-table name, without embedded NUL bytes.
     pub fn bfldid(&self, field_name: &str) -> UbfResult<i32> {
         let name = CString::new(field_name)
             .map_err(|e| crate::UbfError::new(crate::UbfError::BEINVAL, e.to_string()))?;
@@ -1245,6 +1664,10 @@ impl AtmiCtx {
     }
 
     /// Resolve a typed field id to its field name.
+    ///
+    /// # Arguments
+    ///
+    /// - `bfldid`: Typed field identifier, including the native field-type bits.
     pub fn bfname(&self, bfldid: BFLDID) -> UbfResult<String> {
         #[cfg(not(feature = "ctx-send"))]
         let mut ptr = unsafe { raw::Bfname(bfldid) };
@@ -1276,6 +1699,10 @@ impl AtmiCtx {
     }
 
     /// Return the untyped field number portion of a typed field id.
+    ///
+    /// # Arguments
+    ///
+    /// - `bfldid`: Typed field identifier, including the native field-type bits.
     pub fn bfldno(&self, bfldid: BFLDID) -> i32 {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::Bfldno(bfldid) };
@@ -1287,6 +1714,10 @@ impl AtmiCtx {
     }
 
     /// Return the Enduro/X textual field type descriptor.
+    ///
+    /// # Arguments
+    ///
+    /// - `bfldid`: Typed field identifier, including the native field-type bits.
     pub fn btype(&self, bfldid: BFLDID) -> UbfResult<String> {
         #[cfg(not(feature = "ctx-send"))]
         let ptr = unsafe { raw::Btype(bfldid) };
@@ -1304,6 +1735,11 @@ impl AtmiCtx {
     }
 
     /// Reinitialize a UBF buffer with a given UBF length.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF whose fields or native header may be changed.
+    /// - `len`: UBF capacity to record in bytes; must not exceed the actual allocation.
     ///
     /// Fails with `BEINVAL` if `len` exceeds the allocation. `Binit` formats the
     /// buffer header for the length it is given, so a value larger than the
@@ -1327,7 +1763,7 @@ impl AtmiCtx {
         self.ubf_unit_result(rc)
     }
 
-    /// Load UBF field table database from `FLDTBLDIR`/`FIELDTBLS`.
+    /// Load the configured native UBF field database for dynamic name/identifier lookup.
     pub fn bflddbload(&self) -> UbfResult<()> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::Bflddbload() };
@@ -1339,6 +1775,10 @@ impl AtmiCtx {
     }
 
     /// Compile a UBF boolean expression.
+    ///
+    /// # Arguments
+    ///
+    /// - `expr`: UBF boolean expression text to compile.
     pub fn bboolco(&self, expr: &str) -> UbfResult<UbfExprTree<'_>> {
         let expr = CString::new(expr)
             .map_err(|e| crate::UbfError::new(crate::UbfError::BEINVAL, e.to_string()))?;
@@ -1353,11 +1793,19 @@ impl AtmiCtx {
     }
 
     /// Explicitly free a compiled UBF boolean expression tree.
+    ///
+    /// # Arguments
+    ///
+    /// - `tree`: Owned expression tree to consume and release.
     pub fn btreefree(&self, mut tree: UbfExprTree<'_>) {
         tree.free();
     }
 
     /// Print a compiled boolean expression tree to a string.
+    ///
+    /// # Arguments
+    ///
+    /// - `tree`: Compiled expression to evaluate or print.
     ///
     /// Wraps the C `Bboolpr`/`OBboolpr` `FILE*` API by capturing its output via
     /// an in-memory stream from `open_memstream(3)`.
@@ -1400,6 +1848,12 @@ impl AtmiCtx {
     }
 
     /// Register a Rust callback for UBF boolean expression evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// - `funcname`: Registered function name, without embedded NUL bytes.
+    /// - `callback`: Function receiving the evaluated UBF and registered name, and returning
+    ///   the expression value.
     ///
     /// Registration is process-wide and independent of this context's lifetime.
     /// The callback borrows the context of the buffer being evaluated, on the
@@ -1445,6 +1899,12 @@ impl AtmiCtx {
 
     /// Register a Rust callback with one string argument for boolean evaluation.
     ///
+    /// # Arguments
+    ///
+    /// - `funcname`: Registered function name, without embedded NUL bytes.
+    /// - `callback`: Function receiving the evaluated UBF, registered name, and
+    ///   expression-supplied string argument.
+    ///
     /// Like [`Self::bboolsetcbf`], registration is process-wide. The callback
     /// borrows the evaluating buffer's context, regardless of which context or
     /// thread registered it, and may run concurrently on different threads.
@@ -1488,8 +1948,13 @@ impl AtmiCtx {
 
     /// Project a UBF buffer in place to the fields listed in `fldlist`.
     ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF whose fields or native header may be changed.
+    /// - `fldlist`: Typed field identifiers to select; no terminating zero is required.
+    ///
     /// A terminating `0` is appended for the C API; callers should pass field
-    /// numbers only.
+    /// identifiers only, without a terminator.
     pub fn bproj(&self, ubf: &mut TypedUbf<'_>, fldlist: &[i32]) -> UbfResult<()> {
         let mut fields: Vec<BFLDID> = fldlist.iter().copied().map(|f| f as BFLDID).collect();
         fields.push(0);
@@ -1504,6 +1969,13 @@ impl AtmiCtx {
     }
 
     /// Copy a projection of `src` into `dst`.
+    ///
+    /// # Arguments
+    ///
+    /// - `dst`: Destination UBF to modify; it must already have enough capacity.
+    /// - `src`: Source UBF to read; shallow copying rejects pointer fields, including inside
+    ///   inline UBFs.
+    /// - `fldlist`: Typed field identifiers to select; no terminating zero is required.
     pub fn bprojcpy(
         &self,
         dst: &mut TypedUbf<'_>,
@@ -1531,6 +2003,10 @@ impl AtmiCtx {
     }
 
     /// Return the allocated size of a UBF buffer in bytes.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: UBF buffer to inspect.
     pub fn bsizeof(&self, ubf: &TypedUbf<'_>) -> UbfResult<usize> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::Bsizeof(ubf.as_ubfh()) };
@@ -1541,7 +2017,14 @@ impl AtmiCtx {
         self.ubf_count_result(rc)
     }
 
-    /// Return whether `ubf1` is a subset of `ubf2`.
+    /// Test whether `ubf2` is contained in `ubf1`, comparing fields, occurrences, and values.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf1`: Containing buffer to search.
+    /// - `ubf2`: Candidate subset whose fields and values are sought in `ubf1`.
+    ///
+    /// This wrapper maps any nonzero native result to `true`, including a native error.
     pub fn bsubset(&self, ubf1: &TypedUbf<'_>, ubf2: &TypedUbf<'_>) -> bool {
         #[cfg(not(feature = "ctx-send"))]
         unsafe {
@@ -1554,7 +2037,12 @@ impl AtmiCtx {
         }
     }
 
-    /// Remove the index from a UBF buffer.
+    /// Call the native unindex compatibility API; current Enduro/X returns zero without
+    /// changing the buffer.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: Destination UBF whose fields or native header may be changed.
     pub fn bunindex(&self, ubf: &mut TypedUbf<'_>) -> UbfResult<usize> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::Bunindex(ubf.as_ubfh()) };
@@ -1566,6 +2054,10 @@ impl AtmiCtx {
     }
 
     /// Return the unused byte count in a UBF buffer.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: UBF buffer to inspect.
     pub fn bunused(&self, ubf: &TypedUbf<'_>) -> UbfResult<usize> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::Bunused(ubf.as_ubfh()) };
@@ -1576,7 +2068,14 @@ impl AtmiCtx {
         self.ubf_count_result(rc)
     }
 
-    /// Update `dst` with fields from `src`.
+    /// Replace matching field occurrences in `dst` from `src`, adding source occurrences that
+    /// are missing.
+    ///
+    /// # Arguments
+    ///
+    /// - `dst`: Destination UBF to modify; it must already have enough capacity.
+    /// - `src`: Source UBF to read; shallow copying rejects pointer fields, including inside
+    ///   inline UBFs.
     pub fn bupdate(&self, dst: &mut TypedUbf<'_>, src: &TypedUbf<'_>) -> UbfResult<()> {
         self.reject_pointer_copy(src, "Bupdate")?;
         #[cfg(not(feature = "ctx-send"))]
@@ -1589,6 +2088,10 @@ impl AtmiCtx {
     }
 
     /// Return the used byte count in a UBF buffer.
+    ///
+    /// # Arguments
+    ///
+    /// - `ubf`: UBF buffer to inspect.
     pub fn bused(&self, ubf: &TypedUbf<'_>) -> UbfResult<usize> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::Bused(ubf.as_ubfh()) };
@@ -1600,6 +2103,11 @@ impl AtmiCtx {
     }
 
     /// Return a typed field id from a field type and field number.
+    ///
+    /// # Arguments
+    ///
+    /// - `field_type`: Rust UBF field kind to encode in the identifier.
+    /// - `field_no`: Untyped field number to combine with the field kind.
     pub fn bmkfldid_typed(&self, field_type: UbfFieldType, field_no: i32) -> i32 {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::Bmkfldid(field_type.as_raw(), field_no as BFLDID) };
@@ -1612,6 +2120,11 @@ impl AtmiCtx {
     }
 
     /// Return a typed field id from a raw Enduro/X field type and field number.
+    ///
+    /// # Arguments
+    ///
+    /// - `field_type`: Native `BFLD_*` numeric type code to encode in the identifier.
+    /// - `field_no`: Untyped field number to combine with the field kind.
     pub fn bmkfldid(&self, field_type: i32, field_no: i32) -> UbfResult<i32> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::Bmkfldid(field_type as c_int, field_no as BFLDID) };

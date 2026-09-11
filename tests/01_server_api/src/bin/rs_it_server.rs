@@ -231,6 +231,11 @@ fn rs_it_init(ctx: &AtmiCtx, _args: &[String]) -> AtmiResult<()> {
     ctx.tpadvertise("RS_IT_FORWARD_FINAL", rs_it_forward_final)?;
     ctx.tpadvertise("RS_IT_INNER_UBF", rs_it_inner_ubf)?;
     ctx.tpadvertise("RS_IT_CONTROL", rs_it_control)?;
+    ctx.tpadvertise("RS_IT_EVENT", rs_it_event)?;
+    ctx.tpadvertise("RS_IT_SUBSCRIBE", rs_it_subscribe)?;
+    ctx.tpadvertise("RS_IT_EVENTCOUNT", rs_it_eventcount)?;
+    ctx.tpadvertise("RS_IT_REQLOG", rs_it_reqlog)?;
+    ctx.tpadvertise("RS_IT_DLM", rs_it_dlm)?;
     Ok(())
 }
 
@@ -253,5 +258,101 @@ fn main() {
     ) {
         eprintln!("server failed: {e}");
         std::process::exit(1);
+    }
+}
+
+static EVENT_COUNT: AtomicUsize = AtomicUsize::new(0);
+static DLM_RETRY_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn rs_it_event(ctx: &AtmiCtx, svc: &mut TpSvcInfo<'_>) {
+    EVENT_COUNT.fetch_add(1, Ordering::SeqCst);
+    if let Some(data) = svc.take_data() {
+        ctx.tpreturn(TpReturnStatus::Success, 0, data, 0);
+    }
+}
+
+fn rs_it_subscribe(ctx: &AtmiCtx, svc: &mut TpSvcInfo<'_>) {
+    let Some(mut data) = svc.take_data_ubf() else {
+        return;
+    };
+    let mut ctl = endurox_rs::TpEvCtl::default();
+    ctl.set_name1("RS_IT_EVENT")
+        .unwrap()
+        .set_flags(endurox_rs::TPEVSERVICE);
+    match ctx.tpsubscribe("^RS_API_EVENT$", None, &ctl, 0) {
+        Ok(subscription) => {
+            data.bchg(ubf_fields::T_LONG_FLD, 0, subscription, true)
+                .unwrap();
+            ctx.tpreturn_ubf(TpReturnStatus::Success, 0, data, 0);
+        }
+        Err(e) => {
+            eprintln!("subscribe: {e}");
+            ctx.tpreturn_ubf(TpReturnStatus::Fail, 1, data, 0);
+        }
+    }
+}
+
+fn rs_it_eventcount(ctx: &AtmiCtx, svc: &mut TpSvcInfo<'_>) {
+    let Some(mut data) = svc.take_data_ubf() else {
+        return;
+    };
+    data.bchg(
+        ubf_fields::T_LONG_FLD,
+        0,
+        EVENT_COUNT.load(Ordering::SeqCst) as i64,
+        true,
+    )
+    .unwrap();
+    ctx.tpreturn_ubf(TpReturnStatus::Success, 0, data, 0);
+}
+
+fn rs_it_reqlog(ctx: &AtmiCtx, svc: &mut TpSvcInfo<'_>) {
+    let Some(mut data) = svc.take_data_ubf() else {
+        return;
+    };
+    let fail = data.bget_string(ubf_fields::T_STRING_FLD, 0).unwrap() == "fail";
+    let filename = data.bget_string(ubf_fields::T_STRING_2_FLD, 0).unwrap();
+    data.bchg(ubf_fields::T_CARRAY_FLD, 0, vec![7_u8; 12000], true)
+        .unwrap();
+    ctx.tplogsetreqfile(Some(&mut data), Some(&filename), None)
+        .unwrap();
+    endurox_rs::tp_always!(ctx, "SERVICE-REQUEST-LOG");
+    ctx.tplogclosereqfile();
+    ctx.tpreturn_ubf(
+        if fail {
+            TpReturnStatus::Fail
+        } else {
+            TpReturnStatus::Success
+        },
+        0,
+        data,
+        0,
+    );
+}
+
+fn rs_it_dlm(ctx: &AtmiCtx, svc: &mut TpSvcInfo<'_>) {
+    let Some(mut data) = svc.take_data_ubf() else {
+        return;
+    };
+    let action = data.bget_string(ubf_fields::T_STRING_FLD, 0).unwrap();
+    let attempt = if action == "retry" {
+        DLM_RETRY_COUNT.fetch_add(1, Ordering::SeqCst) + 1
+    } else {
+        1
+    };
+    data.bchg(ubf_fields::T_LONG_FLD, 0, attempt as i64, true)
+        .unwrap();
+    data.bchg(ubf_fields::T_CARRAY_FLD, 0, vec![8_u8; 12000], true)
+        .unwrap();
+    if action == "fail" || (action == "retry" && attempt == 1) {
+        let code = ctx.bfldid("EX_NERROR_CODE").unwrap();
+        let message = ctx.bfldid("EX_NERROR_MSG").unwrap();
+        // Core NSTD codes: NEINVAL=4 is final; NEUNAVAILABLE=39 is retryable.
+        data.bchg(code, 0, if action == "fail" { 4_i16 } else { 39_i16 }, true)
+            .unwrap();
+        data.bchg(message, 0, "DLM fixture response", true).unwrap();
+        ctx.tpreturn_ubf(TpReturnStatus::Fail, 0, data, 0);
+    } else {
+        ctx.tpreturn_ubf(TpReturnStatus::Success, 0, data, 0);
     }
 }

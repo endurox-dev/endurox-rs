@@ -1,3 +1,4 @@
+//! Async request submission, reply routing, and runtime-specific reply-queue drivers.
 use crate::{raw, AtmiCtx, AtmiError, AtmiResult, TypedBuffer};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -28,6 +29,11 @@ pub trait AsyncReplyDriver: Sized {
 
     /// Register the Enduro/X-owned reply descriptor.
     ///
+    /// # Arguments
+    ///
+    /// - `reply_fd`: Open native reply-queue descriptor to duplicate; ownership remains with
+    ///   Enduro/X.
+    ///
     /// Implementations must duplicate `reply_fd`; they must neither close it
     /// nor change flags on its shared open-file description.
     fn register(reply_fd: i32) -> io::Result<Self>;
@@ -37,14 +43,31 @@ pub trait AsyncReplyDriver: Sized {
 
     /// Clear a readiness indication after `tpgetrply(TPNOBLOCK)` has reported
     /// that the reply queue is empty.
+    ///
+    /// # Arguments
+    ///
+    /// - `readiness`: Runtime readiness token to clear only after native receive reports
+    ///   would-block.
     fn clear_readiness(&self, readiness: &mut Self::Readiness<'_>);
 
     /// Sleep until an absolute standard-library deadline.
+    ///
+    /// # Arguments
+    ///
+    /// - `deadline`: Absolute monotonic instant at which the timer should complete.
     fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()> + '_;
 }
 
 /// Retry only a definitely-unsent request. Each failed attempt yields to the
 /// executor; the timer is capped by the original send/reply deadline.
+///
+/// # Arguments
+///
+/// - `flags`: Original submission flags; explicit `TPNOBLOCK` disables retries after queue-full.
+/// - `deadline`: Original absolute timeout instant, or `None` when the operation has no deadline.
+/// - `send`: Attempt callback receiving nonblocking flags and a boolean indicating whether this
+///   is a retry.
+/// - `sleep`: Closure creating a timer future for the supplied absolute wake instant.
 async fn send_with_backpressure<T, F, S, W>(
     flags: i64,
     deadline: Option<Instant>,
@@ -98,15 +121,23 @@ struct ParkedBuf {
 // silently makes `AsyncAtmiCtx` !Send; with it unconditionally, this would claim
 // more than atmictx.rs justifies. `async` implies `ctx-send` today, so the gate
 // is documentation -- and a tripwire if the two are ever decoupled.
+/// Allow ownership to move between threads with the detached native context.
 #[cfg(feature = "ctx-send")]
 unsafe impl Send for ParkedBuf {}
 
+/// Native ownership and cleanup for a reply parked outside a Rust buffer wrapper.
 impl ParkedBuf {
     const EMPTY: Self = Self {
         ptr: std::ptr::null_mut(),
         len: 0,
     };
 
+    /// Release the parked native buffer through its owning context.
+    ///
+    /// # Arguments
+    ///
+    /// - `ctx`: Live native context that owns the reply allocations and reply queue.
+    ///
     /// # Safety
     /// `ctx` must be the context that allocated `self.ptr`.
     unsafe fn free(self, ctx: &AtmiCtx) {
@@ -148,7 +179,13 @@ struct AnyWaiterGuard<'a> {
     id: u64,
 }
 
+/// Scoped registration of a caller waiting for any unclaimed reply.
 impl<'a> AnyWaiterGuard<'a> {
+    /// Register a `TPGETANY` waiter whose registration is removed when this guard is dropped.
+    ///
+    /// # Arguments
+    ///
+    /// - `demux`: Reply router that owns this waiter’s registration.
     fn new(demux: &'a ReplyDemux) -> Self {
         Self {
             id: demux.register_any_waiter(),
@@ -156,12 +193,15 @@ impl<'a> AnyWaiterGuard<'a> {
         }
     }
 
+    /// Return this `TPGETANY` waiter’s registration identifier.
     fn id(&self) -> u64 {
         self.id
     }
 }
 
+/// Remove this waiter’s waker and pending queue-level error from the reply router.
 impl Drop for AnyWaiterGuard<'_> {
+    /// Remove this waiter’s waker and pending queue-level error from the reply router.
     fn drop(&mut self) {
         self.demux.deregister_any_waiter(self.id);
     }
@@ -220,7 +260,13 @@ struct ReplyDemux {
     draining: Cell<bool>,
 }
 
+/// Debug formatting of runtime state without dumping owned native buffers.
 impl fmt::Debug for ReplyDemux {
+    /// Format the reply router’s current number of tracked descriptors.
+    ///
+    /// # Arguments
+    ///
+    /// - `f`: Formatter receiving the router’s debug description.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReplyDemux")
             .field("slots", &self.slots.borrow().len())
@@ -228,8 +274,15 @@ impl fmt::Debug for ReplyDemux {
     }
 }
 
+/// Descriptor registration, buffered replies, wakeups, and shared queue draining.
 impl ReplyDemux {
     /// Register a slot for a descriptor known to be free.
+    ///
+    /// # Arguments
+    ///
+    /// - `cd`: Native call descriptor identifying the outstanding request or parked reply.
+    /// - `claimed`: Whether a particular future owns the reply, excluding it from `TPGETANY`
+    ///   collection.
     ///
     /// Never displaces anything: [`AsyncAtmiCtx::submit`] refuses to proceed
     /// with a descriptor that is still occupied, so any existing entry here
@@ -250,6 +303,10 @@ impl ReplyDemux {
 
     /// Whether anything is still tracked for `cd`.
     ///
+    /// # Arguments
+    ///
+    /// - `cd`: Native call descriptor identifying the outstanding request or parked reply.
+    ///
     /// Any occupied slot makes the number unsafe to reuse, not just one holding
     /// an uncollected reply. A `Ready { claimed: true }` entry normally means
     /// the owning future has been *woken but has not resumed yet* -- not that
@@ -261,6 +318,10 @@ impl ReplyDemux {
 
     /// Register a slot for a descriptor the caller owns, from its own
     /// `tpacall`.
+    ///
+    /// # Arguments
+    ///
+    /// - `cd`: Native call descriptor identifying the outstanding request or parked reply.
     ///
     /// Unlike [`Self::register_fresh`] this preserves a reply that a drain has
     /// already parked here. With a manual `tpacall`, the reply can easily
@@ -286,11 +347,22 @@ impl ReplyDemux {
         }
     }
 
+    /// Remember the original submission deadline for later reply collection.
+    ///
+    /// # Arguments
+    ///
+    /// - `cd`: Native call descriptor identifying the outstanding request or parked reply.
+    /// - `deadline`: Original absolute timeout instant, or `None` when the operation has no
+    ///   deadline.
     fn record_deadline(&self, cd: i32, deadline: Option<Instant>) {
         self.deadlines.borrow_mut().insert(cd, deadline);
     }
 
     /// Deadline recorded when `cd` was submitted, if this adapter sent it.
+    ///
+    /// # Arguments
+    ///
+    /// - `cd`: Native call descriptor identifying the outstanding request or parked reply.
     ///
     /// Read-only on purpose. A collection attempt may end without completing
     /// the call -- TPNOBLOCK reporting TPEBLOCK, a driver error, or the future
@@ -311,10 +383,20 @@ impl ReplyDemux {
         self.deadlines.borrow().values().filter_map(|d| *d).min()
     }
 
+    /// Remove the deadline after a descriptor completes or is cancelled.
+    ///
+    /// # Arguments
+    ///
+    /// - `cd`: Native call descriptor identifying the outstanding request or parked reply.
     fn forget_deadline(&self, cd: i32) {
         self.deadlines.borrow_mut().remove(&cd);
     }
 
+    /// Test whether a reply or descriptor-specific error has already been parked.
+    ///
+    /// # Arguments
+    ///
+    /// - `cd`: Native call descriptor identifying the outstanding request or parked reply.
     fn is_ready(&self, cd: i32) -> bool {
         matches!(self.slots.borrow().get(&cd), Some(Slot::Ready { .. }))
     }
@@ -330,6 +412,11 @@ impl ReplyDemux {
             })
     }
 
+    /// Test whether the selected descriptor or any-reply waiter has a result available.
+    ///
+    /// # Arguments
+    ///
+    /// - `target`: Specific descriptor or registered `TPGETANY` waiter whose readiness is checked.
     fn is_target_ready(&self, target: Target) -> bool {
         match target {
             Target::One(cd) => self.is_ready(cd),
@@ -342,6 +429,11 @@ impl ReplyDemux {
         }
     }
 
+    /// Test whether a queue-level error is waiting for this `TPGETANY` registration.
+    ///
+    /// # Arguments
+    ///
+    /// - `id`: Unique registration identifier for an any-reply waiter.
     fn has_any_error(&self, id: u64) -> bool {
         self.any_waiters
             .borrow()
@@ -349,6 +441,13 @@ impl ReplyDemux {
             .is_some_and(|entry| entry.error.is_some())
     }
 
+    /// Store the executor waker for a descriptor or an any-reply registration.
+    ///
+    /// # Arguments
+    ///
+    /// - `target`: Specific descriptor or registered `TPGETANY` waiter whose readiness is checked.
+    /// - `id`: Any-reply registration identifier; ignored for a specific-descriptor target.
+    /// - `waker`: Executor notification handle to clone and wake when progress becomes possible.
     fn park_waker(&self, target: Target, id: u64, waker: &Waker) {
         match target {
             Target::One(cd) => {
@@ -375,6 +474,7 @@ impl ReplyDemux {
         }
     }
 
+    /// Wake every registered any-reply waiter so it can recheck replies and errors.
     fn wake_any_waiters(&self) {
         let wakers: Vec<Waker> = self
             .any_waiters
@@ -397,11 +497,20 @@ impl ReplyDemux {
         id
     }
 
+    /// Remove an any-reply registration and discard its pending error.
+    ///
+    /// # Arguments
+    ///
+    /// - `id`: Unique registration identifier for an any-reply waiter.
     fn deregister_any_waiter(&self, id: u64) {
         self.any_waiters.borrow_mut().remove(&id);
     }
 
     /// Take the queue-level error delivered to this specific waiter, if any.
+    ///
+    /// # Arguments
+    ///
+    /// - `id`: Unique registration identifier for an any-reply waiter.
     fn take_any_error(&self, id: u64) -> Option<AtmiError> {
         self.any_waiters
             .borrow_mut()
@@ -411,6 +520,10 @@ impl ReplyDemux {
 
     /// Remove a slot, returning any buffer parked in it so the caller can free
     /// it against the owning context.
+    ///
+    /// # Arguments
+    ///
+    /// - `cd`: Native call descriptor identifying the outstanding request or parked reply.
     fn deregister(&self, cd: i32) -> Option<ParkedBuf> {
         match self.slots.borrow_mut().remove(&cd) {
             Some(Slot::Ready { buf, .. }) => Some(buf),
@@ -419,6 +532,13 @@ impl ReplyDemux {
     }
 
     /// Take a completed reply, moving its buffer into `data`.
+    ///
+    /// # Arguments
+    ///
+    /// - `target`: Specific descriptor or registered `TPGETANY` waiter whose readiness is checked.
+    /// - `data`: Caller’s reply buffer, updated with the received allocation and reported length.
+    /// - `flags`: Caller’s receive flags; `TPNOCHANGE` is enforced when handing over a parked
+    ///   reply.
     ///
     /// `data`'s previous buffer is handed back as the next drain scratch, so
     /// neither an allocation nor a copy happens on the common path.
@@ -444,6 +564,13 @@ impl ReplyDemux {
     }
 
     /// Move a collected reply into the caller's buffer, applying `TPNOCHANGE`.
+    ///
+    /// # Arguments
+    ///
+    /// - `outcome`: Native reply result to preserve alongside its buffer, including service errors.
+    /// - `buf`: Owned parked allocation and length to transfer, retain, or release.
+    /// - `data`: Caller’s reply buffer, updated with the received allocation and reported length.
+    /// - `flags`: Caller’s receive flags; `TPNOCHANGE` requires matching buffer type and subtype.
     fn hand_over(
         &self,
         outcome: AtmiResult<()>,
@@ -491,6 +618,10 @@ impl ReplyDemux {
     }
 
     /// Keep a spare buffer for the next drain, or set it aside to be freed.
+    ///
+    /// # Arguments
+    ///
+    /// - `buf`: Owned parked allocation and length to transfer, retain, or release.
     fn stash(&self, buf: ParkedBuf) {
         if buf.ptr.is_null() {
             return;
@@ -506,6 +637,12 @@ impl ReplyDemux {
 
     /// Drain every reply currently available and route each to its slot.
     ///
+    /// # Arguments
+    ///
+    /// - `ctx`: Live native context that owns the reply allocations and reply queue.
+    /// - `flags`: Caller flags forwarded to the drain helper; native draining uses its own
+    ///   neutral receive flags.
+    ///
     /// Synchronous and free of await points, so `draining` only has to guard
     /// against re-entrancy, never against parallelism.
     fn drain(&self, ctx: &AtmiCtx, flags: i64) {
@@ -516,6 +653,13 @@ impl ReplyDemux {
         self.draining.set(false);
     }
 
+    /// Collect all ready native replies with `TPGETANY | TPNOBLOCK` and route them by descriptor.
+    ///
+    /// # Arguments
+    ///
+    /// - `ctx`: Live native context that owns the reply allocations and reply queue.
+    /// - `_flags`: Unused caller flags; shared draining always uses neutral `TPGETANY |
+    ///   TPNOBLOCK` flags.
     fn drain_inner(&self, ctx: &AtmiCtx, _flags: i64) {
         // Neutral flag policy. A drain uses TPGETANY, so it collects replies
         // for descriptors belonging to *other* waiters; applying the calling
@@ -572,6 +716,11 @@ impl ReplyDemux {
         }
     }
 
+    /// Reuse the saved receive allocation, or allocate a provisional CARRAY buffer.
+    ///
+    /// # Arguments
+    ///
+    /// - `ctx`: Live native context that owns the reply allocations and reply queue.
     fn take_scratch<'c>(&self, ctx: &'c AtmiCtx) -> AtmiResult<TypedBuffer<'c>> {
         if let Some(buf) = self.scratch.borrow_mut().take() {
             // SAFETY: the pointer came from a TypedBuffer allocated by this
@@ -585,6 +734,13 @@ impl ReplyDemux {
         ctx.tpalloc("CARRAY", "", 1024)
     }
 
+    /// Park a reply in its descriptor’s slot and wake its owner and any-reply waiters.
+    ///
+    /// # Arguments
+    ///
+    /// - `cd`: Native call descriptor identifying the outstanding request or parked reply.
+    /// - `outcome`: Native reply result to preserve alongside its buffer, including service errors.
+    /// - `buf`: Owned parked allocation and length to transfer, retain, or release.
     fn route(&self, cd: i32, outcome: AtmiResult<()>, buf: ParkedBuf) {
         let waker = {
             let mut slots = self.slots.borrow_mut();
@@ -641,6 +797,11 @@ impl ReplyDemux {
         self.wake_any_waiters();
     }
 
+    /// Deliver a queue-wide failure to all current waiters without affecting later registrations.
+    ///
+    /// # Arguments
+    ///
+    /// - `err`: Error to propagate to the affected waiter or waiters.
     fn fail_all_waiting(&self, err: AtmiError) {
         // Deliver to each TPGETANY waiter registered right now. Every one of
         // them gets a copy -- a single shared error would satisfy only the
@@ -673,6 +834,10 @@ impl ReplyDemux {
     }
 
     /// Free every buffer still held. Must run before the context is dropped.
+    ///
+    /// # Arguments
+    ///
+    /// - `ctx`: Live native context that owns the reply allocations and reply queue.
     ///
     /// # Safety
     /// `ctx` must be the context these buffers were allocated from.
@@ -730,7 +895,14 @@ struct SendPriority {
     flags: i64,
 }
 
+/// Validation of absolute and relative message priorities.
 impl SendPriority {
+    /// Validate an absolute or relative message-priority setting.
+    ///
+    /// # Arguments
+    ///
+    /// - `value`: Absolute priority from 1 to 100, or a relative adjustment from -100 to 100.
+    /// - `flags`: `TPABSOLUTE` for an absolute priority, or `0` for a relative adjustment.
     fn new(value: i32, flags: i64) -> AtmiResult<Self> {
         let absolute = flags & raw::TPABSOLUTE as i64 != 0;
         if flags & !(raw::TPABSOLUTE as i64) != 0
@@ -746,8 +918,14 @@ impl SendPriority {
     }
 }
 
+/// Async submission and collection with shared reply routing, cancellation, and deadlines.
 impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
     /// Attach `driver` type `D` to an initialized ATMI context.
+    ///
+    /// # Arguments
+    ///
+    /// - `context`: Initialized ATMI context consumed by the adapter; its native reply queue
+    ///   must be pollable.
     ///
     /// `context.tpinit()` must have completed so Enduro/X has opened its reply
     /// queue. On a non-pollable backend this returns `TPEINVAL`.
@@ -781,6 +959,11 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
     /// resolved priority is retained across queue-full retries. It is separate
     /// from native operations invoked through `context()` or `Deref`; configure
     /// those through `context().tpsprio(...)` instead.
+    ///
+    /// # Arguments
+    ///
+    /// - `priority`: Absolute priority from 1 to 100, or relative adjustment from -100 to 100.
+    /// - `flags`: `TPABSOLUTE` selects absolute priority; `0` selects a relative adjustment.
     pub fn tpsprio(&self, priority: i32, flags: i64) -> AtmiResult<()> {
         self.next_priority
             .set(Some(SendPriority::new(priority, flags)?));
@@ -811,6 +994,15 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
     }
 
     /// Submit a request and asynchronously wait for its reply.
+    ///
+    /// # Arguments
+    ///
+    /// - `svc`: Advertised destination service name, without embedded NUL bytes.
+    /// - `idata`: Borrowed request buffer; native sends use its tracked payload length.
+    /// - `odata`: Reply destination; received pointer and length changes are preserved even
+    ///   with a service error.
+    /// - `flags`: Call options; `TPNOBLOCK` affects only sending, `TPNOTIME` disables the
+    ///   deadline, and `TPNOREPLY` is invalid.
     ///
     /// A full destination queue yields between nonblocking send attempts.
     /// `TPNOBLOCK` makes the send fail immediately with `TPEBLOCK` if full,
@@ -855,6 +1047,13 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
 
     /// Asynchronously submit a request, returning its descriptor once sent.
     ///
+    /// # Arguments
+    ///
+    /// - `svc`: Advertised destination service name, without embedded NUL bytes.
+    /// - `idata`: Borrowed request buffer; native sends use its tracked payload length.
+    /// - `flags`: Submission options; `TPNOREPLY` returns descriptor zero, and `TPNOTIME`
+    ///   disables the deadline.
+    ///
     /// A full queue yields between attempts unless `TPNOBLOCK` was requested.
     /// The original timeout covers both queue waiting and later reply waiting
     /// through [`Self::tpgetrply`]. `TPNOREPLY` returns zero after submission.
@@ -868,6 +1067,13 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
 
     /// Attempt submission once, returning `TPEBLOCK` if the queue is full.
     /// Records the deadline for later [`Self::tpgetrply`] collection.
+    ///
+    /// # Arguments
+    ///
+    /// - `svc`: Advertised destination service name, without embedded NUL bytes.
+    /// - `idata`: Borrowed request buffer; native sends use its tracked payload length.
+    /// - `flags`: Submission options; `TPNOREPLY` returns descriptor zero, and `TPNOTIME`
+    ///   disables the deadline.
     pub fn try_tpacall(&self, svc: &str, idata: &TypedBuffer<'_>, flags: i64) -> AtmiResult<i32> {
         Self::check_supported_flags(flags)?;
         let deadline = self.deadline_for(flags)?;
@@ -880,6 +1086,13 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
     }
 
     /// Compatibility spelling for [`Self::tpacall`].
+    ///
+    /// # Arguments
+    ///
+    /// - `svc`: Advertised destination service name, without embedded NUL bytes.
+    /// - `idata`: Borrowed request buffer; native sends use its tracked payload length.
+    /// - `flags`: Submission options; `TPNOREPLY` returns descriptor zero, and `TPNOTIME`
+    ///   disables the deadline.
     pub async fn tpacall_async(
         &self,
         svc: &str,
@@ -889,6 +1102,18 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
         self.tpacall(svc, idata, flags).await
     }
 
+    /// Submit with queue-full retries while preserving the original deadline, priority, and
+    /// descriptor claim.
+    ///
+    /// # Arguments
+    ///
+    /// - `svc`: Advertised destination service name, without embedded NUL bytes.
+    /// - `idata`: Borrowed request buffer; native sends use its tracked payload length.
+    /// - `flags`: XATMI flags controlling blocking, timeouts, or reply handling for this operation.
+    /// - `deadline`: Original absolute timeout instant, or `None` when the operation has no
+    ///   deadline.
+    /// - `claimed`: Whether a particular future owns the reply, excluding it from `TPGETANY`
+    ///   collection.
     async fn submit(
         &self,
         svc: &str,
@@ -940,8 +1165,16 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
         .await
     }
 
-    /// Send a request and take ownership of the descriptor, refusing to reuse
-    /// one whose slot is still occupied.
+    /// Register a successfully submitted descriptor, rejecting reuse while an older reply is
+    /// still tracked.
+    ///
+    /// # Arguments
+    ///
+    /// - `cd`: Native call descriptor identifying the outstanding request or parked reply.
+    /// - `deadline`: Original absolute timeout instant, or `None` when the operation has no
+    ///   deadline.
+    /// - `claimed`: Whether a particular future owns the reply, excluding it from `TPGETANY`
+    ///   collection.
     ///
     /// Enduro/X frees a descriptor number as soon as the demux collects its
     /// reply, so the same number can come straight back from `tpacall` while
@@ -985,6 +1218,12 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
 
     /// Apply priority only for this synchronous native attempt. Clear it even
     /// if routing fails before the native queue sender consumes the setting.
+    ///
+    /// # Arguments
+    ///
+    /// - `priority`: Optional adapter-owned priority to apply for this one native attempt.
+    /// - `send`: Closure making one synchronous native submission while the temporary priority
+    ///   is active.
     fn with_send_priority(
         &self,
         priority: Option<SendPriority>,
@@ -1008,6 +1247,16 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
 
     /// Reapply the remaining timeout because native tpacall consumes TPBLK_NEXT
     /// even when sending fails. No temporary setting survives an async yield.
+    ///
+    /// # Arguments
+    ///
+    /// - `svc`: Advertised destination service name, without embedded NUL bytes.
+    /// - `idata`: Borrowed request buffer; native sends use its tracked payload length.
+    /// - `flags`: XATMI flags controlling blocking, timeouts, or reply handling for this operation.
+    /// - `deadline`: Original absolute timeout instant, or `None` when the operation has no
+    ///   deadline.
+    /// - `priority`: Resolved absolute priority from the first failed send, reused without
+    ///   another relative adjustment.
     fn retry_tpacall(
         &self,
         svc: &str,
@@ -1052,6 +1301,15 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
     }
 
     /// Compatibility spelling for [`AsyncAtmiCtx::tpcall`].
+    ///
+    /// # Arguments
+    ///
+    /// - `svc`: Advertised destination service name, without embedded NUL bytes.
+    /// - `idata`: Borrowed request buffer; native sends use its tracked payload length.
+    /// - `odata`: Reply destination; received pointer and length changes are preserved even
+    ///   with a service error.
+    /// - `flags`: Call options; `TPNOBLOCK` affects only sending, `TPNOTIME` disables the
+    ///   deadline, and `TPNOREPLY` is invalid.
     pub async fn tpcall_async(
         &self,
         svc: &str,
@@ -1064,6 +1322,14 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
 
     /// Asynchronously retrieve a caller-owned descriptor returned by
     /// [`AtmiCtx::tpacall`].
+    ///
+    /// # Arguments
+    ///
+    /// - `cd`: Requested descriptor on input; updated to the completed descriptor, including
+    ///   with `TPGETANY`.
+    /// - `data`: Caller’s reply buffer, updated with the received allocation and reported length.
+    /// - `flags`: `TPGETANY` accepts an unclaimed reply, `TPNOBLOCK` avoids waiting, and
+    ///   `TPNOCHANGE` enforces the output type.
     ///
     /// Expiration of the Enduro/X call timeout cancels `cd`. Merely dropping
     /// this future does not, because descriptor ownership remains with the
@@ -1128,11 +1394,23 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
     }
 
     /// Whether the caller asked for a nonblocking collection.
+    ///
+    /// # Arguments
+    ///
+    /// - `flags`: Call flags to inspect for `TPNOBLOCK`.
     fn is_nonblocking(flags: i64) -> bool {
         flags & raw::TPNOBLOCK as i64 != 0
     }
 
     /// Compatibility spelling for [`AsyncAtmiCtx::tpgetrply`].
+    ///
+    /// # Arguments
+    ///
+    /// - `cd`: Requested descriptor on input; updated to the completed descriptor, including
+    ///   with `TPGETANY`.
+    /// - `data`: Caller’s reply buffer, updated with the received allocation and reported length.
+    /// - `flags`: `TPGETANY` accepts an unclaimed reply, `TPNOBLOCK` avoids waiting, and
+    ///   `TPNOCHANGE` enforces the output type.
     pub async fn tpgetrply_async(
         &self,
         cd: &mut i32,
@@ -1143,6 +1421,10 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
     }
 
     /// Cancel an asynchronous call and release its slot.
+    ///
+    /// # Arguments
+    ///
+    /// - `cd`: Native call descriptor identifying the outstanding request or parked reply.
     pub fn tpcancel(&self, cd: i32) -> AtmiResult<()> {
         self.release_slot(cd);
         let result = self.context.tpcancel(cd);
@@ -1162,6 +1444,11 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
     }
 
     /// Reject reply-collection flags the demux cannot honour per call.
+    ///
+    /// # Arguments
+    ///
+    /// - `flags`: Caller flags to validate; `TPNOABORT` and `TPTRANSUSPEND` are unsupported by
+    ///   shared reply routing.
     ///
     /// A drain uses `TPGETANY` and therefore collects replies for descriptors
     /// other than the one whose future triggered it. Flags that change how
@@ -1188,6 +1475,10 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
 
     /// Mirror the public `tpcall()`'s rejection of `TPNOREPLY`.
     ///
+    /// # Arguments
+    ///
+    /// - `flags`: Call flags to check for the forbidden `TPNOREPLY` bit.
+    ///
     /// `libatmi/atmi.c:330` fails with TPEINVAL and the message "TPNOREPLY
     /// cannot be used with tpcall()" before delegating to `ndrx_tpcall`. The
     /// internal helper does tolerate the flag -- that is how `tppost` reuses it
@@ -1206,6 +1497,10 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
 
     /// Deadline for this call, honouring `TPNOTIME`.
     ///
+    /// # Arguments
+    ///
+    /// - `flags`: Call flags; `TPNOTIME` disables the adapter deadline.
+    ///
     /// With `TPNOTIME` Enduro/X disables its own call timeout, so imposing the
     /// `tpgblktime` deadline here would expire and cancel a descriptor the
     /// caller explicitly asked to wait on indefinitely.
@@ -1216,6 +1511,11 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
         self.context.reply_deadline()
     }
 
+    /// Remove a descriptor’s deadline and reply slot, freeing any parked buffer.
+    ///
+    /// # Arguments
+    ///
+    /// - `cd`: Native call descriptor identifying the outstanding request or parked reply.
     fn release_slot(&self, cd: i32) {
         // The descriptor is finished with, so its recorded deadline must go
         // too. Leaving it behind lets `earliest_deadline` keep returning a
@@ -1230,6 +1530,16 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
 
     /// Returns the descriptor that replied alongside its outcome, so a
     /// `TPGETANY` caller learns which call completed.
+    ///
+    /// # Arguments
+    ///
+    /// - `target`: Specific descriptor or registered `TPGETANY` waiter whose readiness is checked.
+    /// - `data`: Caller’s reply buffer, updated with the received allocation and reported length.
+    /// - `flags`: XATMI flags controlling blocking, timeouts, or reply handling for this operation.
+    /// - `deadline`: Original absolute timeout instant, or `None` when the operation has no
+    ///   deadline.
+    /// - `cancel_on_timeout`: Whether an expired specific descriptor is cancelled here;
+    ///   otherwise its owner handles cancellation.
     async fn await_reply(
         &self,
         target: Target,
@@ -1312,6 +1622,12 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
     /// Park until this descriptor's slot is filled, the reply fd signals, or
     /// the deadline passes.
     ///
+    /// # Arguments
+    ///
+    /// - `target`: Specific descriptor or registered `TPGETANY` waiter whose readiness is checked.
+    /// - `deadline`: Original absolute timeout instant, or `None` when the operation has no
+    ///   deadline.
+    ///
     /// Any future woken by the fd drains on behalf of everyone, so a reply for
     /// a descriptor whose own future is parked still gets delivered.
     /// Returns the wake reason together with any runtime readiness token.
@@ -1392,27 +1708,34 @@ enum Wake {
     Timeout,
 }
 
+/// Shared access to the underlying context or typed buffer.
 impl<D> Deref for AsyncAtmiCtx<D> {
     type Target = AtmiCtx;
 
+    /// Borrow the underlying synchronous ATMI context.
     fn deref(&self) -> &Self::Target {
         &self.context
     }
 }
 
+/// Borrowed access to the underlying context or bytecode.
 impl<D> AsRef<AtmiCtx> for AsyncAtmiCtx<D> {
+    /// Borrow the underlying synchronous ATMI context.
     fn as_ref(&self) -> &AtmiCtx {
         &self.context
     }
 }
 
+/// Free parked replies while the owning native context is still alive.
 impl<D> Drop for AsyncAtmiCtx<D> {
+    /// Free parked replies while the owning native context is still alive.
     fn drop(&mut self) {
         // SAFETY: `context` is still alive and owns every parked buffer.
         unsafe { self.demux.release(&self.context) };
     }
 }
 
+/// Conversion to an adapter using an explicit reply driver.
 impl AtmiCtx {
     /// Convert this initialized context into an async context using driver `D`.
     #[cfg(feature = "async")]
@@ -1431,7 +1754,14 @@ struct AsyncPendingCall<'ctx, D: AsyncReplyDriver> {
     armed: bool,
 }
 
+/// Cancellation guard for a submitted async call.
 impl<'ctx, D: AsyncReplyDriver> AsyncPendingCall<'ctx, D> {
+    /// Arm cancellation for an async call until its reply is successfully collected.
+    ///
+    /// # Arguments
+    ///
+    /// - `context`: Borrowed async adapter responsible for cancelling or releasing this descriptor.
+    /// - `cd`: Native call descriptor identifying the outstanding request or parked reply.
     fn new(context: &'ctx AsyncAtmiCtx<D>, cd: i32) -> Self {
         Self {
             context,
@@ -1440,12 +1770,15 @@ impl<'ctx, D: AsyncReplyDriver> AsyncPendingCall<'ctx, D> {
         }
     }
 
+    /// Mark the call complete so dropping the guard only releases its reply slot.
     fn complete(&mut self) {
         self.armed = false;
     }
 }
 
+/// Cancel an unfinished call or release the slot of a completed call.
 impl<D: AsyncReplyDriver> Drop for AsyncPendingCall<'_, D> {
+    /// Cancel an unfinished call or release the slot of a completed call.
     fn drop(&mut self) {
         if self.armed {
             let _ = self.context.tpcancel(self.cd);
@@ -1455,6 +1788,11 @@ impl<D: AsyncReplyDriver> Drop for AsyncPendingCall<'_, D> {
     }
 }
 
+/// Wrap an async I/O failure as ATMI `TPEOS`, preserving the diagnostic text.
+///
+/// # Arguments
+///
+/// - `err`: Operating-system or reactor error to wrap as ATMI `TPEOS`.
 fn driver_error(err: io::Error) -> AtmiError {
     AtmiError::new(
         raw::TPEOS,
@@ -1462,6 +1800,13 @@ fn driver_error(err: io::Error) -> AtmiError {
     )
 }
 
+/// Duplicate a reply descriptor with close-on-exec, leaving the original descriptor and flags
+/// unchanged.
+///
+/// # Arguments
+///
+/// - `reply_fd`: Open native reply-queue descriptor to duplicate; ownership remains with Enduro/X.
+///
 #[cfg(any(feature = "async-io", feature = "tokio"))]
 fn duplicate_reply_fd(reply_fd: RawFd) -> io::Result<OwnedFd> {
     let duplicate = unsafe { libc::fcntl(reply_fd, libc::F_DUPFD_CLOEXEC, 0) };
@@ -1482,10 +1827,18 @@ pub struct TokioReplyDriver {
     _local: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
+/// Reply-descriptor readiness and timers through Tokio.
 #[cfg(feature = "tokio")]
 impl AsyncReplyDriver for TokioReplyDriver {
     type Readiness<'a> = tokio::io::unix::AsyncFdReadyGuard<'a, OwnedFd>;
 
+    /// Duplicate the native reply descriptor and register read interest with the current Tokio
+    /// runtime.
+    ///
+    /// # Arguments
+    ///
+    /// - `reply_fd`: Open native reply-queue descriptor to duplicate; ownership remains with
+    ///   Enduro/X.
     fn register(reply_fd: i32) -> io::Result<Self> {
         let reply_fd = duplicate_reply_fd(reply_fd)?;
         let reply_fd = std::panic::catch_unwind(|| {
@@ -1498,14 +1851,26 @@ impl AsyncReplyDriver for TokioReplyDriver {
         })
     }
 
+    /// Wait for Tokio to report potential reply-queue readability and return its readiness guard.
     fn readable(&self) -> impl Future<Output = io::Result<Self::Readiness<'_>>> + '_ {
         self.reply_fd.readable()
     }
 
+    /// Clear the Tokio readiness guard after native receive reports an empty queue.
+    ///
+    /// # Arguments
+    ///
+    /// - `readiness`: Runtime readiness token to clear only after native receive reports
+    ///   would-block.
     fn clear_readiness(&self, readiness: &mut Self::Readiness<'_>) {
         readiness.clear_ready();
     }
 
+    /// Create a Tokio timer for the requested absolute instant.
+    ///
+    /// # Arguments
+    ///
+    /// - `deadline`: Absolute monotonic instant at which the timer should complete.
     fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()> + '_ {
         tokio::time::sleep_until(deadline.into())
     }
@@ -1515,6 +1880,7 @@ impl AsyncReplyDriver for TokioReplyDriver {
 #[cfg(feature = "tokio")]
 pub type TokioAtmiCtx = AsyncAtmiCtx<TokioReplyDriver>;
 
+/// Conversion to the Tokio reply adapter.
 #[cfg(feature = "tokio")]
 impl AtmiCtx {
     /// Convert this initialized context to a Tokio-native async context.
@@ -1533,10 +1899,17 @@ pub struct AsyncIoReplyDriver {
     reply_fd: async_io::Async<OwnedFd>,
 }
 
+/// Reply-descriptor readiness and timers through async-io.
 #[cfg(feature = "async-io")]
 impl AsyncReplyDriver for AsyncIoReplyDriver {
     type Readiness<'a> = ();
 
+    /// Duplicate the native reply descriptor and register it with the async-io reactor.
+    ///
+    /// # Arguments
+    ///
+    /// - `reply_fd`: Open native reply-queue descriptor to duplicate; ownership remains with
+    ///   Enduro/X.
     fn register(reply_fd: i32) -> io::Result<Self> {
         let reply_fd = duplicate_reply_fd(reply_fd)?;
         Ok(Self {
@@ -1546,14 +1919,26 @@ impl AsyncReplyDriver for AsyncIoReplyDriver {
         })
     }
 
+    /// Wait for one async-io readability notification.
     fn readable(&self) -> impl Future<Output = io::Result<Self::Readiness<'_>>> + '_ {
         self.reply_fd.readable()
     }
 
+    /// Complete the driver readiness hook; async-io consumes readiness in its readable future.
+    ///
+    /// # Arguments
+    ///
+    /// - `_readiness`: Unused unit token; async-io needs no explicit readiness reset.
     fn clear_readiness(&self, _readiness: &mut Self::Readiness<'_>) {
         // Each async-io Readable future consumes one reactor readiness tick.
     }
 
+    /// Create an async-io timer for the requested absolute instant.
+    ///
+    /// # Arguments
+    ///
+    /// - `deadline`: Absolute monotonic instant at which the timer should complete.
+    ///
     #[allow(clippy::manual_async_fn)]
     fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()> + '_ {
         async move {
@@ -1566,6 +1951,7 @@ impl AsyncReplyDriver for AsyncIoReplyDriver {
 #[cfg(feature = "async-io")]
 pub type AsyncIoAtmiCtx = AsyncAtmiCtx<AsyncIoReplyDriver>;
 
+/// Conversion to the async-io reply adapter.
 #[cfg(feature = "async-io")]
 impl AtmiCtx {
     /// Convert this initialized context to an executor-independent async context.
@@ -1590,10 +1976,21 @@ mod tests {
 
     struct CountingWaker(AtomicUsize);
 
+    /// Executor-wake counting for reply-router tests.
     impl Wake for CountingWaker {
+        /// Record an executor wake in the test counter.
+        ///
+        /// # Arguments
+        ///
+        /// - `self`: Shared test wake counter whose notification count is incremented.
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
+        /// Record an executor wake without consuming the caller’s shared counter handle.
+        ///
+        /// # Arguments
+        ///
+        /// - `self`: Shared test wake counter whose notification count is incremented.
         fn wake_by_ref(self: &Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
@@ -1728,6 +2125,7 @@ mod tests {
         });
     }
 
+    /// Verify timer-based retries yield, cap their delay, and stop after successful submission.
     #[test]
     fn full_queue_yields_before_each_retry_and_stops_after_success() {
         let attempts = Cell::new(0);
@@ -1778,6 +2176,7 @@ mod tests {
             .all(|delay| *delay <= Duration::from_millis(16)));
     }
 
+    /// Verify explicit nonblocking mode and errors other than queue-full return immediately.
     #[test]
     fn nonblocking_and_non_queue_errors_are_never_retried() {
         let waker = Waker::from(Arc::new(CountingWaker(AtomicUsize::new(0))));
@@ -1805,6 +2204,7 @@ mod tests {
         }
     }
 
+    /// Verify the original deadline limits retry sleeps and prevents a late native send.
     #[test]
     fn send_deadline_caps_sleep_and_prevents_late_submission() {
         let attempts = Cell::new(0);
@@ -1837,16 +2237,26 @@ mod tests {
         assert_eq!(attempts.get(), 1);
     }
 
+    /// Verify dropping a waiting send releases its timer and prevents another attempt.
     #[test]
     fn cancelling_a_send_drops_its_timer_without_resubmitting() {
         struct PendingTimer<'a>(&'a Cell<bool>);
+        /// A pending timer used to verify cancellation cleanup.
         impl Future for PendingTimer<'_> {
             type Output = ();
+            /// Keep the test timer pending until its owning future is dropped.
+            ///
+            /// # Arguments
+            ///
+            /// - `self`: Pinned test timer that remains pending.
+            /// - `_`: Unused executor context; this test timer always returns `Poll::Pending`.
             fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<()> {
                 Poll::Pending
             }
         }
+        /// Record that the pending test timer was dropped.
         impl Drop for PendingTimer<'_> {
+            /// Record that the pending test timer was dropped.
             fn drop(&mut self) {
                 self.0.set(true);
             }
@@ -1871,6 +2281,7 @@ mod tests {
         assert_eq!(attempts.get(), 1);
     }
 
+    /// Verify a queue-full send leaves Tokio free to run another task that makes progress.
     #[cfg(feature = "tokio")]
     #[test]
     fn tokio_runs_other_tasks_while_a_send_waits_for_space() {
@@ -1913,6 +2324,7 @@ mod tests {
         });
     }
 
+    /// Verify the async-io timer drives retries until a send succeeds.
     #[cfg(feature = "async-io")]
     #[test]
     fn async_io_send_timer_retries_until_space_is_available() {
@@ -2243,6 +2655,8 @@ mod tests {
         );
     }
 
+    /// Verify Tokio readiness handling and that dropping the driver leaves the original
+    /// descriptor open.
     #[cfg(feature = "tokio")]
     #[test]
     fn tokio_driver_waits_without_owning_endurox_fd() {
@@ -2286,6 +2700,8 @@ mod tests {
         assert_eq!(byte, *b"y");
     }
 
+    /// Verify async-io readiness handling and that dropping the driver leaves the original
+    /// descriptor open.
     #[cfg(feature = "async-io")]
     #[test]
     fn async_io_driver_waits_without_owning_endurox_fd() {
@@ -2318,6 +2734,7 @@ mod tests {
         assert_eq!(byte, *b"y");
     }
 
+    /// Verify an async-io reply wait can be polled by a Tokio executor.
     #[cfg(all(feature = "async-io", feature = "tokio"))]
     #[test]
     fn async_io_driver_future_runs_on_tokio_executor() {
