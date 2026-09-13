@@ -643,6 +643,7 @@ fn provision_endurox_env() {
             .arg(
                 r#"
 set -euo pipefail
+export CDPATH="${CDPATH:-}"
 cd "$NDRX_RS_UNIT_TEST_DIR"
 if [ -f "$HOME/ndrx_home" ]; then
     . "$HOME/ndrx_home"

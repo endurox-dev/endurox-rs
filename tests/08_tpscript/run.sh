@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export CDPATH="${CDPATH:-}"
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$TEST_DIR/../.." && pwd)"
 if [ -f "$HOME/ndrx_home" ]; then
-    export CDPATH="${CDPATH:-}"
     export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
     export DYLD_FALLBACK_LIBRARY_PATH="${DYLD_FALLBACK_LIBRARY_PATH:-}"
     . "$HOME/ndrx_home"
