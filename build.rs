@@ -85,6 +85,12 @@ fn main() {
             // redeclaration: bindgen emits c_ulong where the compiler expects
             // usize. Same layout on a 64-bit target, a real mismatch on 32-bit.
             .blocklist_function("mem(cmp|cpy|move|set)|bcmp|strlen")
+            // The transitive stdio headers also expose unused va_list functions.
+            // On Linux ARM64, bindgen represents va_list as an array passed by
+            // value, which is not supported by Rust's C ABI. Exclude these
+            // functions and libc's internal aliases; keep improper_ctypes enabled.
+            .blocklist_function("(v|__.*v).*printf.*")
+            .blocklist_function("(v|__.*v).*scanf.*")
             .formatter(bindgen::Formatter::Rustfmt);
 
         // Forward include dirs and defines to clang so <angled> includes resolve.
