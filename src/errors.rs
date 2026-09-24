@@ -4,10 +4,19 @@ use std::{borrow::Cow, error::Error, fmt};
 
 // --- ATMI Errors -------------------------------------------------------------
 
-/// Expose native error-number constants under the enclosing error type.
+/// Export each native code once and retain the associated error-type spelling.
 macro_rules! gen_error_consts {
-    ($($name:ident),* $(,)?) => {
-        $(pub const $name: u32 = raw::$name;)*
+    ($error:ident { $($name:ident),* $(,)? }) => {
+        $(
+            #[doc = concat!("Native `", stringify!($name), "` error code for [`", stringify!($error), "`].")]
+            pub const $name: u32 = raw::$name;
+        )*
+        impl $error {
+            $(
+                #[doc = concat!("Native error code; see [`", stringify!($name), "`](crate::", stringify!($name), ").")]
+                pub const $name: u32 = crate::errors::$name;
+            )*
+        }
     };
 }
 
@@ -18,7 +27,6 @@ pub struct AtmiError {
     pub message: Cow<'static, str>,
 }
 
-/* ATMI error */
 /// ATMI error construction and native error-code constants.
 impl AtmiError {
     /// Create an error preserving the native error code and diagnostic message.
@@ -33,9 +41,10 @@ impl AtmiError {
             message: message.into(),
         }
     }
+}
 
-    // List of errors codes
-    gen_error_consts! {
+gen_error_consts! {
+    AtmiError {
         TPMINVAL,
         TPEABORT,
         TPEBADDESC,
@@ -67,7 +76,7 @@ impl AtmiError {
         TPERFU28,
         TPERFU29,
         TPINITFAIL,
-        TPMAXVAL
+        TPMAXVAL,
     }
 }
 
@@ -98,7 +107,6 @@ pub struct UbfError {
     pub message: Cow<'static, str>,
 }
 
-/* ATMI error */
 /// UBF error construction and native error-code constants.
 impl UbfError {
     /// Create an error preserving the native error code and diagnostic message.
@@ -113,9 +121,10 @@ impl UbfError {
             message: message.into(),
         }
     }
+}
 
-    // List of errors codes
-    gen_error_consts! {
+gen_error_consts! {
+    UbfError {
         BMINVAL,
         BERFU0,
         BALIGNERR,
@@ -139,7 +148,7 @@ impl UbfError {
         BBADACM,
         BNOCNAME,
         BEBADOP,
-        BMAXVAL
+        BMAXVAL,
     }
 }
 
@@ -170,8 +179,7 @@ pub struct NstdError {
     pub message: Cow<'static, str>,
 }
 
-/* ATMI error */
-/// NSTD error construction preserving native diagnostics.
+/// NSTD error construction and native error-code constants.
 impl NstdError {
     /// Create an error preserving the native error code and diagnostic message.
     ///
@@ -184,6 +192,52 @@ impl NstdError {
             code,
             message: message.into(),
         }
+    }
+}
+
+gen_error_consts! {
+    NstdError {
+        NMINVAL,
+        NEINVALINI,
+        NEMALLOC,
+        NEUNIX,
+        NEINVAL,
+        NESYSTEM,
+        NEMANDATORY,
+        NEFORMAT,
+        NETOUT,
+        NENOCONN,
+        NELIMIT,
+        NEPLUGIN,
+        NENOSPACE,
+        NEINVALKEY,
+        NENOENT,
+        NEWRITE,
+        NEEXEC,
+        NESUPPORT,
+        NEEXISTS,
+        NEVERSION,
+        NEBUSY,
+        NESTALE,
+        NEEOF,
+        NESYNC,
+        NECONSTRAINT,
+        NESTATE,
+        NEUNKNOWN,
+        NESTMT,
+        NEACCESS,
+        NECONTEXT,
+        NEMATCH,
+        NEPROTO,
+        NEUBF,
+        NEATMI,
+        NEMSGSIZE,
+        NECANCELED,
+        NEINPROGRESS,
+        NEDEADLK,
+        NEPRECOND,
+        NEUNAVAILABLE,
+        NMAXVAL,
     }
 }
 

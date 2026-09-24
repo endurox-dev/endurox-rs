@@ -49,3 +49,11 @@ enum {
     NDRX_RS_EX_DLM_INCONCLUSIVE = EX_DLM_INCONCLUSIVE,
     NDRX_RS_EX_DLM_OPFLAGS = EX_DLM_OPFLAGS,
 };
+
+/* Bindgen needs enum values for UBF macros containing explicit C casts. */
+enum {
+    NDRX_RS_BBADFLDID = BBADFLDID,
+    NDRX_RS_BFIRSTFLDID = BFIRSTFLDID,
+    NDRX_RS_BBADFLDOCC = BBADFLDOCC,
+    NDRX_RS_BFLDOCCMAX = BFLDOCCMAX,
+};

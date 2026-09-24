@@ -405,7 +405,7 @@ pub const EX_DLM_INCONCLUSIVE: i32 = raw::NDRX_RS_EX_DLM_INCONCLUSIVE as i32;
 pub const EX_DLM_OPFLAGS: i32 = raw::NDRX_RS_EX_DLM_OPFLAGS as i32;
 
 // Validate the native C string and UTF-8 at compile time.
-const fn native_text(bytes: &'static [u8]) -> &'static str {
+pub(crate) const fn native_text(bytes: &'static [u8]) -> &'static str {
     let text = match std::ffi::CStr::from_bytes_with_nul(bytes) {
         Ok(text) => text,
         Err(_) => panic!("DLM constant must be a NUL-terminated C string"),

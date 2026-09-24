@@ -2,12 +2,10 @@
 use core::ffi::{c_char, c_int, c_long};
 use std::ffi::{CStr, CString};
 
-use crate::{raw, AtmiCtx, AtmiError, TypedBuffer, UbfError, UbfResult};
-
-/// Reject native NULL values when reading a VIEW member.
-pub const BVACCESS_NOTNULL: i64 = 0x00000001;
-const VIEW_NAME_LEN: usize = 33;
-const VIEW_CNAME_LEN: usize = 256;
+use crate::{
+    raw, AtmiCtx, AtmiError, TypedBuffer, UbfError, UbfResult, NDRX_VIEW_CNAME_LEN,
+    NDRX_VIEW_NAME_LEN,
+};
 
 /// Value that can be written into a VIEW field.
 pub enum ViewValue {
@@ -721,7 +719,7 @@ impl<'ctx> TypedView<'ctx> {
             .as_ref()
             .map(|s| s.as_ptr() as *mut c_char)
             .unwrap_or(std::ptr::null_mut());
-        let mut cname = vec![0u8; VIEW_CNAME_LEN + 1];
+        let mut cname = vec![0u8; NDRX_VIEW_CNAME_LEN + 1];
         let mut fldtype: c_int = 0;
         let mut maxocc: raw::BFLDOCC = 0;
         let mut dim_size: c_long = 0;
@@ -891,7 +889,7 @@ impl AtmiCtx {
     ///   NUL bytes.
     pub fn tpjson_to_view<'ctx>(&'ctx self, json: &str) -> Result<TypedView<'ctx>, AtmiError> {
         let json = CString::new(json).map_err(|e| AtmiError::new(raw::TPEINVAL, e.to_string()))?;
-        let mut view = vec![0u8; VIEW_NAME_LEN + 1];
+        let mut view = vec![0u8; NDRX_VIEW_NAME_LEN + 1];
         let raw = unsafe {
             self.tpjsontoview(
                 view.as_mut_ptr() as *mut c_char,

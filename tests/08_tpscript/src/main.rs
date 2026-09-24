@@ -1,6 +1,7 @@
 use endurox_rs::{
-    ubf_fields as f, AtmiCtx, AtmiError, TpScrBuffers, TpScrError, TpScrResult, TpScrSlot as S,
-    TpScrVm, TypedUbf, NDRX_TPSCR_FLAT, NDRX_TPSCR_PACKAGE, NDRX_TPSCR_REPLACE,
+    ubf_fields as f, AtmiCtx, AtmiError, TpScrBuffers, TpScrCfg, TpScrError, TpScrResult,
+    TpScrSlot as S, TpScrVm, TypedUbf, NDRX_SCR_CFG_VERSION_1, NDRX_SCR_INITSTRING_PYTHON,
+    NDRX_TPSCR_FLAT, NDRX_TPSCR_PACKAGE, NDRX_TPSCR_REPLACE,
 };
 use std::cell::Cell;
 use std::rc::Rc;
@@ -29,7 +30,17 @@ fn run() -> TpScrResult<()> {
         println!("no-plugin error propagated");
         return Ok(());
     }
-    let mut vm = ctx.tpscrinit(None, 0)?;
+    // A non-matching engine init string is rejected by the endurox-python plugin.
+    let error = ctx
+        .tpscrinit(Some(TpScrCfg::engine("engine=nosuch")?), 0)
+        .expect_err("unsupported engine init string must be rejected");
+    assert_eq!(error.atmi_code, AtmiError::TPEINVAL);
+
+    // Explicitly select the Python engine via its init string.
+    let cfg = TpScrCfg::engine(NDRX_SCR_INITSTRING_PYTHON)?;
+    assert_eq!(cfg.version(), NDRX_SCR_CFG_VERSION_1);
+    assert_eq!(cfg.initstring(), NDRX_SCR_INITSTRING_PYTHON);
+    let mut vm = ctx.tpscrinit(Some(cfg), 0)?;
     let mut buffers = TpScrBuffers::new(&ctx);
     vm.tpscrseterror(1234, "manual error")?;
     assert_eq!(vm.tpscrerrno(), 1234);

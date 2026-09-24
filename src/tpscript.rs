@@ -1,5 +1,6 @@
 //! Safe access to the scripting engine selected by Enduro/X's plugin loader.
 use crate::{raw, AtmiCtx, AtmiError, TpScrBuffers, UbfError};
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -122,33 +123,110 @@ impl From<UbfError> for TpScrError {
 /// Result of a scripting operation, preserving ATMI and engine diagnostics.
 pub type TpScrResult<T> = Result<T, TpScrError>;
 
-/// Opaque backend-specific configuration. Pass `None` to use engine defaults.
-/// The portable C API declares native `tpscr_cfg_t` without defining its layout.
-/// Normal initialization uses `ctx.tpscrinit(None, 0)`; constructing this wrapper is
-/// only needed when a specific backend documents additional native configuration.
-/// See [`TpScrVm`] for setup and usage.
+/// Backend-specific configuration for [`AtmiCtx::tpscrinit`].
+///
+/// Pass `None` to use the selected engine's defaults. Use [`Self::engine`] to assert
+/// which engine must handle the VM, e.g. [`crate::NDRX_SCR_INITSTRING_PYTHON`]; the
+/// plugin rejects a mismatched engine at init. The plugin reads the configuration
+/// during `tpscrinit` and does not retain it. See [`TpScrVm`] for setup and usage.
 #[derive(Clone, Copy, Debug)]
-pub struct TpScrCfg<'a> {
-    pointer: *const c_void,
-    _borrow: PhantomData<&'a c_void>,
+pub struct TpScrCfg {
+    raw: raw::tpscr_cfg_t,
 }
-/// Unsafe construction of opaque backend configuration borrows.
-impl<'a> TpScrCfg<'a> {
-    /// Wrap an opaque configuration pointer for the selected scripting backend.
+/// Construction and per-field access for scripting engine configuration.
+impl TpScrCfg {
+    /// A configuration stamped with the current structure version
+    /// ([`crate::NDRX_SCR_CFG_VERSION_1`]) and every other native field defaulted
+    /// (zeroed). Set individual fields through the accessors below, e.g.
+    /// [`Self::set_initstring`]. The version makes the plugin honor those fields.
+    pub fn new() -> Self {
+        // SAFETY: tpscr_cfg_t is a plain C struct of scalar / fixed char-buffer
+        // fields; an all-zero value is a valid default (empty NUL-terminated
+        // strings and zero scalars) and stays valid as fields are added.
+        let mut raw: raw::tpscr_cfg_t = unsafe { std::mem::zeroed() };
+        raw.version = raw::NDRX_SCR_CFG_VERSION_1 as c_int;
+        Self { raw }
+    }
+
+    /// Convenience for [`Self::new`] plus [`Self::set_initstring`]: a configuration
+    /// selecting an engine by its init string, e.g. [`crate::NDRX_SCR_INITSTRING_PYTHON`].
     ///
     /// # Arguments
     ///
-    /// - `pointer`: Backend-specific configuration storage whose layout and lifetime satisfy
-    ///   that engine’s requirements.
+    /// - `initstring`: Engine selection string; see [`Self::set_initstring`].
+    pub fn engine(initstring: &str) -> TpScrResult<Self> {
+        let mut cfg = Self::new();
+        cfg.set_initstring(initstring)?;
+        Ok(cfg)
+    }
+
+    /// Set the engine selection / init string field (`tpscr_cfg_t.initstring`).
+    /// Additional engine options may follow the engine token.
+    ///
+    /// # Arguments
+    ///
+    /// - `initstring`: Engine selection string; must not contain an interior NUL and must
+    ///   fit the native buffer including its terminator.
+    pub fn set_initstring(&mut self, initstring: &str) -> TpScrResult<()> {
+        let bytes = initstring.as_bytes();
+        if bytes.contains(&0) {
+            return Err(TpScrError::invalid("engine init string contains NUL"));
+        }
+        // Reserve the last byte for the terminating NUL.
+        if bytes.len() >= self.raw.initstring.len() {
+            return Err(TpScrError::invalid("engine init string too long"));
+        }
+        self.raw.initstring.fill(0);
+        for (dst, &src) in self.raw.initstring.iter_mut().zip(bytes) {
+            *dst = src as c_char;
+        }
+        Ok(())
+    }
+
+    /// Read the engine selection / init string field (`tpscr_cfg_t.initstring`),
+    /// decoded up to its terminating NUL.
+    pub fn initstring(&self) -> Cow<'_, str> {
+        // SAFETY: initstring is a fixed char buffer within self; read it as
+        // bytes and stop at the first NUL terminator.
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                self.raw.initstring.as_ptr().cast(),
+                self.raw.initstring.len(),
+            )
+        };
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        String::from_utf8_lossy(&bytes[..end])
+    }
+
+    /// Read the structure version field (`tpscr_cfg_t.version`).
+    pub fn version(&self) -> i32 {
+        self.raw.version as i32
+    }
+
+    /// Escape hatch: copy a caller-built native configuration.
+    ///
+    /// # Arguments
+    ///
+    /// - `pointer`: Pointer to a native `tpscr_cfg_t` built for the selected backend.
     ///
     /// # Safety
-    /// `pointer` must have the layout required by the selected engine and remain
-    /// valid for `'a`, including any engine retention until the VM is destroyed.
+    /// `pointer` must point to a valid, initialized `tpscr_cfg_t`.
     pub unsafe fn from_raw(pointer: *const c_void) -> Self {
         Self {
-            pointer,
-            _borrow: PhantomData,
+            raw: *pointer.cast::<raw::tpscr_cfg_t>(),
         }
+    }
+
+    /// Native pointer to the owned configuration, valid while `self` is borrowed.
+    fn as_ptr(&self) -> *const raw::tpscr_cfg_t {
+        &self.raw
+    }
+}
+
+/// A configuration with all native fields defaulted.
+impl Default for TpScrCfg {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -229,10 +307,10 @@ struct CallbackEntry {
 /// The Rust binding calls the native plugin API rather than starting a Python process.
 ///
 /// Initialize an [`AtmiCtx`] with [`AtmiCtx::tpinit`], then call
-/// [`AtmiCtx::tpscrinit`] with `None` and flags `0` for backend defaults.
-/// [`TpScrCfg`] is an opaque backend-specific escape hatch, not a required Rust
-/// configuration object. A missing scripting plugin makes initialization fail with
-/// [`AtmiError::TPERELEASE`] in [`TpScrError::atmi_code`].
+/// [`AtmiCtx::tpscrinit`] with `None` and flags `0` for backend defaults, or with a
+/// [`TpScrCfg`] to assert the engine (e.g. `TpScrCfg::engine(NDRX_SCR_INITSTRING_PYTHON)`);
+/// the plugin rejects a mismatched engine. A missing scripting plugin makes
+/// initialization fail with [`AtmiError::TPERELEASE`] in [`TpScrError::atmi_code`].
 ///
 /// # Quick start
 ///
@@ -430,7 +508,6 @@ pub struct TpScrVm<'ctx> {
     // name until shutdown, even on registration errors/after unregister, since
     // a plugin can partially change registration before reporting failure.
     callbacks: HashMap<String, Box<CallbackEntry>>,
-    _config: Option<TpScrCfg<'ctx>>,
     _local: PhantomData<Rc<()>>,
 }
 
@@ -443,17 +520,17 @@ impl AtmiCtx {
     ///
     /// # Arguments
     ///
-    /// - `config`: Opaque backend configuration, or `None` for the selected engine’s defaults.
+    /// - `config`: Engine configuration ([`TpScrCfg`]), or `None` for the selected engine’s defaults.
     /// - `flags`: Native scripting-operation options supported by the selected backend; use `0`
     ///   for defaults.
     pub fn tpscrinit<'ctx>(
         &'ctx self,
-        config: Option<TpScrCfg<'ctx>>,
+        config: Option<TpScrCfg>,
         flags: i64,
     ) -> TpScrResult<TpScrVm<'ctx>> {
-        let cfg = config
-            .as_ref()
-            .map_or(ptr::null(), |cfg| cfg.pointer.cast());
+        // `config` lives to the end of this call, so the native pointer stays
+        // valid for the synchronous `tpscrinit`; the plugin does not retain it.
+        let cfg = config.as_ref().map_or(ptr::null(), TpScrCfg::as_ptr);
         let pointer = native!(self, tpscrinit, Otpscrinit, cfg, native_flags(flags)?);
         if pointer.is_null() {
             return Err(last_error(self, pointer, "tpscrinit failed", raw::EXFAIL));
@@ -462,7 +539,6 @@ impl AtmiCtx {
             ctx: self,
             pointer,
             callbacks: HashMap::new(),
-            _config: config,
             _local: PhantomData,
         })
     }

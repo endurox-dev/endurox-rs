@@ -1,7 +1,9 @@
 //! Rust bindings for Enduro/X contexts, typed buffers, services, queues, and scripting.
 //!
 //! Start with [`AtmiCtx`]; buffers borrow their context and use native Enduro/X allocation.
-//! Operation flags and subsystem-specific errors are re-exported at the crate root.
+//! Native TP/UBF constants and subsystem-specific errors are re-exported at the crate root.
+//! Error codes are `u32` and also available on [`AtmiError`], [`UbfError`] and [`NstdError`].
+//! Flags retain the native names; reserved constants do not imply support in every method.
 //!
 //! # Scripting
 //!
@@ -66,11 +68,8 @@ pub use atmictx_srv::{
 };
 pub use atmictx_ubf::{BFldLocInfo, UbfExprCallback, UbfExprCallback2, UbfExprTree, UbfFieldType};
 pub use dlm::{TpDlmCtl, TpDlmTimeout};
-pub use errors::{AtmiError, AtmiResult, NstdError, NstdResult, UbfError, UbfResult};
-pub use flags::{
-    TPABSOLUTE, TPBLK_ALL, TPBLK_NEXT, TPCONV, TPEX_STRING, TPGETANY, TPNOBLOCK, TPNOCHANGE,
-    TPNOREPLY, TPNOTIME, TPNOTRAN, TPRECVONLY, TPSENDONLY, TPSIGRSTRT, TPTRAN, TPTRANSUSPEND,
-};
+pub use errors::*;
+pub use flags::*;
 pub use nstdutil::NdrxStdCfgStr;
 pub use script_buffers::{TpScrBuffers, TpScrSlot};
 pub use tpscript::{
@@ -82,13 +81,19 @@ pub const NDRX_TPSCR_PACKAGE: i64 = raw::NDRX_TPSCR_PACKAGE as i64;
 pub const NDRX_TPSCR_REPLACE: i64 = raw::NDRX_TPSCR_REPLACE as i64;
 /// Treat a loaded script name as literal text instead of splitting it at dots.
 pub const NDRX_TPSCR_FLAT: i64 = raw::NDRX_TPSCR_FLAT as i64;
+/// Scripting engine init string selecting the Python engine (endurox-python), for use
+/// with [`TpScrCfg::engine`]. Mirrors the native `NDRX_SCR_INITSTRING_PYTHON` macro.
+pub const NDRX_SCR_INITSTRING_PYTHON: &str = dlm::native_text(raw::NDRX_SCR_INITSTRING_PYTHON);
+/// Initial `tpscr_cfg_t` structure version. [`TpScrCfg::new`] stamps this so the plugin
+/// interprets the configuration's fields.
+pub const NDRX_SCR_CFG_VERSION_1: i32 = raw::NDRX_SCR_CFG_VERSION_1 as i32;
 pub use tpsvcinfo::TpSvcInfo;
 pub use typed_buf::{TpTypeInfo, TypedBuffer};
 pub use typed_ubf::{
     BorrowedBuffer, BorrowedUbf, FastAdder, IntoUbfValue, TypedUbf, UbfField, UbfGetValue,
     UbfIterator, UbfValue,
 };
-pub use typed_view::{BvNextState, IntoViewValue, TypedView, ViewValue, BVACCESS_NOTNULL};
+pub use typed_view::{BvNextState, IntoViewValue, TypedView, ViewValue};
 pub use types::{ClientId, TpTranId};
 pub use ubf_search::{BorrowedView, UbfFieldRef};
 #[doc(hidden)]
@@ -103,32 +108,6 @@ pub use ubf_serde::{
 #[doc(hidden)]
 pub use view_serde::check_view;
 pub use view_serde::{ViewDeserialize, ViewFieldDeserialize, ViewFieldSerialize, ViewSerialize};
-
-pub const TPQCORRID: i64 = raw::TPQCORRID as i64;
-pub const TPQFAILUREQ: i64 = raw::TPQFAILUREQ as i64;
-pub const TPQBEFOREMSGID: i64 = raw::TPQBEFOREMSGID as i64;
-pub const TPQGETBYMSGIDOLD: i64 = raw::TPQGETBYMSGIDOLD as i64;
-pub const TPQMSGID: i64 = raw::TPQMSGID as i64;
-pub const TPQPRIORITY: i64 = raw::TPQPRIORITY as i64;
-pub const TPQTOP: i64 = raw::TPQTOP as i64;
-pub const TPQWAIT: i64 = raw::TPQWAIT as i64;
-pub const TPQREPLYQ: i64 = raw::TPQREPLYQ as i64;
-pub const TPQTIME_ABS: i64 = raw::TPQTIME_ABS as i64;
-pub const TPQTIME_REL: i64 = raw::TPQTIME_REL as i64;
-pub const TPQGETBYCORRIDOLD: i64 = raw::TPQGETBYCORRIDOLD as i64;
-pub const TPQPEEK: i64 = raw::TPQPEEK as i64;
-pub const TPQDELIVERYQOS: i64 = raw::TPQDELIVERYQOS as i64;
-pub const TPQREPLYQOS: i64 = raw::TPQREPLYQOS as i64;
-pub const TPQEXPTIME_ABS: i64 = raw::TPQEXPTIME_ABS as i64;
-pub const TPQEXPTIME_REL: i64 = raw::TPQEXPTIME_REL as i64;
-pub const TPQEXPTIME_NONE: i64 = raw::TPQEXPTIME_NONE as i64;
-pub const TPQGETBYMSGID: i64 = raw::TPQGETBYMSGID as i64;
-pub const TPQGETBYCORRID: i64 = raw::TPQGETBYCORRID as i64;
-pub const TPQASYNC: i64 = raw::TPQASYNC as i64;
-pub const TPQKEEPORIG: i64 = raw::TPQKEEPORIG as i64;
-pub const TPQQOSDEFAULTPERSIST: i64 = raw::TPQQOSDEFAULTPERSIST as i64;
-pub const TPQQOSPERSISTENT: i64 = raw::TPQQOSPERSISTENT as i64;
-pub const TPQQOSNONPERSISTENT: i64 = raw::TPQQOSNONPERSISTENT as i64;
 
 /// Event subscription control block used by [`AtmiCtx::tpsubscribe`].
 ///
@@ -184,11 +163,6 @@ impl TpEvCtl {
         Ok(self)
     }
 }
-
-/// Deliver matching events to the service in [`TpEvCtl::name1`].
-pub const TPEVSERVICE: i64 = raw::TPEVSERVICE as i64;
-/// Keep a subscription when its destination service becomes unavailable.
-pub const TPEVPERSIST: i64 = raw::TPEVPERSIST as i64;
 
 /// Persistent queue control block used by queue enqueue/dequeue APIs.
 ///

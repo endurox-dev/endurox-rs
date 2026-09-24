@@ -1,5 +1,29 @@
 Rust bindings for Enduro/X.
 
+# Native constants
+
+Numeric XATMI and UBF constants are available at the crate root, including call
+flags, conversation events, queue flags and `QME*` diagnostics, `BFLD_*` types,
+VIEW conversion options and buffer limits. Values come from the Enduro/X headers
+selected by `pkg-config`; cast-valued UBF sentinels are evaluated by the C compiler.
+
+Error codes are `u32` and support both spellings: `TPEINVAL` or
+`AtmiError::TPEINVAL`, `BNOTPRES` or `UbfError::BNOTPRES`, and `NEPRECOND` or
+`NstdError::NEPRECOND`. Queue diagnostics stay signed to match
+`TpQCtl::diagnostic()`; `BBADFLDOCC` is the signed recursive-path terminator.
+
+```rust
+use endurox_rs::{NstdError, NEPRECOND, TPNOABORT, TPNOCACHELOOK};
+
+let flags: i64 = TPNOABORT | TPNOCACHELOOK;
+let error = NstdError::new(NstdError::NEPRECOND, "condition changed");
+assert_eq!(error.code, NEPRECOND);
+```
+
+Reserved constants are included under their native names. Their presence does
+not imply that every Rust method accepts them; each method retains its documented
+flag restrictions. DLM-specific constants remain in `endurox_rs::dlm`.
+
 # Events, request logging and DLM
 
 Event subscriptions require a destination service. Configure `TpEvCtl::set_name1`
@@ -317,8 +341,10 @@ assert_eq!(output.as_bytes(), b"hello from Rust");
   scripting failures. Native TLS is restored after callbacks under `ctx-send`.
 - VMs and callbacks are local to their creating thread; callbacks must be
   synchronous. A VM borrows its `AtmiCtx`. Default configuration is `None`;
-  `TpScrCfg::from_raw` is an unsafe escape hatch for backend-specific
-  configuration because the portable core leaves that structure opaque.
+  build a `TpScrCfg` to assert the engine, e.g.
+  `TpScrCfg::engine(NDRX_SCR_INITSTRING_PYTHON)`, and the plugin rejects a
+  mismatched engine. `TpScrCfg::from_raw` remains an unsafe escape hatch for a
+  caller-built native configuration.
 
 The scripting integration fixture checks `ENDUROX_TPSCRIPT_PLUGIN`, installed
 Python packages discoverable by interpreters on `PATH` (including user site

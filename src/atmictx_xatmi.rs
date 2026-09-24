@@ -1232,17 +1232,25 @@ impl AtmiCtx {
     ///
     /// # Arguments
     ///
-    /// - `ibuf`: Typed buffer to export; this wrapper passes zero as the native input length.
+    /// - `ibuf`: Typed buffer to export; its tracked `len()` is passed as the native input
+    ///   length. Only CARRAY requires it; the self-describing UBF/VIEW/STRING keep `len()`
+    ///   at 0, so they derive (STRING) or ignore the length.
     /// - `flags`: `0` for JSON export data, or `TPEX_STRING` for its base64 encoding.
     pub fn tpexport(&self, ibuf: &TypedBuffer<'_>, flags: i64) -> AtmiResult<Vec<u8>> {
         let mut out = vec![0u8; 65536];
         let mut olen = out.len() as c_long;
 
+        // CARRAY is the only non-self-describing type: it needs its payload byte
+        // count, tracked in `len()`. The self-describing types (UBF/VIEW/STRING)
+        // keep `len()` at 0, so this passes 0 and they derive (STRING, via the
+        // terminating NUL) or ignore the length.
+        let ilen = ibuf.len() as c_long;
+
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe {
             raw::tpexport(
                 ibuf.as_ptr(),
-                0,
+                ilen,
                 out.as_mut_ptr() as *mut c_char,
                 &mut olen,
                 flags as c_long,
@@ -1254,7 +1262,7 @@ impl AtmiCtx {
             raw::Otpexport(
                 self.c_ctx_ptr(),
                 ibuf.as_ptr(),
-                0,
+                ilen,
                 out.as_mut_ptr() as *mut c_char,
                 &mut olen,
                 flags as c_long,
