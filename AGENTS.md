@@ -28,6 +28,14 @@ changing a contract; the details below describe the present design.
 
 ## Project map
 
+`ThreadLogger` is a stateless TP logger for synchronous callbacks that cannot
+retain `AtmiCtx` (for example, Diesel instrumentation). It uses the logger active
+on the calling thread, including thread/request routing, without allocating or
+switching an ATMI context. With `ctx-send` it does not select a detached context.
+`ThreadLogger.enabled(LogLevel::Dump)` queries native `tplogqinfo`; expensive
+dump preparation should use that check. Normal `tp_*!(ThreadLogger, ...)` macros
+work with the handle. Native `[@debug]` levels remain authoritative.
+
 | Area | Files |
 | --- | --- |
 | Native build discovery and generated bindings | `build.rs`, `include/wrapper.h` |

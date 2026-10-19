@@ -15,6 +15,42 @@ pub enum LogLevel {
     Dump = 6,
 }
 
+/// Application logger currently active on the calling thread.
+///
+/// This stateless handle follows Enduro/X's process, thread and request log
+/// routing. It does not allocate, attach or retain an ATMI context. Use it in
+/// synchronous library callbacks which cannot capture an [`AtmiCtx`], such as
+/// database instrumentation. With `ctx-send`, this logs under the context
+/// currently attached to the thread; it does not select a detached context.
+///
+/// The handle works with the ordinary `tp_info!`, `tp_debug!` and other TP macros.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ThreadLogger;
+
+impl ThreadLogger {
+    /// Whether the active application logger accepts `level` under `[@debug]`.
+    /// Check before preparing an expensive buffer dump or SQL representation.
+    pub fn enabled(self, level: LogLevel) -> bool {
+        // tplogqinfo is an NSTD operation and initializes logging independently
+        // of ATMI. The fixed flag selects only the application logger.
+        unsafe { raw::tplogqinfo(level.into(), raw::TPLOGQI_GET_TP as c_long) > 0 }
+    }
+
+    /// Write `msg` through the active thread's application logger, preserving
+    /// the caller's `file` and `line`. NUL handling matches [`AtmiCtx::tplog_str`].
+    pub fn tplog_str(self, level: LogLevel, file: &'static str, line: u32, msg: &str) {
+        call_logex(
+            |severity, source_file, source_line, message| unsafe {
+                raw::tplogex(severity, source_file, source_line, message);
+            },
+            level,
+            file,
+            line,
+            msg,
+        );
+    }
+}
+
 /// Conversion that preserves the source value’s native meaning.
 impl From<LogLevel> for c_int {
     /// Convert a Rust log level to its native numeric value.

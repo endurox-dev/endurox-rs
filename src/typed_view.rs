@@ -20,136 +20,141 @@ pub enum ViewValue {
 }
 
 /// Convert Rust scalar values and byte arrays into values accepted by VIEW writes.
+/// Unsigned values that exceed `i64::MAX` return `BEINVAL` before any write.
 pub trait IntoViewValue {
     /// Convert this value into the corresponding VIEW write variant.
-    fn into_view_value(self) -> ViewValue;
+    fn into_view_value(self) -> UbfResult<ViewValue>;
 }
 
 /// Conversion of `ViewValue` into a VIEW write value.
 impl IntoViewValue for ViewValue {
     /// Convert this value into the corresponding VIEW write variant.
-    fn into_view_value(self) -> ViewValue {
-        self
+    fn into_view_value(self) -> UbfResult<ViewValue> {
+        Ok(self)
     }
 }
 
 /// Conversion of `i16` into a VIEW write value.
 impl IntoViewValue for i16 {
     /// Convert this value into the corresponding VIEW write variant.
-    fn into_view_value(self) -> ViewValue {
-        ViewValue::Short(self)
+    fn into_view_value(self) -> UbfResult<ViewValue> {
+        Ok(ViewValue::Short(self))
     }
 }
 
 /// Conversion of `i64` into a VIEW write value.
 impl IntoViewValue for i64 {
     /// Convert this value into the corresponding VIEW write variant.
-    fn into_view_value(self) -> ViewValue {
-        ViewValue::Long(self)
+    fn into_view_value(self) -> UbfResult<ViewValue> {
+        Ok(ViewValue::Long(self))
     }
 }
 
 /// Conversion of `isize` into a VIEW write value.
 impl IntoViewValue for isize {
     /// Convert this value into the corresponding VIEW write variant.
-    fn into_view_value(self) -> ViewValue {
-        ViewValue::Long(self as i64)
+    fn into_view_value(self) -> UbfResult<ViewValue> {
+        Ok(ViewValue::Long(self as i64))
     }
 }
 
 /// Conversion of `i32` into a VIEW write value.
 impl IntoViewValue for i32 {
     /// Convert this value into the corresponding VIEW write variant.
-    fn into_view_value(self) -> ViewValue {
-        ViewValue::Int(self as i64)
+    fn into_view_value(self) -> UbfResult<ViewValue> {
+        Ok(ViewValue::Int(self as i64))
     }
 }
 
 /// Conversion of `u64` into a VIEW write value.
 impl IntoViewValue for u64 {
     /// Convert this value into the corresponding VIEW write variant.
-    fn into_view_value(self) -> ViewValue {
-        ViewValue::Long(self as i64)
+    fn into_view_value(self) -> UbfResult<ViewValue> {
+        i64::try_from(self)
+            .map(ViewValue::Long)
+            .map_err(|_| UbfError::new(UbfError::BEINVAL, "unsigned value exceeds i64::MAX"))
     }
 }
 
 /// Conversion of `usize` into a VIEW write value.
 impl IntoViewValue for usize {
     /// Convert this value into the corresponding VIEW write variant.
-    fn into_view_value(self) -> ViewValue {
-        ViewValue::Long(self as i64)
+    fn into_view_value(self) -> UbfResult<ViewValue> {
+        i64::try_from(self)
+            .map(ViewValue::Long)
+            .map_err(|_| UbfError::new(UbfError::BEINVAL, "unsigned value exceeds i64::MAX"))
     }
 }
 
 /// Conversion of `u32` into a VIEW write value.
 impl IntoViewValue for u32 {
     /// Convert this value into the corresponding VIEW write variant.
-    fn into_view_value(self) -> ViewValue {
-        ViewValue::Long(self as i64)
+    fn into_view_value(self) -> UbfResult<ViewValue> {
+        Ok(ViewValue::Long(self as i64))
     }
 }
 
 /// Conversion of `u16` into a VIEW write value.
 impl IntoViewValue for u16 {
     /// Convert this value into the corresponding VIEW write variant.
-    fn into_view_value(self) -> ViewValue {
-        ViewValue::Short(self as i16)
+    fn into_view_value(self) -> UbfResult<ViewValue> {
+        Ok(ViewValue::Long(i64::from(self)))
     }
 }
 
 /// Conversion of `u8` into a VIEW write value.
 impl IntoViewValue for u8 {
     /// Convert this value into the corresponding VIEW write variant.
-    fn into_view_value(self) -> ViewValue {
-        ViewValue::Short(self as i16)
+    fn into_view_value(self) -> UbfResult<ViewValue> {
+        Ok(ViewValue::Short(self as i16))
     }
 }
 
 /// Conversion of `i8` into a VIEW write value.
 impl IntoViewValue for i8 {
     /// Convert this value into the corresponding VIEW write variant.
-    fn into_view_value(self) -> ViewValue {
-        ViewValue::Char(self)
+    fn into_view_value(self) -> UbfResult<ViewValue> {
+        Ok(ViewValue::Char(self))
     }
 }
 
 /// Conversion of `f32` into a VIEW write value.
 impl IntoViewValue for f32 {
     /// Convert this value into the corresponding VIEW write variant.
-    fn into_view_value(self) -> ViewValue {
-        ViewValue::Float(self)
+    fn into_view_value(self) -> UbfResult<ViewValue> {
+        Ok(ViewValue::Float(self))
     }
 }
 
 /// Conversion of `f64` into a VIEW write value.
 impl IntoViewValue for f64 {
     /// Convert this value into the corresponding VIEW write variant.
-    fn into_view_value(self) -> ViewValue {
-        ViewValue::Double(self)
+    fn into_view_value(self) -> UbfResult<ViewValue> {
+        Ok(ViewValue::Double(self))
     }
 }
 
 /// Conversion of `String` into a VIEW write value.
 impl IntoViewValue for String {
     /// Convert this value into the corresponding VIEW write variant.
-    fn into_view_value(self) -> ViewValue {
-        ViewValue::String(self)
+    fn into_view_value(self) -> UbfResult<ViewValue> {
+        Ok(ViewValue::String(self))
     }
 }
 
 /// Conversion of `&str` into a VIEW write value.
 impl IntoViewValue for &str {
     /// Convert this value into the corresponding VIEW write variant.
-    fn into_view_value(self) -> ViewValue {
-        ViewValue::String(self.to_string())
+    fn into_view_value(self) -> UbfResult<ViewValue> {
+        Ok(ViewValue::String(self.to_string()))
     }
 }
 
 /// Conversion of `Vec<u8>` into a VIEW write value.
 impl IntoViewValue for Vec<u8> {
     /// Convert this value into the corresponding VIEW write variant.
-    fn into_view_value(self) -> ViewValue {
-        ViewValue::Carray(self)
+    fn into_view_value(self) -> UbfResult<ViewValue> {
+        Ok(ViewValue::Carray(self))
     }
 }
 
@@ -512,14 +517,32 @@ impl<'ctx> TypedView<'ctx> {
     pub fn bvchg(&mut self, cname: &str, occ: i32, value: impl IntoViewValue) -> UbfResult<()> {
         let view = self.view_cstring()?;
         let cname = Self::cname_cstring(cname)?;
-        let mut value = value.into_view_value();
+        let mut value = value.into_view_value()?;
         let mut string_storage: Option<CString> = None;
         let mut empty_carray = [0u8; 1];
+        let mut _long_storage: c_long = 0;
+        let mut _int_storage: c_int = 0;
 
         let (ptr, len, usrtype) = match &mut value {
             ViewValue::Short(v) => (v as *mut i16 as *mut c_char, 0, raw::BFLD_SHORT),
-            ViewValue::Long(v) => (v as *mut i64 as *mut c_char, 0, raw::BFLD_LONG),
-            ViewValue::Int(v) => (v as *mut i64 as *mut c_char, 0, raw::BFLD_INT),
+            ViewValue::Long(v) => {
+                _long_storage = c_long::try_from(*v)
+                    .map_err(|_| UbfError::new(UbfError::BEINVAL, "value exceeds native long"))?;
+                (
+                    &mut _long_storage as *mut c_long as *mut c_char,
+                    0,
+                    raw::BFLD_LONG,
+                )
+            }
+            ViewValue::Int(v) => {
+                _int_storage = c_int::try_from(*v)
+                    .map_err(|_| UbfError::new(UbfError::BEINVAL, "value exceeds native int"))?;
+                (
+                    &mut _int_storage as *mut c_int as *mut c_char,
+                    0,
+                    raw::BFLD_INT,
+                )
+            }
             ViewValue::Char(v) => (v as *mut i8 as *mut c_char, 0, raw::BFLD_CHAR),
             ViewValue::Float(v) => (v as *mut f32 as *mut c_char, 0, raw::BFLD_FLOAT),
             ViewValue::Double(v) => (v as *mut f64 as *mut c_char, 0, raw::BFLD_DOUBLE),

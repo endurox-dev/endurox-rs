@@ -147,6 +147,51 @@ impl ParkedBuf {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplyClaim {
+    Call,
+    Waiter(u64),
+}
+
+/// Releases only this waiter's claim, even if its descriptor has since been reused.
+#[derive(Debug)]
+struct ReplyClaimGuard<'a> {
+    demux: &'a ReplyDemux,
+    cd: i32,
+    id: u64,
+    /// Whether the claim created the slot for an untracked descriptor. Such a
+    /// slot is removed again if no reply landed, or it would mark the number
+    /// busy for a later `tpacall` that reuses it.
+    created: bool,
+}
+
+impl Drop for ReplyClaimGuard<'_> {
+    fn drop(&mut self) {
+        {
+            let mut slots = self.demux.slots.borrow_mut();
+            match slots.get_mut(&self.cd) {
+                Some(Slot::Waiting { claim, .. })
+                    if self.created && *claim == Some(ReplyClaim::Waiter(self.id)) =>
+                {
+                    slots.remove(&self.cd);
+                    return;
+                }
+                Some(Slot::Waiting { waker, claim })
+                    if *claim == Some(ReplyClaim::Waiter(self.id)) =>
+                {
+                    *claim = None;
+                    *waker = None;
+                }
+                Some(Slot::Ready { claim, .. }) if *claim == Some(ReplyClaim::Waiter(self.id)) => {
+                    *claim = None;
+                }
+                _ => return,
+            }
+        }
+        self.demux.wake_any_waiters();
+    }
+}
+
 enum Slot {
     /// Registered, reply not yet collected.
     Waiting {
@@ -159,7 +204,7 @@ enum Slot {
         /// is registered only to protect the number from reuse, and stays
         /// unclaimed until a `tpgetrply` names it -- otherwise `TPGETANY` could
         /// never collect a manually submitted call.
-        claimed: bool,
+        claim: Option<ReplyClaim>,
     },
     /// A reply, or a per-descriptor error, has been routed here.
     Ready {
@@ -169,7 +214,7 @@ enum Slot {
         /// the reply landed. `TPGETANY` must not steal those: they belong to a
         /// specific pending `tpcall`. Only unclaimed replies -- from the
         /// caller's own `tpacall` -- are eligible for "give me any reply".
-        claimed: bool,
+        claim: Option<ReplyClaim>,
     },
 }
 
@@ -252,6 +297,7 @@ struct ReplyDemux {
     /// call the way a single shared error slot would.
     any_waiters: RefCell<HashMap<u64, AnyWaiter>>,
     next_any_id: Cell<u64>,
+    next_claim_id: Cell<u64>,
     /// Absolute deadlines recorded at submission time, keyed by descriptor.
     /// Populated by `AsyncAtmiCtx::tpacall`; a later `tpgetrply` must use the
     /// deadline from when the call was *sent*, not from when collection began.
@@ -292,7 +338,7 @@ impl ReplyDemux {
             cd,
             Slot::Waiting {
                 waker: None,
-                claimed,
+                claim: claimed.then_some(ReplyClaim::Call),
             },
         );
         debug_assert!(
@@ -308,7 +354,7 @@ impl ReplyDemux {
     /// - `cd`: Native call descriptor identifying the outstanding request or parked reply.
     ///
     /// Any occupied slot makes the number unsafe to reuse, not just one holding
-    /// an uncollected reply. A `Ready { claimed: true }` entry normally means
+    /// an uncollected reply. A `Ready { claim: Some(..) }` entry normally means
     /// the owning future has been *woken but has not resumed yet* -- not that
     /// it was abandoned. Overwriting that would free the response out from
     /// under it and leave two futures chasing the same descriptor.
@@ -327,24 +373,32 @@ impl ReplyDemux {
     /// already parked here. With a manual `tpacall`, the reply can easily
     /// arrive before `tpgetrply` is first called, and dropping it would hang
     /// the caller forever.
-    fn claim(&self, cd: i32) {
-        match self.slots.borrow_mut().entry(cd) {
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert(Slot::Waiting {
-                    waker: None,
-                    claimed: true,
-                });
-            }
-            std::collections::hash_map::Entry::Occupied(mut slot) => {
-                // Naming the descriptor claims it: this caller is collecting it
-                // by number, so TPGETANY must no longer take it. Any reply
-                // already parked here is preserved.
-                match slot.get_mut() {
-                    Slot::Waiting { claimed, .. } => *claimed = true,
-                    Slot::Ready { claimed, .. } => *claimed = true,
-                }
-            }
+    fn claim(&self, cd: i32) -> AtmiResult<ReplyClaimGuard<'_>> {
+        let id =
+            self.next_claim_id.get().checked_add(1).ok_or_else(|| {
+                AtmiError::new(raw::TPELIMIT, "reply waiter identifiers exhausted")
+            })?;
+        let mut slots = self.slots.borrow_mut();
+        let created = !slots.contains_key(&cd);
+        let slot = slots.entry(cd).or_insert(Slot::Waiting {
+            waker: None,
+            claim: None,
+        });
+        let (Slot::Waiting { claim, .. } | Slot::Ready { claim, .. }) = slot;
+        if claim.is_some() {
+            return Err(AtmiError::new(
+                raw::TPEPROTO,
+                "call descriptor already has a reply waiter",
+            ));
         }
+        *claim = Some(ReplyClaim::Waiter(id));
+        self.next_claim_id.set(id);
+        Ok(ReplyClaimGuard {
+            demux: self,
+            cd,
+            id,
+            created,
+        })
     }
 
     /// Remember the original submission deadline for later reply collection.
@@ -407,7 +461,7 @@ impl ReplyDemux {
             .borrow()
             .iter()
             .find_map(|(cd, slot)| match slot {
-                Slot::Ready { claimed: false, .. } => Some(*cd),
+                Slot::Ready { claim: None, .. } => Some(*cd),
                 _ => None,
             })
     }
@@ -746,8 +800,8 @@ impl ReplyDemux {
             let mut slots = self.slots.borrow_mut();
             match slots.get_mut(&cd) {
                 Some(slot) => {
-                    let (waker, was_claimed) = match slot {
-                        Slot::Waiting { waker, claimed } => (waker.take(), *claimed),
+                    let (waker, claim) = match slot {
+                        Slot::Waiting { waker, claim } => (waker.take(), *claim),
                         // A second reply for a descriptor that already has one
                         // should not happen; keep the first.
                         Slot::Ready { .. } => {
@@ -763,7 +817,7 @@ impl ReplyDemux {
                     *slot = Slot::Ready {
                         outcome,
                         buf,
-                        claimed: was_claimed,
+                        claim,
                     };
                     waker
                 }
@@ -783,7 +837,7 @@ impl ReplyDemux {
                         Slot::Ready {
                             outcome,
                             buf,
-                            claimed: false,
+                            claim: None,
                         },
                     );
                     None
@@ -817,12 +871,12 @@ impl ReplyDemux {
         {
             let mut slots = self.slots.borrow_mut();
             for slot in slots.values_mut() {
-                if let Slot::Waiting { waker, .. } = slot {
+                if let Slot::Waiting { waker, claim } = slot {
                     wakers.extend(waker.take());
                     *slot = Slot::Ready {
                         outcome: Err(err.clone()),
                         buf: ParkedBuf::EMPTY,
-                        claimed: true,
+                        claim: *claim,
                     };
                 }
             }
@@ -1333,7 +1387,9 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
     ///
     /// Expiration of the Enduro/X call timeout cancels `cd`. Merely dropping
     /// this future does not, because descriptor ownership remains with the
-    /// caller; the wait can be resumed or cancelled explicitly.
+    /// caller; the wait can be resumed, collected with `TPGETANY`, or cancelled
+    /// explicitly. A nonblocking `TPEBLOCK` also releases the temporary claim.
+    /// A second concurrent wait for the same descriptor returns `TPEPROTO`.
     pub async fn tpgetrply(
         &self,
         cd: &mut i32,
@@ -1369,6 +1425,13 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
             None
         };
 
+        // Release the claim on success, would-block, driver error, or Drop.
+        // The descriptor, parked reply and original deadline remain intact.
+        let _claim = if any {
+            None
+        } else {
+            Some(self.demux.claim(*cd)?)
+        };
         let target = if let Some(guard) = &any_waiter {
             // TPGETANY: take whichever reply lands first and report which one
             // it was through `cd`, as the blocking API does. Replies belonging
@@ -1378,7 +1441,6 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
         } else {
             // `claim`, not `register_fresh`: a drain may already have parked
             // this descriptor's reply before the caller got here.
-            self.demux.claim(*cd);
             Target::One(*cd)
         };
 
@@ -1976,6 +2038,151 @@ mod tests {
 
     struct CountingWaker(AtomicUsize);
 
+    struct PendingReplyDriver {
+        fail_read: bool,
+    }
+
+    impl AsyncReplyDriver for PendingReplyDriver {
+        type Readiness<'a> = ();
+
+        fn register(_: i32) -> io::Result<Self> {
+            Ok(Self { fail_read: false })
+        }
+
+        async fn readable(&self) -> io::Result<()> {
+            if self.fail_read {
+                Err(io::Error::other("test driver failure"))
+            } else {
+                std::future::pending().await
+            }
+        }
+
+        fn clear_readiness(&self, _: &mut ()) {}
+
+        async fn sleep_until(&self, _: Instant) {
+            std::future::pending::<()>().await
+        }
+    }
+
+    #[test]
+    fn released_specific_wait_remains_collectable_by_any() {
+        // A nonblocking probe, dropped wait, dropped ready wait, and driver
+        // failure must all retain the caller's reply and original deadline.
+        for scenario in 0..4 {
+            let ctx = AsyncAtmiCtx {
+                driver: PendingReplyDriver {
+                    fail_read: scenario == 3,
+                },
+                demux: ReplyDemux::default(),
+                context: AtmiCtx::new().unwrap(),
+                next_priority: Cell::new(None),
+            };
+            // Inject replies directly so this runs on non-pollable backends.
+            ctx.demux.draining.set(true);
+            ctx.demux.register_fresh(7, false);
+            let deadline = Instant::now() + Duration::from_secs(60);
+            ctx.demux.record_deadline(7, Some(deadline));
+            let mut data = ctx.tpalloc_carray(b"old").unwrap();
+            let mut cd = 7;
+            let mut task = std::task::Context::from_waker(Waker::noop());
+            let flags = if scenario == 0 {
+                raw::TPNOBLOCK as i64
+            } else {
+                0
+            };
+            let reply = ctx.tpalloc_carray(b"reply").unwrap();
+            let mut reply = Some(ParkedBuf {
+                ptr: reply.into_raw(),
+                len: 5,
+            });
+            {
+                let mut future = Box::pin(ctx.tpgetrply(&mut cd, &mut data, flags));
+                let result = future.as_mut().poll(&mut task);
+                match scenario {
+                    0 => assert!(matches!(result, Poll::Ready(Err(e)) if e.code == raw::TPEBLOCK)),
+                    3 => assert!(matches!(result, Poll::Ready(Err(e)) if e.code == raw::TPEOS)),
+                    _ => assert!(result.is_pending()),
+                }
+                if scenario == 2 {
+                    ctx.demux.route(7, Ok(()), reply.take().unwrap());
+                    assert!(ctx.demux.any_unclaimed().is_none());
+                }
+            }
+            assert_eq!(ctx.demux.peek_deadline(7), Some(Some(deadline)));
+            assert!(ctx.demux.is_descriptor_busy(7));
+            if let Some(reply) = reply {
+                ctx.demux.route(7, Ok(()), reply);
+            }
+            cd = 0;
+            {
+                let mut future = Box::pin(ctx.tpgetrply(
+                    &mut cd,
+                    &mut data,
+                    (raw::TPGETANY | raw::TPNOBLOCK) as i64,
+                ));
+                assert!(
+                    matches!(future.as_mut().poll(&mut task), Poll::Ready(Ok(()))),
+                    "scenario {scenario}: abandoned claim hid the reply"
+                );
+            }
+            assert_eq!(cd, 7);
+            assert_eq!(data.as_bytes(), b"reply");
+            assert_eq!(ctx.demux.peek_deadline(7), None);
+        }
+    }
+
+    #[test]
+    fn reply_claim_guards_preserve_other_waiters_and_descriptor_generations() {
+        let demux = ReplyDemux::default();
+        demux.register_fresh(5, false);
+        let old = demux.claim(5).unwrap();
+        assert_eq!(demux.claim(5).unwrap_err().code, raw::TPEPROTO);
+        let _ = demux.deregister(5);
+        demux.register_fresh(5, false);
+        let current = demux.claim(5).unwrap();
+        drop(old);
+        demux.route(5, Ok(()), ParkedBuf::EMPTY);
+        assert!(demux.any_unclaimed().is_none());
+
+        let any = demux.register_any_waiter();
+        let counter = Arc::new(CountingWaker(AtomicUsize::new(0)));
+        demux.park_waker(Target::Any(any), any, &Waker::from(counter.clone()));
+        drop(current);
+        assert_eq!(demux.any_unclaimed(), Some(5));
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+
+        demux.register_fresh(6, true);
+        assert_eq!(demux.claim(6).unwrap_err().code, raw::TPEPROTO);
+        demux.route(6, Ok(()), ParkedBuf::EMPTY);
+        let _ = demux.deregister(5);
+        assert!(
+            demux.any_unclaimed().is_none(),
+            "tpcall keeps its own claim"
+        );
+    }
+
+    /// A claim on an untracked descriptor must not leave the number marked
+    /// busy once it is released without a reply, but must keep one that landed.
+    #[test]
+    fn reply_claim_on_untracked_descriptor_does_not_leak_slot() {
+        let demux = ReplyDemux::default();
+        drop(demux.claim(8).unwrap());
+        assert!(!demux.is_descriptor_busy(8), "empty claim slot leaked");
+        demux.register_fresh(8, false);
+
+        let claim = demux.claim(9).unwrap();
+        demux.route(9, Ok(()), ParkedBuf::EMPTY);
+        drop(claim);
+        assert_eq!(demux.any_unclaimed(), Some(9));
+
+        demux.register_fresh(10, false);
+        drop(demux.claim(10).unwrap());
+        assert!(
+            demux.is_descriptor_busy(10),
+            "tpacall slot must stay registered"
+        );
+    }
+
     /// Executor-wake counting for reply-router tests.
     impl Wake for CountingWaker {
         /// Record an executor wake in the test counter.
@@ -2388,7 +2595,7 @@ mod tests {
         assert!(demux.is_ready(9), "unclaimed reply must be parked");
 
         // The caller now gets around to collecting descriptor 9.
-        demux.claim(9);
+        let _claim = demux.claim(9).unwrap();
         assert!(
             demux.is_ready(9),
             "claiming a descriptor must not discard a reply already parked for it"
@@ -2449,7 +2656,7 @@ mod tests {
         let any_id = demux.register_any_waiter();
 
         demux.register_fresh(7, false);
-        demux.claim(7);
+        let _claim = demux.claim(7).unwrap();
         demux.route(7, Ok(()), ParkedBuf::EMPTY);
 
         assert!(demux.is_ready(7), "its own collector still finds it");
@@ -2466,7 +2673,7 @@ mod tests {
 
         demux.register_fresh(7, false);
         demux.route(7, Ok(()), ParkedBuf::EMPTY);
-        demux.claim(7);
+        let _claim = demux.claim(7).unwrap();
 
         assert!(
             demux.is_ready(7),

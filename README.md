@@ -288,6 +288,16 @@ pointer fields. `UbfAdhoc` can serialize an unmapped embedded UBF (including one
 that owns pointers) by deep copy; use `ubf_read_adhoc` for scoped access when
 reading it.
 
+`IntoUbfValue::into_ubf_value` and `IntoViewValue::into_view_value` return
+`UbfResult`. Unsigned `u16` values are promoted without changing their sign;
+`u64`/`usize` values above `i64::MAX` fail with `BEINVAL` before writing. Custom
+implementations must return `Ok(value)` or a conversion error.
+
+`TypedUbf::bextread` uses native parsing for escapes, comments, commands, numeric
+field identifiers, and nested UBF/VIEW values. Allocate sufficient destination
+capacity first. Parsing errors may leave earlier fields updated, without
+replaying the input.
+
 # Scripting plugins
 
 The native `tpscr*` API is available through `AtmiCtx::tpscrinit` and the returned
@@ -478,7 +488,10 @@ into Enduro/X's in-memory queue where the reply fd could not signal it again.
 Dropping a send future while it waits for queue space stops all further attempts.
 Dropping `AsyncAtmiCtx::tpcall` after submission cancels its call descriptor; dropping
 `AsyncAtmiCtx::tpgetrply` leaves its caller-owned descriptor pending so it can
-be awaited again or cancelled explicitly. Multiple adapters may share one
+be awaited again, collected with `TPGETANY`, or cancelled explicitly. A
+nonblocking receive that returns `TPEBLOCK` also releases its temporary claim.
+Concurrent waits for the same descriptor return `TPEPROTO`; a pending `tpcall`
+retains exclusive ownership of its reply. Multiple adapters may share one
 executor thread; each owns a separate Enduro/X context and reply queue.
 
 The generic form is `AsyncAtmiCtx<D>`, where `D: AsyncReplyDriver`. The provided

@@ -1,6 +1,6 @@
 //! Typed UBF field access, conversion, iteration, and borrowed child-buffer views.
 // src/typed_ubf.rs
-use core::ffi::{c_char, c_int};
+use core::ffi::{c_char, c_int, c_long};
 use std::ffi::{CStr, CString};
 use std::ops::{Deref, DerefMut};
 
@@ -50,152 +50,157 @@ pub enum UbfGetValue<'a, 'ctx> {
 }
 
 /// Converts ordinary Rust values into values accepted by UBF write methods.
+/// Unsigned values that exceed `i64::MAX` return `BEINVAL` before any write.
 pub trait IntoUbfValue<'ctx> {
     /// Convert this value into the corresponding UBF write variant.
-    fn into_ubf_value(self) -> UbfValue<'ctx>;
+    fn into_ubf_value(self) -> UbfResult<UbfValue<'ctx>>;
 }
 
 /// Conversion of `UbfValue<'ctx>` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for UbfValue<'ctx> {
     /// Convert this value into the corresponding UBF write variant.
-    fn into_ubf_value(self) -> UbfValue<'ctx> {
-        self
+    fn into_ubf_value(self) -> UbfResult<UbfValue<'ctx>> {
+        Ok(self)
     }
 }
 
 /// Conversion of `i16` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for i16 {
     /// Convert this value into the corresponding UBF write variant.
-    fn into_ubf_value(self) -> UbfValue<'ctx> {
-        UbfValue::Short(self)
+    fn into_ubf_value(self) -> UbfResult<UbfValue<'ctx>> {
+        Ok(UbfValue::Short(self))
     }
 }
 
 /// Conversion of `i64` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for i64 {
     /// Convert this value into the corresponding UBF write variant.
-    fn into_ubf_value(self) -> UbfValue<'ctx> {
-        UbfValue::Long(self)
+    fn into_ubf_value(self) -> UbfResult<UbfValue<'ctx>> {
+        Ok(UbfValue::Long(self))
     }
 }
 
 /// Conversion of `isize` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for isize {
     /// Convert this value into the corresponding UBF write variant.
-    fn into_ubf_value(self) -> UbfValue<'ctx> {
-        UbfValue::Long(self as i64)
+    fn into_ubf_value(self) -> UbfResult<UbfValue<'ctx>> {
+        Ok(UbfValue::Long(self as i64))
     }
 }
 
 /// Conversion of `i32` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for i32 {
     /// Convert this value into the corresponding UBF write variant.
-    fn into_ubf_value(self) -> UbfValue<'ctx> {
-        UbfValue::Long(self as i64)
+    fn into_ubf_value(self) -> UbfResult<UbfValue<'ctx>> {
+        Ok(UbfValue::Long(self as i64))
     }
 }
 
 /// Conversion of `u64` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for u64 {
     /// Convert this value into the corresponding UBF write variant.
-    fn into_ubf_value(self) -> UbfValue<'ctx> {
-        UbfValue::Long(self as i64)
+    fn into_ubf_value(self) -> UbfResult<UbfValue<'ctx>> {
+        i64::try_from(self)
+            .map(UbfValue::Long)
+            .map_err(|_| UbfError::new(UbfError::BEINVAL, "unsigned value exceeds i64::MAX"))
     }
 }
 
 /// Conversion of `usize` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for usize {
     /// Convert this value into the corresponding UBF write variant.
-    fn into_ubf_value(self) -> UbfValue<'ctx> {
-        UbfValue::Long(self as i64)
+    fn into_ubf_value(self) -> UbfResult<UbfValue<'ctx>> {
+        i64::try_from(self)
+            .map(UbfValue::Long)
+            .map_err(|_| UbfError::new(UbfError::BEINVAL, "unsigned value exceeds i64::MAX"))
     }
 }
 
 /// Conversion of `u32` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for u32 {
     /// Convert this value into the corresponding UBF write variant.
-    fn into_ubf_value(self) -> UbfValue<'ctx> {
-        UbfValue::Long(self as i64)
+    fn into_ubf_value(self) -> UbfResult<UbfValue<'ctx>> {
+        Ok(UbfValue::Long(self as i64))
     }
 }
 
 /// Conversion of `u16` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for u16 {
     /// Convert this value into the corresponding UBF write variant.
-    fn into_ubf_value(self) -> UbfValue<'ctx> {
-        UbfValue::Short(self as i16)
+    fn into_ubf_value(self) -> UbfResult<UbfValue<'ctx>> {
+        Ok(UbfValue::Long(i64::from(self)))
     }
 }
 
 /// Conversion of `u8` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for u8 {
     /// Convert this value into the corresponding UBF write variant.
-    fn into_ubf_value(self) -> UbfValue<'ctx> {
-        UbfValue::Short(self as i16)
+    fn into_ubf_value(self) -> UbfResult<UbfValue<'ctx>> {
+        Ok(UbfValue::Short(self as i16))
     }
 }
 
 /// Conversion of `i8` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for i8 {
     /// Convert this value into the corresponding UBF write variant.
-    fn into_ubf_value(self) -> UbfValue<'ctx> {
-        UbfValue::Char(self)
+    fn into_ubf_value(self) -> UbfResult<UbfValue<'ctx>> {
+        Ok(UbfValue::Char(self))
     }
 }
 
 /// Conversion of `f32` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for f32 {
     /// Convert this value into the corresponding UBF write variant.
-    fn into_ubf_value(self) -> UbfValue<'ctx> {
-        UbfValue::Float(self)
+    fn into_ubf_value(self) -> UbfResult<UbfValue<'ctx>> {
+        Ok(UbfValue::Float(self))
     }
 }
 
 /// Conversion of `f64` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for f64 {
     /// Convert this value into the corresponding UBF write variant.
-    fn into_ubf_value(self) -> UbfValue<'ctx> {
-        UbfValue::Double(self)
+    fn into_ubf_value(self) -> UbfResult<UbfValue<'ctx>> {
+        Ok(UbfValue::Double(self))
     }
 }
 
 /// Conversion of `String` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for String {
     /// Convert this value into the corresponding UBF write variant.
-    fn into_ubf_value(self) -> UbfValue<'ctx> {
-        UbfValue::String(self)
+    fn into_ubf_value(self) -> UbfResult<UbfValue<'ctx>> {
+        Ok(UbfValue::String(self))
     }
 }
 
 /// Conversion of `&str` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for &str {
     /// Convert this value into the corresponding UBF write variant.
-    fn into_ubf_value(self) -> UbfValue<'ctx> {
-        UbfValue::String(self.to_string())
+    fn into_ubf_value(self) -> UbfResult<UbfValue<'ctx>> {
+        Ok(UbfValue::String(self.to_string()))
     }
 }
 
 /// Conversion of `Vec<u8>` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for Vec<u8> {
     /// Convert this value into the corresponding UBF write variant.
-    fn into_ubf_value(self) -> UbfValue<'ctx> {
-        UbfValue::Carray(self)
+    fn into_ubf_value(self) -> UbfResult<UbfValue<'ctx>> {
+        Ok(UbfValue::Carray(self))
     }
 }
 
 /// Conversion of `TypedBuffer<'ctx>` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for TypedBuffer<'ctx> {
     /// Convert this value into the corresponding UBF write variant.
-    fn into_ubf_value(self) -> UbfValue<'ctx> {
-        UbfValue::Ptr(self)
+    fn into_ubf_value(self) -> UbfResult<UbfValue<'ctx>> {
+        Ok(UbfValue::Ptr(self))
     }
 }
 
 /// Conversion of `TypedUbf<'ctx>` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for TypedUbf<'ctx> {
     /// Convert this value into the corresponding UBF write variant.
-    fn into_ubf_value(self) -> UbfValue<'ctx> {
-        UbfValue::Ubf(self)
+    fn into_ubf_value(self) -> UbfResult<UbfValue<'ctx>> {
+        Ok(UbfValue::Ubf(self))
     }
 }
 
@@ -221,15 +226,15 @@ impl<'ctx> FastAdder<'_, 'ctx> {
     /// - `realloc`: Whether to grow the destination and retry when Enduro/X reports `BNOSPACE`.
     pub fn add(&mut self, bfldid: i32, v: impl IntoUbfValue<'ctx>, realloc: bool) -> UbfResult<()> {
         self.ubf
-            .write_value_fast(bfldid, v.into_ubf_value(), &mut self.loc, realloc)
+            .write_value_fast(bfldid, v.into_ubf_value()?, &mut self.loc, realloc)
     }
 }
 
 /// Conversion of `TypedView<'ctx>` into a UBF write value.
 impl<'ctx> IntoUbfValue<'ctx> for TypedView<'ctx> {
     /// Convert this value into the corresponding UBF write variant.
-    fn into_ubf_value(self) -> UbfValue<'ctx> {
-        UbfValue::View(self)
+    fn into_ubf_value(self) -> UbfResult<UbfValue<'ctx>> {
+        Ok(UbfValue::View(self))
     }
 }
 
@@ -514,7 +519,7 @@ impl<'ctx> TypedUbf<'ctx> {
         v: impl IntoUbfValue<'ctx>,
         realloc: bool,
     ) -> UbfResult<()> {
-        self.write_value(bfldid, occ, v.into_ubf_value(), realloc, false)
+        self.write_value(bfldid, occ, v.into_ubf_value()?, realloc, false)
     }
 
     /// Add a new UBF field occurrence.
@@ -532,7 +537,7 @@ impl<'ctx> TypedUbf<'ctx> {
         v: impl IntoUbfValue<'ctx>,
         realloc: bool,
     ) -> UbfResult<()> {
-        self.write_value(bfldid, 0, v.into_ubf_value(), realloc, true)
+        self.write_value(bfldid, 0, v.into_ubf_value()?, realloc, true)
     }
 
     /// Begin a batch of fast appends.
@@ -596,7 +601,7 @@ impl<'ctx> TypedUbf<'ctx> {
         do_add: bool,
         realloc: bool,
     ) -> UbfResult<()> {
-        self.write_value(bfldid, occ, v.into_ubf_value(), realloc, do_add)
+        self.write_value(bfldid, occ, v.into_ubf_value()?, realloc, do_add)
     }
 
     /// Iterate the fields of this buffer.
@@ -647,6 +652,7 @@ impl<'ctx> TypedUbf<'ctx> {
         loop {
             let mut _string_storage: Option<CString> = None;
             let mut empty_carray = [0u8; 1];
+            let mut _long_storage: c_long = 0;
             // CBchg/CBadd take a pointer *to* the value. For BFLD_PTR the value
             // is itself a pointer, so it must be handed the address of a
             // variable holding the target address -- passing the target address
@@ -657,7 +663,16 @@ impl<'ctx> TypedUbf<'ctx> {
 
             let (ptr, len, ftype) = match &mut v {
                 UbfValue::Short(val) => (val as *mut i16 as *mut c_char, 0, raw::BFLD_SHORT),
-                UbfValue::Long(val) => (val as *mut i64 as *mut c_char, 0, raw::BFLD_LONG),
+                UbfValue::Long(val) => {
+                    _long_storage = c_long::try_from(*val).map_err(|_| {
+                        UbfError::new(UbfError::BEINVAL, "value exceeds native long")
+                    })?;
+                    (
+                        &mut _long_storage as *mut c_long as *mut c_char,
+                        0,
+                        raw::BFLD_LONG,
+                    )
+                }
                 UbfValue::Char(val) => (val as *mut i8 as *mut c_char, 0, raw::BFLD_CHAR),
                 UbfValue::Float(val) => (val as *mut f32 as *mut c_char, 0, raw::BFLD_FLOAT),
                 UbfValue::Double(val) => (val as *mut f64 as *mut c_char, 0, raw::BFLD_DOUBLE),
@@ -773,6 +788,7 @@ impl<'ctx> TypedUbf<'ctx> {
         loop {
             let mut _string_storage: Option<CString> = None;
             let mut empty_carray = [0u8; 1];
+            let mut _long_storage: c_long = 0;
             // CBchg/CBadd take a pointer *to* the value. For BFLD_PTR the value
             // is itself a pointer, so it must be handed the address of a
             // variable holding the target address -- passing the target address
@@ -783,7 +799,16 @@ impl<'ctx> TypedUbf<'ctx> {
 
             let (ptr, len, ftype) = match &mut v {
                 UbfValue::Short(val) => (val as *mut i16 as *mut c_char, 0, raw::BFLD_SHORT),
-                UbfValue::Long(val) => (val as *mut i64 as *mut c_char, 0, raw::BFLD_LONG),
+                UbfValue::Long(val) => {
+                    _long_storage = c_long::try_from(*val).map_err(|_| {
+                        UbfError::new(UbfError::BEINVAL, "value exceeds native long")
+                    })?;
+                    (
+                        &mut _long_storage as *mut c_long as *mut c_char,
+                        0,
+                        raw::BFLD_LONG,
+                    )
+                }
                 UbfValue::Char(val) => (val as *mut i8 as *mut c_char, 0, raw::BFLD_CHAR),
                 UbfValue::Float(val) => (val as *mut f32 as *mut c_char, 0, raw::BFLD_FLOAT),
                 UbfValue::Double(val) => (val as *mut f64 as *mut c_char, 0, raw::BFLD_DOUBLE),
@@ -1409,6 +1434,10 @@ impl<'ctx> TypedUbf<'ctx> {
     /// # Arguments
     ///
     /// - `text`: Text in native field-name/value format to read into this buffer.
+    ///
+    /// Uses native escape, comment, command and nested-buffer parsing. The
+    /// destination must have enough capacity; an error may leave earlier fields
+    /// updated. Embedded NULs must be encoded as native hexadecimal escapes.
     pub fn bextread(&mut self, text: &str) -> UbfResult<()> {
         self.inner.ctx.bextreadcb_value(self, text)
     }

@@ -262,41 +262,36 @@ unsafe extern "C" fn bfprint_output_callback(
     raw::EXSUCCEED as c_int
 }
 
-/// Copy the next available input bytes into the native reader’s destination.
-///
-/// # Arguments
-///
-/// - `buffer`: Writable destination with at least `bufsz` bytes.
-/// - `bufsz`: Destination capacity in bytes.
-/// - `dataptr1`: Non-null pointer to `ReadState`, whose offset advances as bytes are copied.
+/// Supply one complete, NUL-terminated line to native `Bextreadcb`.
 ///
 /// # Safety
-///
-/// The output must be writable for `bufsz` bytes and userdata must exclusively reference a live
-/// `ReadState`.
+/// `buffer` must hold `bufsz` writable bytes, and `dataptr1` must exclusively
+/// reference a live `ReadState`. The input has already been checked for NULs.
 unsafe extern "C" fn read_callback(
     buffer: *mut c_char,
     bufsz: c_long,
     dataptr1: *mut c_void,
 ) -> c_long {
     if buffer.is_null() || dataptr1.is_null() || bufsz <= 0 {
-        return 0;
+        return raw::EXFAIL as c_long;
     }
-
     let state = &mut *(dataptr1 as *mut ReadState<'_>);
-    if state.offset >= state.bytes.len() {
+    let remaining = &state.bytes[state.offset..];
+    if remaining.is_empty() {
         return 0;
     }
-
-    let remaining = state.bytes.len() - state.offset;
-    let to_copy = remaining.min(bufsz as usize);
-    std::ptr::copy_nonoverlapping(
-        state.bytes[state.offset..].as_ptr(),
-        buffer as *mut u8,
-        to_copy,
-    );
-    state.offset += to_copy;
-    to_copy as c_long
+    let len = remaining
+        .iter()
+        .position(|&byte| byte == b'\n')
+        .map_or(remaining.len(), |end| end + 1);
+    // Splitting an oversized line would parse its tail as a new field.
+    if len >= bufsz as usize {
+        return raw::EXFAIL as c_long;
+    }
+    std::ptr::copy_nonoverlapping(remaining.as_ptr(), buffer.cast(), len);
+    *buffer.add(len) = 0;
+    state.offset += len;
+    (len + 1) as c_long
 }
 
 /// Append a native binary-output chunk to the Rust output vector.
@@ -1109,148 +1104,39 @@ impl AtmiCtx {
         self.ubf_unit_result(rc)
     }
 
-    /// Read UBF text with the Rust parser, falling back to native parsing when needed.
+    /// Read the entire input once with native UBF text parsing.
     ///
-    /// # Arguments
-    ///
-    /// - `ubf`: Destination UBF whose fields or native header may be changed.
-    /// - `text`: UBF text with a field label and value separated by a tab on each line.
+    /// The destination must have sufficient capacity. Like `Bextread`, errors
+    /// can leave earlier fields updated; a failed parse is never replayed.
     pub(crate) fn bextreadcb_value(&self, ubf: &mut TypedUbf<'_>, text: &str) -> UbfResult<()> {
-        if self.bextread_text_rust(ubf, text).is_ok() {
-            return Ok(());
-        }
-
-        let normalized = self.normalize_bextread_text(text);
-        let mut data = CString::new(normalized)
-            .map_err(|e| crate::UbfError::new(crate::UbfError::BEINVAL, e.to_string()))?
-            .into_bytes_with_nul();
-        let mode = CString::new("r").expect("static mode has no NUL");
-        let file =
-            unsafe { libc::fmemopen(data.as_mut_ptr() as *mut c_void, data.len(), mode.as_ptr()) };
-        if file.is_null() {
+        if text.as_bytes().contains(&0) {
             return Err(crate::UbfError::new(
-                crate::UbfError::BEUNIX,
-                "failed to open memory stream",
+                crate::UbfError::BEINVAL,
+                "UBF text contains NUL; use native hexadecimal escapes",
             ));
         }
-
+        let mut state = ReadState {
+            bytes: text.as_bytes(),
+            offset: 0,
+        };
         #[cfg(not(feature = "ctx-send"))]
-        let rc = unsafe { raw::Bextread(ubf.as_ubfh(), file as *mut raw::FILE) };
-
+        let rc = unsafe {
+            raw::Bextreadcb(
+                ubf.as_ubfh(),
+                Some(read_callback),
+                &mut state as *mut ReadState<'_> as *mut c_void,
+            )
+        };
         #[cfg(feature = "ctx-send")]
-        let rc = unsafe { raw::OBextread(self.c_ctx_ptr(), ubf.as_ubfh(), file as *mut raw::FILE) };
-
-        unsafe {
-            libc::fclose(file);
-        }
-
+        let rc = unsafe {
+            raw::OBextreadcb(
+                self.c_ctx_ptr(),
+                ubf.as_ubfh(),
+                Some(read_callback),
+                &mut state as *mut ReadState<'_> as *mut c_void,
+            )
+        };
         self.ubf_unit_result(rc)
-    }
-
-    /// Append tab-separated scalar field values, growing the destination as needed.
-    ///
-    /// # Arguments
-    ///
-    /// - `ubf`: Destination UBF whose fields or native header may be changed.
-    /// - `text`: UBF text with a field label and value separated by a tab on each line.
-    fn bextread_text_rust(&self, ubf: &mut TypedUbf<'_>, text: &str) -> UbfResult<()> {
-        for line in text.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let (field, value) = line.split_once('\t').ok_or_else(|| {
-                crate::UbfError::new(crate::UbfError::BEINVAL, "missing field/value separator")
-            })?;
-            let bfldid = self.bextread_field_id(field)?;
-            match self.bfldtype(bfldid)? {
-                UbfFieldType::Short => ubf.badd(
-                    bfldid,
-                    value.parse::<i16>().map_err(|e| {
-                        crate::UbfError::new(crate::UbfError::BEINVAL, e.to_string())
-                    })?,
-                    true,
-                )?,
-                UbfFieldType::Long => ubf.badd(
-                    bfldid,
-                    value.parse::<i64>().map_err(|e| {
-                        crate::UbfError::new(crate::UbfError::BEINVAL, e.to_string())
-                    })?,
-                    true,
-                )?,
-                UbfFieldType::Char => {
-                    let ch = value.as_bytes().first().copied().unwrap_or_default() as i8;
-                    ubf.badd(bfldid, ch, true)?
-                }
-                UbfFieldType::Float => ubf.badd(
-                    bfldid,
-                    value.parse::<f32>().map_err(|e| {
-                        crate::UbfError::new(crate::UbfError::BEINVAL, e.to_string())
-                    })?,
-                    true,
-                )?,
-                UbfFieldType::Double => ubf.badd(
-                    bfldid,
-                    value.parse::<f64>().map_err(|e| {
-                        crate::UbfError::new(crate::UbfError::BEINVAL, e.to_string())
-                    })?,
-                    true,
-                )?,
-                UbfFieldType::String => ubf.badd(bfldid, value, true)?,
-                UbfFieldType::Carray => ubf.badd(bfldid, value.as_bytes().to_vec(), true)?,
-                UbfFieldType::Ptr | UbfFieldType::Ubf | UbfFieldType::View => {
-                    return Err(crate::UbfError::new(
-                        crate::UbfError::BEINVAL,
-                        "BExtRead for ptr/ubf/view fields is not supported by Rust parser",
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Resolve a field name or a printed `((BFLDID32)number)` identifier.
-    ///
-    /// # Arguments
-    ///
-    /// - `field`: Field name or printed numeric field identifier.
-    fn bextread_field_id(&self, field: &str) -> UbfResult<i32> {
-        if let Some(id) = field
-            .strip_prefix("((BFLDID32)")
-            .and_then(|s| s.strip_suffix(')'))
-            .and_then(|id| id.parse::<i32>().ok())
-        {
-            return Ok(id);
-        }
-        self.bfldid(field)
-    }
-
-    /// Replace resolvable numeric field labels with names for native text parsing.
-    ///
-    /// # Arguments
-    ///
-    /// - `text`: UBF text with a field label and value separated by a tab on each line.
-    fn normalize_bextread_text(&self, text: &str) -> String {
-        let mut out = String::with_capacity(text.len());
-        for line in text.lines() {
-            if let Some((field, rest)) = line.split_once('\t') {
-                let name = field
-                    .strip_prefix("((BFLDID32)")
-                    .and_then(|s| s.strip_suffix(')'))
-                    .and_then(|id| id.parse::<i32>().ok())
-                    .and_then(|id| self.bfname(id as BFLDID).ok());
-                if let Some(name) = name {
-                    out.push_str(&name);
-                } else {
-                    out.push_str(field);
-                }
-                out.push('\t');
-                out.push_str(rest);
-            } else {
-                out.push_str(line);
-            }
-            out.push('\n');
-        }
-        out
     }
 
     /// Return whether two UBF buffers contain the same fields and values.

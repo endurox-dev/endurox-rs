@@ -60,7 +60,7 @@ pub use async_atmi::{AsyncIoAtmiCtx, AsyncIoReplyDriver};
 #[cfg(feature = "tokio")]
 pub use async_atmi::{TokioAtmiCtx, TokioReplyDriver};
 pub use atmictx::AtmiCtx;
-pub use atmictx_log::LogLevel;
+pub use atmictx_log::{LogLevel, ThreadLogger};
 pub use atmictx_srv::{
     PollerEvent, RustBeforePollCallback, RustPeriodCallback, RustPollerCallback,
     RustServerDoneHook, RustServerInitHook, RustServerThreadDoneHook, RustServerThreadInitHook,

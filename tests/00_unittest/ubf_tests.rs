@@ -1597,3 +1597,5 @@ mod script_buffer_tests;
 
 #[path = "api_additions.rs"]
 mod api_additions;
+
+mod binding_regressions;
