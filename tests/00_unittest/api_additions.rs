@@ -289,3 +289,55 @@ fn dlm_preparation_grows_nested_requests_and_preserves_identity_rules() {
         AtmiError::TPEINVAL
     );
 }
+
+#[test]
+fn saga_controls_preserve_values_after_invalid_setters() {
+    use endurox_rs::{
+        TpSagaCtl, TpTxStatus, NDRX_SAGA_PAYLOAD_MAX, NDRX_SAGA_URL_MAX, TPSAGA_NOLOCK, TPTXS_BRXID,
+    };
+    let mut ctl = TpSagaCtl::default();
+    ctl.set_flags(TPSAGA_NOLOCK).unwrap();
+    ctl.set_saga_name("RS")
+        .unwrap()
+        .set_saga_key("participant")
+        .unwrap()
+        .set_commit_url("xatmi://COMMIT")
+        .unwrap()
+        .set_rollback_url("xatmi://CANCEL")
+        .unwrap()
+        .set_status_url("xatmi://STATUS")
+        .unwrap()
+        .set_forget_url("xatmi://FORGET")
+        .unwrap()
+        .set_after_url("xatmi://AFTER")
+        .unwrap()
+        .set_content_type("application/octet-stream")
+        .unwrap()
+        .set_payload(&[0, 255, 7])
+        .unwrap();
+    assert!(ctl.set_saga_name("bad\0name").is_err());
+    assert!(ctl
+        .set_commit_url(&"x".repeat(NDRX_SAGA_URL_MAX + 1))
+        .is_err());
+    assert!(ctl
+        .set_payload(&vec![0; NDRX_SAGA_PAYLOAD_MAX + 1])
+        .is_err());
+    assert_eq!(ctl.saga_name(), "RS");
+    assert_eq!(ctl.commit_url(), "xatmi://COMMIT");
+    assert_eq!(ctl.payload(), &[0, 255, 7]);
+    assert_eq!(ctl.flags(), TPSAGA_NOLOCK);
+    ctl.set_payload(&[]).unwrap();
+    assert!(ctl.payload().is_empty());
+    let mut status = TpTxStatus::default();
+    status
+        .set_flags(TPTXS_BRXID)
+        .unwrap()
+        .set_branch_xid("branch")
+        .unwrap()
+        .set_timeout(60)
+        .unwrap();
+    assert!(status.set_branch_xid(&"x".repeat(1024)).is_err());
+    assert!(status.set_timeout(0).is_err());
+    assert_eq!(status.branch_xid(), "branch");
+    assert_eq!(status.timeout(), 60);
+}

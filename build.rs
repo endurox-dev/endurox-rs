@@ -77,6 +77,7 @@ fn main() {
 
         let mut builder = bindgen::Builder::default()
             .header(wrapper.to_string_lossy())
+            .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
             .layout_tests(false)
             // <string.h> arrives transitively through the Enduro/X headers, so
             // bindgen would redeclare libc's mem*/str* symbols. Rust code calls

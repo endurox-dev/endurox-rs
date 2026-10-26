@@ -403,17 +403,7 @@ impl AtmiCtx {
 
         #[cfg(endurox_pollable)]
         {
-            #[cfg(not(feature = "ctx-send"))]
-            let reply_fd = unsafe { raw::tpext_getreplyqfd() };
-
-            #[cfg(feature = "ctx-send")]
-            let reply_fd = unsafe { raw::Otpext_getreplyqfd(self.c_ctx_ptr()) };
-
-            if reply_fd < 0 {
-                Err(self.atmi_last_error())
-            } else {
-                Ok(reply_fd)
-            }
+            self.tpext_getreplyqfd()
         }
     }
 
@@ -1228,7 +1218,7 @@ impl AtmiCtx {
         }
     }
 
-    /// Encode a typed buffer in Enduro/X export format using a 64 KiB output area.
+    /// Encode a typed buffer using a dynamically sized native JSON allocation.
     ///
     /// # Arguments
     ///
@@ -1237,43 +1227,78 @@ impl AtmiCtx {
     ///   at 0, so they derive (STRING) or ignore the length.
     /// - `flags`: `0` for JSON export data, or `TPEX_STRING` for its base64 encoding.
     pub fn tpexport(&self, ibuf: &TypedBuffer<'_>, flags: i64) -> AtmiResult<Vec<u8>> {
-        let mut out = vec![0u8; 65536];
-        let mut olen = out.len() as c_long;
-
-        // CARRAY is the only non-self-describing type: it needs its payload byte
-        // count, tracked in `len()`. The self-describing types (UBF/VIEW/STRING)
-        // keep `len()` at 0, so this passes 0 and they derive (STRING, via the
-        // terminating NUL) or ignore the length.
-        let ilen = ibuf.len() as c_long;
-
+        let flags = c_long::try_from(flags)
+            .map_err(|_| AtmiError::new(raw::TPEINVAL, "flags exceed native long"))?;
+        let mut out: *mut c_char = std::ptr::null_mut();
+        let mut olen: c_long = 0;
+        let ilen = c_long::try_from(ibuf.len())
+            .map_err(|_| AtmiError::new(raw::TPEINVAL, "buffer length exceeds native long"))?;
         #[cfg(not(feature = "ctx-send"))]
-        let rc = unsafe {
-            raw::tpexport(
-                ibuf.as_ptr(),
-                ilen,
-                out.as_mut_ptr() as *mut c_char,
-                &mut olen,
-                flags as c_long,
-            )
-        };
-
+        let rc = unsafe { raw::tpexport2(ibuf.as_ptr(), ilen, &mut out, &mut olen, flags) };
         #[cfg(feature = "ctx-send")]
         let rc = unsafe {
-            raw::Otpexport(
+            raw::Otpexport2(
                 self.c_ctx_ptr(),
                 ibuf.as_ptr(),
                 ilen,
-                out.as_mut_ptr() as *mut c_char,
+                &mut out,
                 &mut olen,
-                flags as c_long,
+                flags,
             )
         };
-
-        if rc == raw::EXSUCCEED as c_int {
-            out.truncate(olen as usize);
-            Ok(out)
+        // Capture the native error before releasing any returned allocation.
+        let result = if rc == raw::EXSUCCEED as c_int {
+            // Native length includes the terminating NUL, as did tpexport.
+            Ok(unsafe { std::slice::from_raw_parts(out.cast::<u8>(), olen as usize) }.to_vec())
         } else {
             Err(self.atmi_last_error())
+        };
+        if !out.is_null() {
+            unsafe { raw::exjson_free_serialized_string(out) };
+        }
+        result
+    }
+
+    /// Compare typed values, returning -1, 0 or 1 for ordering. Native -2 is an error.
+    /// `None` represents a NULL typed buffer; lengths come from each buffer.
+    /// `flags` is reserved and must be zero.
+    pub fn tpbufcmp(
+        &self,
+        left: Option<&TypedBuffer<'_>>,
+        right: Option<&TypedBuffer<'_>>,
+        flags: i64,
+    ) -> AtmiResult<i32> {
+        let flags = c_long::try_from(flags)
+            .map_err(|_| AtmiError::new(raw::TPEINVAL, "flags exceed native long"))?;
+        let lp = left.map_or(std::ptr::null_mut(), |b| b.as_ptr());
+        let rp = right.map_or(std::ptr::null_mut(), |b| b.as_ptr());
+        let ll = c_long::try_from(left.map_or(0, |b| b.len()))
+            .map_err(|_| AtmiError::new(raw::TPEINVAL, "left buffer exceeds native long"))?;
+        let rl = c_long::try_from(right.map_or(0, |b| b.len()))
+            .map_err(|_| AtmiError::new(raw::TPEINVAL, "right buffer exceeds native long"))?;
+        #[cfg(not(feature = "ctx-send"))]
+        let rc = unsafe { raw::tpbufcmp(lp, ll, rp, rl, flags) };
+        #[cfg(feature = "ctx-send")]
+        let rc = unsafe { raw::Otpbufcmp(self.c_ctx_ptr(), lp, ll, rp, rl, flags) };
+        if rc == -2 {
+            Err(self.atmi_last_error())
+        } else {
+            Ok(rc)
+        }
+    }
+
+    /// Borrow the native reply queue descriptor. Never close it or change its flags.
+    /// Unsupported backends return the native error; use only pollable backends
+    /// for event-loop integration.
+    pub fn tpext_getreplyqfd(&self) -> AtmiResult<i32> {
+        #[cfg(not(feature = "ctx-send"))]
+        let fd = unsafe { raw::tpext_getreplyqfd() };
+        #[cfg(feature = "ctx-send")]
+        let fd = unsafe { raw::Otpext_getreplyqfd(self.c_ctx_ptr()) };
+        if fd < 0 {
+            Err(self.atmi_last_error())
+        } else {
+            Ok(fd)
         }
     }
 

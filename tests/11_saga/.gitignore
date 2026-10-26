@@ -1,0 +1,12 @@
+/Cargo.lock
+/target/
+/bin/
+/log/
+/tmp/
+/ubftab/
+/conf/app.ini
+/conf/settest*
+/RM*/
+/tm-log/
+/test.out
+ULOG*

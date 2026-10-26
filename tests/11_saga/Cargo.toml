@@ -1,0 +1,11 @@
+[package]
+name = "endurox-rs-11-saga-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+endurox-rs = { path = "../.." }
+
+[features]
+ctx-send = ["endurox-rs/ctx-send"]

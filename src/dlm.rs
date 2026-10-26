@@ -501,3 +501,6 @@ pub const NDRX_DLM_MEMBERSHIP_EV: &str = native_text(raw::NDRX_DLM_MEMBERSHIP_EV
 pub const NDRX_DLM_STATE_EV: &str = native_text(raw::NDRX_DLM_STATE_EV);
 /// Native `NDRX_DLM_XFER_EV` text.
 pub const NDRX_DLM_XFER_EV: &str = native_text(raw::NDRX_DLM_XFER_EV);
+
+/// Maximum DLM space name length, excluding the NUL terminator.
+pub const NDRX_DLMSPACE_MAX: usize = raw::NDRX_DLMSPACE_MAX as usize;

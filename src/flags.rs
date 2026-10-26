@@ -367,3 +367,211 @@ pub const NDRX_VIEW_COMPFLAGS_LEN: usize = raw::NDRX_VIEW_COMPFLAGS_LEN as usize
 // Standard-utility error message size.
 /// Maximum native NSTD error message length, excluding its terminator.
 pub const MAX_ERROR_LEN: usize = raw::MAX_ERROR_LEN as usize;
+
+/// Maximum Saga profile name length in `[@saga/<name>]`, excluding NUL.
+pub const NDRX_SAGA_NAME_MAX: usize = raw::NDRX_SAGA_NAME_MAX as usize;
+
+/// Maximum raw bytes of the Saga payload
+pub const NDRX_SAGA_PAYLOAD_MAX: usize = raw::NDRX_SAGA_PAYLOAD_MAX as usize;
+
+/// Maximum payload MIME type length, excluding NUL
+pub const NDRX_SAGA_MIME_MAX: usize = raw::NDRX_SAGA_MIME_MAX as usize;
+
+/// Maximum length of a TPSAGACTL branch URL, excluding NUL
+pub const NDRX_SAGA_URL_MAX: usize = raw::NDRX_SAGA_URL_MAX as usize;
+
+/// Maximum Saga idempotency key length (TPSAGACTL.saga_key), excluding NUL; as a URL, so that
+/// a participant URL may be the key
+pub const NDRX_SAGA_KEY_MAX: usize = raw::NDRX_SAGA_KEY_MAX as usize;
+
+/// TMSAGA_ACTION value: the commit action is requested
+pub const NDRX_SAGA_ACTION_COMMIT: u8 = raw::NDRX_SAGA_ACTION_COMMIT;
+
+/// TMSAGA_ACTION value: the rollback action is requested
+pub const NDRX_SAGA_ACTION_ROLLBACK: u8 = raw::NDRX_SAGA_ACTION_ROLLBACK;
+
+/// TMSAGA_ACTION value: the forget action after a heuristic result
+pub const NDRX_SAGA_ACTION_FORGET: u8 = raw::NDRX_SAGA_ACTION_FORGET;
+
+/// TMSAGA_ACTION value: the after action, notifies the final outcome
+pub const NDRX_SAGA_ACTION_AFTER: u8 = raw::NDRX_SAGA_ACTION_AFTER;
+
+/// TMSAGA_ACTION value: status query of the accepted action given in TMSAGA_STS_ACTION,
+/// TMSAGA_URL is the status URL
+pub const NDRX_SAGA_ACTION_STATUS: u8 = raw::NDRX_SAGA_ACTION_STATUS;
+
+/// tpurcode with TPFAIL of a commit or rollback action or status query: the action is
+/// accepted and completes asynchronously; TMSAGA_STS_URL of the reply may give the status URL
+pub const NDRX_SAGA_URC_ACCEPTED: i64 = raw::NDRX_SAGA_URC_ACCEPTED as i64;
+
+/// tpurcode with TPFAIL of a status query: the participant does not know the action, it is
+/// sent again
+pub const NDRX_SAGA_URC_UNKNOWN: i64 = raw::NDRX_SAGA_URC_UNKNOWN as i64;
+
+/// TMSAGA_OUTCOME of the after action: committed
+pub const NDRX_SAGA_OUTCOME_CLOSED: &str = crate::dlm::native_text(raw::NDRX_SAGA_OUTCOME_CLOSED);
+
+/// TMSAGA_OUTCOME of the after action: rolled back
+pub const NDRX_SAGA_OUTCOME_CANCELLED: &str =
+    crate::dlm::native_text(raw::NDRX_SAGA_OUTCOME_CANCELLED);
+
+/// TMSAGA_OUTCOME of the after action: committed with heuristic result
+pub const NDRX_SAGA_OUTCOME_FAILED_TO_CLOSE: &str =
+    crate::dlm::native_text(raw::NDRX_SAGA_OUTCOME_FAILED_TO_CLOSE);
+
+/// TMSAGA_OUTCOME of the after action: rolled back with heuristic result
+pub const NDRX_SAGA_OUTCOME_FAILED_TO_CANCEL: &str =
+    crate::dlm::native_text(raw::NDRX_SAGA_OUTCOME_FAILED_TO_CANCEL);
+
+/// Decoded branch XID bytes ahead of the global XID: version, RMID, BTID
+pub const NDRX_SAGA_BRXID_HDR: usize = raw::NDRX_SAGA_BRXID_HDR as usize;
+
+/// Branch XID length, excluding NUL: header and global XID in Base64
+pub const NDRX_SAGA_BRXID_MAX: usize = raw::NDRX_SAGA_BRXID_MAX as usize;
+
+/// Registration mode: hold no Saga lock or caller-local Saga state.
+pub const TPSAGA_NOLOCK: i64 = raw::TPSAGA_NOLOCK as i64;
+
+/// Register using the global XID supplied in the control.
+pub const TPSAGA_JOINXID: i64 = raw::TPSAGA_JOINXID as i64;
+
+/// Explicitly replace a registration with the same participant key.
+pub const TPSAGA_UPDATE: i64 = raw::TPSAGA_UPDATE as i64;
+
+/// Replace only participant URLs, including during recovery.
+pub const TPSAGA_URLSONLY: i64 = raw::TPSAGA_URLSONLY as i64;
+
+/// TPTXSTATUS.xid identifies the txn.
+pub const TPTXS_XID: i64 = raw::TPTXS_XID as i64;
+
+/// TPTXSTATUS.branch_xid identifies it.
+pub const TPTXS_BRXID: i64 = raw::TPTXS_BRXID as i64;
+
+/// TPTXSTATUS.tranid identifies it.
+pub const TPTXS_TRANID: i64 = raw::TPTXS_TRANID as i64;
+
+/// not known by its TM: completed or never existed
+pub const TPTXS_STATUS_NOTFOUND: i64 = raw::TPTXS_STATUS_NOTFOUND as i64;
+
+/// transaction is active.
+pub const TPTXS_STATUS_ACTIVE: i64 = raw::TPTXS_STATUS_ACTIVE as i64;
+
+/// prepare is in progress.
+pub const TPTXS_STATUS_PREPARING: i64 = raw::TPTXS_STATUS_PREPARING as i64;
+
+/// commit decided, completion pending.
+pub const TPTXS_STATUS_COMMITTING: i64 = raw::TPTXS_STATUS_COMMITTING as i64;
+
+/// rollback decided, completion pending.
+pub const TPTXS_STATUS_ABORTING: i64 = raw::TPTXS_STATUS_ABORTING as i64;
+
+/// committed with heuristic or hazard result, being forgotten
+pub const TPTXS_STATUS_COMMIT_HEURISTIC: i64 = raw::TPTXS_STATUS_COMMIT_HEURISTIC as i64;
+
+/// rolled back with heuristic or hazard result, being forgotten
+pub const TPTXS_STATUS_ABORT_HEURISTIC: i64 = raw::TPTXS_STATUS_ABORT_HEURISTIC as i64;
+
+/// committed, kept for the Saga after actions
+pub const TPTXS_STATUS_COMMITTED: i64 = raw::TPTXS_STATUS_COMMITTED as i64;
+
+/// rolled back, kept for the Saga after actions
+pub const TPTXS_STATUS_ABORTED: i64 = raw::TPTXS_STATUS_ABORTED as i64;
+
+/// W3C version-00 traceparent length, excluding its NUL terminator.
+pub const NDRX_TRACEPARENT_LEN: usize = raw::NDRX_TRACEPARENT_LEN as usize;
+
+/// Begin a durable LRA transaction; recovery preserves active work until its deadline.
+pub const TPSAGALRA: i64 = raw::TPSAGALRA as i64;
+
+/// Process-wide tags with the lowest precedence across all contexts.
+pub const TPCTXTAG_PROCESS: i64 = raw::TPCTXTAG_PROCESS as i64;
+
+/// Context-local tags; trace changes update active spans.
+pub const TPCTXTAG_THREAD: i64 = raw::TPCTXTAG_THREAD as i64;
+
+/// Context-local tags with highest precedence, retained until explicitly cleared.
+pub const TPCTXTAG_NEXT: i64 = raw::TPCTXTAG_NEXT as i64;
+
+/// Destination: log records.
+pub const TPCTXTAG_LOG: i64 = raw::TPCTXTAG_LOG as i64;
+
+/// Destination: spans.
+pub const TPCTXTAG_TRACE: i64 = raw::TPCTXTAG_TRACE as i64;
+
+/// Apply tags to both logs and traces; the default when no destination is selected.
+pub const TPCTXTAG_BOTH: i64 = raw::TPCTXTAG_BOTH as i64;
+
+/// Make the span current in its Enduro/X context: later ATMI calls, log records and child
+/// spans use its IDs and tracestate until it ends. Active spans must be ended in LIFO order.
+/// Without the flag the span is created as a child of the current context but does not become
+/// current.
+pub const TPTRACE_F_ACTIVE: i64 = raw::TPTRACE_F_ACTIVE as i64;
+
+/// Ignore the current context and start a new trace: new trace ID, root sampling decision by
+/// the provider, no inherited tracestate.
+pub const TPTRACE_F_NEW_ROOT: i64 = raw::TPTRACE_F_NEW_ROOT as i64;
+
+/// Span status not set.
+pub const TPTRACE_STATUS_UNSET: i32 = raw::TPTRACE_STATUS_UNSET as i32;
+
+/// Span completed successfully.
+pub const TPTRACE_STATUS_OK: i32 = raw::TPTRACE_STATUS_OK as i32;
+
+/// Span failed.
+pub const TPTRACE_STATUS_ERROR: i32 = raw::TPTRACE_STATUS_ERROR as i32;
+
+/// Propagated tracestate bytes.
+pub const NDRX_TRACE_STATE_MAX: usize = raw::NDRX_TRACE_STATE_MAX as usize;
+
+/// Native scripting engine initialization string capacity, including NUL.
+pub const NDRX_SCR_INITSTRING_BUFSZ: usize = raw::NDRX_SCR_INITSTRING_BUFSZ as usize;
+
+/// Saga profile name in callback requests (STRING).
+pub const TMSAGA_NAME: i32 = raw::NDRX_RS_TMSAGA_NAME as i32;
+
+/// Configured Saga DLM space (STRING).
+pub const TMSAGA_DLMSPACE: i32 = raw::NDRX_RS_TMSAGA_DLMSPACE as i32;
+
+/// Modified Base64 participant branch identifier (STRING).
+pub const TMSAGA_BRXID: i32 = raw::NDRX_RS_TMSAGA_BRXID as i32;
+
+/// Registered callback payload bytes (CARRAY).
+pub const TMSAGA_DATA: i32 = raw::NDRX_RS_TMSAGA_DATA as i32;
+
+/// Registered payload content type (STRING).
+pub const TMSAGA_MIME: i32 = raw::NDRX_RS_TMSAGA_MIME as i32;
+
+/// Requested action, one of NDRX_SAGA_ACTION_* (CHAR).
+pub const TMSAGA_ACTION: i32 = raw::NDRX_RS_TMSAGA_ACTION as i32;
+
+/// Current callback endpoint (STRING).
+pub const TMSAGA_URL: i32 = raw::NDRX_RS_TMSAGA_URL as i32;
+
+/// Participant idempotency key (STRING).
+pub const TMSAGA_KEY: i32 = raw::NDRX_RS_TMSAGA_KEY as i32;
+
+/// Commit callback endpoint (STRING).
+pub const TMSAGA_CMT_URL: i32 = raw::NDRX_RS_TMSAGA_CMT_URL as i32;
+
+/// Compensation callback endpoint (STRING).
+pub const TMSAGA_RBK_URL: i32 = raw::NDRX_RS_TMSAGA_RBK_URL as i32;
+
+/// Status query endpoint; an accepted action may return a new URL (STRING).
+pub const TMSAGA_STS_URL: i32 = raw::NDRX_RS_TMSAGA_STS_URL as i32;
+
+/// Forget callback endpoint (STRING).
+pub const TMSAGA_FGT_URL: i32 = raw::NDRX_RS_TMSAGA_FGT_URL as i32;
+
+/// Final outcome notification endpoint (STRING).
+pub const TMSAGA_AFT_URL: i32 = raw::NDRX_RS_TMSAGA_AFT_URL as i32;
+
+/// Final outcome, one of NDRX_SAGA_OUTCOME_* (STRING).
+pub const TMSAGA_OUTCOME: i32 = raw::NDRX_RS_TMSAGA_OUTCOME as i32;
+
+/// Action whose asynchronous result is queried (CHAR).
+pub const TMSAGA_STS_ACTION: i32 = raw::NDRX_RS_TMSAGA_STS_ACTION as i32;
+/// Optional Saga registration lifetime in seconds; zero adds no limit.
+pub const TMSAGA_TIMEOUT: i32 = raw::NDRX_RS_TMSAGA_TIMEOUT as i32;
+
+/// Maximum base58-encoded DLM client identifier length, excluding NUL.
+pub const NDRX_B58_CIDMAX: usize = raw::NDRX_B58_CIDMAX as usize;

@@ -3,6 +3,7 @@
 #include <ondebug.h>
 #include <Exfields.h>
 #include <xatmi.h>
+#include <exparson.h>
 #include <oatmi.h>
 #include <oatmisrv.h>
 #include <oatmisrv_integra.h>
@@ -56,4 +57,24 @@ enum {
     NDRX_RS_BFIRSTFLDID = BFIRSTFLDID,
     NDRX_RS_BBADFLDOCC = BBADFLDOCC,
     NDRX_RS_BFLDOCCMAX = BFLDOCCMAX,
+};
+
+/* Native Saga callback fields used by XATMI participant services. */
+enum {
+    NDRX_RS_TMSAGA_NAME = TMSAGA_NAME, /**< Native TMSAGA_NAME field identifier. */
+    NDRX_RS_TMSAGA_DLMSPACE = TMSAGA_DLMSPACE, /**< Native TMSAGA_DLMSPACE field identifier. */
+    NDRX_RS_TMSAGA_BRXID = TMSAGA_BRXID, /**< Native TMSAGA_BRXID field identifier. */
+    NDRX_RS_TMSAGA_DATA = TMSAGA_DATA, /**< Native TMSAGA_DATA field identifier. */
+    NDRX_RS_TMSAGA_MIME = TMSAGA_MIME, /**< Native TMSAGA_MIME field identifier. */
+    NDRX_RS_TMSAGA_ACTION = TMSAGA_ACTION, /**< Native TMSAGA_ACTION field identifier. */
+    NDRX_RS_TMSAGA_URL = TMSAGA_URL, /**< Native TMSAGA_URL field identifier. */
+    NDRX_RS_TMSAGA_KEY = TMSAGA_KEY, /**< Native TMSAGA_KEY field identifier. */
+    NDRX_RS_TMSAGA_CMT_URL = TMSAGA_CMT_URL, /**< Native TMSAGA_CMT_URL field identifier. */
+    NDRX_RS_TMSAGA_RBK_URL = TMSAGA_RBK_URL, /**< Native TMSAGA_RBK_URL field identifier. */
+    NDRX_RS_TMSAGA_STS_URL = TMSAGA_STS_URL, /**< Native TMSAGA_STS_URL field identifier. */
+    NDRX_RS_TMSAGA_FGT_URL = TMSAGA_FGT_URL, /**< Native TMSAGA_FGT_URL field identifier. */
+    NDRX_RS_TMSAGA_AFT_URL = TMSAGA_AFT_URL, /**< Native TMSAGA_AFT_URL field identifier. */
+    NDRX_RS_TMSAGA_OUTCOME = TMSAGA_OUTCOME, /**< Native TMSAGA_OUTCOME field identifier. */
+    NDRX_RS_TMSAGA_STS_ACTION = TMSAGA_STS_ACTION, /**< Native TMSAGA_STS_ACTION field identifier. */
+    NDRX_RS_TMSAGA_TIMEOUT = TMSAGA_TIMEOUT, /**< Registration lifetime, seconds */
 };

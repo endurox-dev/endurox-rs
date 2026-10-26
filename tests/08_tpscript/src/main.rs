@@ -5,6 +5,9 @@ use endurox_rs::{
 };
 use std::cell::Cell;
 use std::rc::Rc;
+use std::time::Instant;
+#[path = "../../common/test_duration.rs"]
+mod test_duration;
 
 fn load(vm: &mut TpScrVm<'_>, name: &str, body: &str) -> TpScrResult<()> {
     vm.tpscrloadstr(
@@ -149,6 +152,7 @@ fn run() -> TpScrResult<()> {
     load(&mut vm, "failure", "rc, output = fail(None, None, 0)\n    return {'rc':rc,'out':output,'screrrno':tpscrerrno(),'error':tpscrerror()}")?;
     let error = vm.tpscrexec("failure", &mut buffers, 0).unwrap_err();
     assert_eq!(error.script_code, 7777);
+    assert_eq!(error.atmi_code, AtmiError::TPESVCFAIL);
     assert!(error.message.contains("Rust callback error"));
     assert_eq!(
         buffers.get(S::Output)?.unwrap().as_bytes(),
@@ -222,13 +226,28 @@ fn run() -> TpScrResult<()> {
         0,
     )?;
     load(&mut vm, "nested", "rc, output = grow(incoming, incoming, flags)\n    if rc != 0: return rc\n    assert incoming['data'][FIELD][0] == 999\n    return output")?;
-    vm.tpscrexec("nested", &mut buffers, 0)?;
-    assert!(buffers.get(S::Input)?.unwrap().tptypes()?.size >= 131072);
-    assert_eq!(
-        TypedUbf::from_typed(buffers.take(S::Output)?.unwrap())?.bget_long(f::T_LONG_FLD, 0)?,
-        999
+    let duration = test_duration::test_duration();
+    let started = Instant::now();
+    let mut iterations = 0;
+    loop {
+        buffers.set(S::Input, Some(ctx.tpalloc_ubf(128)?.into_inner()))?;
+        buffers.alias(S::Param, S::Input)?;
+        vm.tpscrexec("nested", &mut buffers, 0)?;
+        assert!(buffers.get(S::Input)?.unwrap().tptypes()?.size >= 131072);
+        assert_eq!(
+            TypedUbf::from_typed(buffers.take(S::Output)?.unwrap())?.bget_long(f::T_LONG_FLD, 0)?,
+            999
+        );
+        assert!(buffers.get(S::Input)?.is_none());
+        iterations += 1;
+        if started.elapsed() >= duration {
+            break;
+        }
+    }
+    println!(
+        "Nested scripting: {iterations} iterations in {:.3}s",
+        started.elapsed().as_secs_f64()
     );
-    assert!(buffers.get(S::Input)?.is_none());
 
     vm.tpscrregcb(
         "panic_cb",

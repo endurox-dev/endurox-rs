@@ -41,9 +41,11 @@ pub mod dlm;
 mod errors;
 mod flags;
 mod nstdutil;
+mod saga;
 mod script_buffers;
 mod tpscript;
 mod tpsvcinfo;
+mod trace;
 mod typed_buf;
 mod typed_ubf;
 mod typed_view;
@@ -52,6 +54,7 @@ mod ubf_complex;
 mod ubf_search;
 mod ubf_serde;
 mod view_serde;
+mod xa;
 
 #[cfg(feature = "async")]
 pub use async_atmi::{AsyncAtmiCtx, AsyncReplyDriver};
@@ -87,7 +90,9 @@ pub const NDRX_SCR_INITSTRING_PYTHON: &str = dlm::native_text(raw::NDRX_SCR_INIT
 /// Initial `tpscr_cfg_t` structure version. [`TpScrCfg::new`] stamps this so the plugin
 /// interprets the configuration's fields.
 pub const NDRX_SCR_CFG_VERSION_1: i32 = raw::NDRX_SCR_CFG_VERSION_1 as i32;
+pub use saga::{TpSagaCtl, TpTxStatus, Xid};
 pub use tpsvcinfo::TpSvcInfo;
+pub use trace::TpTraceSpan;
 pub use typed_buf::{TpTypeInfo, TypedBuffer};
 pub use typed_ubf::{
     BorrowedBuffer, BorrowedUbf, FastAdder, IntoUbfValue, TypedUbf, UbfField, UbfGetValue,
@@ -223,6 +228,12 @@ impl TpQCtl {
     pub fn clear_flags(&mut self, flags: i64) -> &mut Self {
         self.inner.flags &= !(flags as std::os::raw::c_long);
         self
+    }
+
+    /// Return the queued message's original W3C traceparent, or empty when absent.
+    /// This field is output-only; `TPQKEEPORIG` preserves originator metadata.
+    pub fn traceparent(&self) -> String {
+        fixed_cstr_to_string(&self.inner.traceparent)
     }
 
     /// Return the configured time at which the message becomes available.

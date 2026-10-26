@@ -1,5 +1,91 @@
 Rust bindings for Enduro/X.
 
+# Enduro/X v9 APIs
+
+The binding requires matching Enduro/X v9 headers and libraries. Rebuild all
+consumers; suspended transaction tokens from v8 must not be reused with v9.
+
+| Area | Rust API |
+| --- | --- |
+| Saga participants | `tpsagaenlist`, `tpsagaend`, `tpsagaget`, `tpsagaupdate`, `tpsagaleave`, `TpSagaCtl` |
+| Transaction recovery | `tptxstatus`, `tptxrenew`, `TpTxStatus` |
+| Global identifiers | `Xid`, `tpxid_to_string`, `tpxid_from_string` |
+| Named XA resources | `tpopen2`, `tprmopen`, `tprmclose`, `tprmstart`, `tprmend`, `tpgetconnrm` |
+| Tracing | `tptracecontextset/get`, `tptracestateset/get`, `tptracespanbegin/end`, `tptraceevent` |
+| Context tags | `tpcontexttagset`, `tpcontexttagclear`, `tpcontexttagclearall` |
+| Buffer/reply utilities | `tpbufcmp`, dynamically sized `tpexport`, `tpext_getreplyqfd` |
+| Queue metadata | Output-only `TpQCtl::traceparent` |
+
+A Saga is a pair of actions for work which is committed locally, outside of
+the two-phase commit, for example a call to a web service. When the global
+transaction commits, `tmsrv` calls the commit action, which confirms the work;
+when it is rolled back or times out, `tmsrv` calls the rollback action, which
+compensates it. See `tpsagaenlist(3)` for the full description.
+
+A participant fills in a `TpSagaCtl`, registers it with `tpsagaenlist()` inside
+the global transaction, does its local work and calls `tpsagaend()`. The
+control keeps its own copy of the payload (up to 4096 bytes). The DLM and
+scripting types work the same way: fields are set and read through methods.
+
+```rust,no_run
+use endurox_rs::{AtmiCtx, AtmiResult, TpSagaCtl, TpTxStatus, TPTXS_BRXID};
+
+fn register(ctx: &AtmiCtx) -> AtmiResult<()> {
+    ctx.tpopen()?;
+    ctx.tpbegin(60, 0)?;
+    let mut saga = TpSagaCtl::default();
+    saga.set_saga_name("ORDER")?
+        .set_saga_key("order-42")?
+        .set_content_type("application/json")?
+        .set_payload(br#"{"order":42}"#)?
+        .set_commit_url("xatmi://ORDERCOMMIT")?
+        .set_rollback_url("xatmi://ORDERCANCEL")?;
+    ctx.tpsagaenlist(&mut saga, 0)?;
+    // Perform the participant's local work here; on failure, abort the transaction.
+    ctx.tpsagaend(&mut saga, 0)?;
+    let mut status = TpTxStatus::default();
+    status.set_flags(TPTXS_BRXID)?.set_branch_xid(&saga.branch_xid())?;
+    ctx.tptxstatus(&mut status, 0)?;
+    ctx.tpcommit(0)?;
+    ctx.tpclose()
+}
+```
+
+The `[@saga/ORDER]` section configures the Saga, including which URLs are
+allowed; `tmsrv` and an XA driver must be configured as well.
+`tests/11_saga/conf` contains a complete example with XATMI services as actions
+and the dynamic null XA driver. The action services receive the `TMSAGA_*`
+fields and must handle the same call being delivered more than once.
+
+`tpsagaend()` ends the local work; the participant stays registered. When the
+Saga configuration has `dlmspace`, it also releases the Saga lock of the
+Distributed Lock Manager (DLM) of the Enduro/X Enterprise Edition. Call it even
+without DLM, except with `TPSAGA_NOLOCK` in the control's flags.
+`tpsagaleave()` removes the participant, so its actions are not called.
+
+Other calls:
+
+- `tpsagaget()` reads the registered URLs and settings by branch identifier.
+- `tpsagaupdate()` replaces the payload and URLs while the transaction is
+  active; with `TPSAGA_URLSONLY` it replaces only the URLs, also while the
+  transaction completes.
+- Set a Saga key to make a repeated registration safe: the same key returns the
+  Saga already registered. A key reused with different data fails, unless
+  `TPSAGA_UPDATE` is given, which replaces the Saga's data.
+- `tptxstatus()` and `tptxrenew()` query a transaction and extend its timeout.
+  Select the transaction by global XID, branch identifier or suspended
+  `TpTranId`; these are three different identifiers.
+
+`tptracespanbegin` returns a `TpTraceSpan`, valid only in the context which
+started it; pass it to `tptracespanend`. End active spans in reverse order.
+`TPCTXTAG_NEXT` persists until explicitly cleared. Native connection pointers
+and reply descriptors are borrowed: do not free or close them.
+
+The new numbered integration suites are `09_buffer_utilities`, `10_trace`,
+`11_saga` and `12_multi_rm`. Their root Cargo tests run both default and
+`ctx-send` clients and servers. Each fast scenario runs for NDRX_TEST_DURATATION seconds (default 10). They use
+core services only and do not require a scripting provider or EE license.
+
 # Native constants
 
 Numeric XATMI and UBF constants are available at the crate root, including call
@@ -300,10 +386,17 @@ replaying the input.
 
 # Scripting plugins
 
-The native `tpscr*` API is available through `AtmiCtx::tpscrinit` and the returned
-`TpScrVm`. Enduro/X selects the language backend through `NDRX_PLUGINS`; Rust
-does not embed or link directly to Python. See the runnable
-[scripting example](examples/scripting.rs) for Python calling a Rust closure.
+An application can run scripts with typed buffers, in a similar way as it calls
+services, and scripts can call Rust closures. The interpreter comes from a
+scripting plugin configured with `NDRX_PLUGINS`, for example the Python plugin
+of `endurox-python`; Rust does not link Python itself. Create a VM with
+`AtmiCtx::tpscrinit`; the other functions are methods of the returned `TpScrVm`.
+See the runnable [scripting example](examples/scripting.rs).
+
+The [Tokio scripting example](examples/scripting_tokio.rs) creates, executes and
+closes its VM inside `spawn_blocking`, then returns owned bytes to the async task.
+Run it with `cargo run --features tokio --example scripting_tokio` in the same
+configured environment. No native buffer or VM crosses an `.await` boundary.
 
 ```rust,no_run
 use endurox_rs::{AtmiCtx, TpScrBuffers, TpScrSlot, NDRX_TPSCR_FLAT};
@@ -326,35 +419,29 @@ assert_eq!(output.as_bytes(), b"hello from Rust");
 # }
 ```
 
-- `tpscrcomp` returns `TpScrBytecode`, which exposes `as_bytes()` and frees
-  compiler storage with native `tpscrfree` on drop. `tpscrfree()` releases it
-  explicitly; `tpscrload` also accepts serialized byte slices. Compiler output
-  uses the plugin allocator, not `tpfree`.
-- `tpscrloadstr`, `tpscrload`, `tpscrunload`, `tpscrexec`, `tpscrregcb`,
-  `tpscrunregcb`, `tpscrerrno`, `tpscrerror`, and `tpscrseterror` are VM methods.
-  `tpscruninit` consumes the VM; Drop also shuts it down. Load flags
-  `NDRX_TPSCR_PACKAGE`, `NDRX_TPSCR_REPLACE`, and `NDRX_TPSCR_FLAT` are exported.
-- `TpScrBuffers` owns the parameter, input and output slots. `set` replaces one
-  slot, `alias` shares an allocation between slots, and `take` transfers its
-  ownership while clearing all aliases. `edit` and `edit_ubf` allow mutation and
-  growth while updating aliases, including during unwinding. A returned input
-  buffer is freed once, even when it also occupies the output slot.
-  Byte views expose CARRAY payloads and terminated STRING/JSON contents;
-  structured UBF/VIEW buffers keep Rust's tracked byte length at zero so their
-  padding and unused capacity are not exposed. Use typed access for those buffers.
-- Execution updates buffer pointers and lengths on success and failure. Inspect
-  the same `TpScrBuffers` after an error to retrieve a failure output or a
-  relocated input. `TpScrError` retains both native and engine error codes.
-- Registered closures may capture owned Rust state. Their callback context
-  exposes the current `AtmiCtx`, callback name/flags, script error APIs, and nested
-  `tpscrexec` when the backend supports it. Rust panics are caught and reported as
-  scripting failures. Native TLS is restored after callbacks under `ctx-send`.
-- VMs and callbacks are local to their creating thread; callbacks must be
-  synchronous. A VM borrows its `AtmiCtx`. Default configuration is `None`;
-  build a `TpScrCfg` to assert the engine, e.g.
-  `TpScrCfg::engine(NDRX_SCR_INITSTRING_PYTHON)`, and the plugin rejects a
-  mismatched engine. `TpScrCfg::from_raw` remains an unsafe escape hatch for a
-  caller-built native configuration.
+- `TpScrBuffers` holds the parameter, input and output buffers of a call.
+  `set` puts a buffer in place, `alias` uses one buffer in two places, and
+  `take` takes a buffer out. `edit` and `edit_ubf` change a buffer in place.
+  A buffer which is both input and output is freed once.
+- After `tpscrexec`, also after an error, `TpScrBuffers` holds the current
+  buffers: a script may resize or replace them, and may return output on
+  failure. `TpScrError` contains the XATMI error code and the script's error
+  code.
+- Byte views show CARRAY data and STRING/JSON text. UBF and VIEW buffers are
+  read through their typed accessors.
+- `tpscrcomp` returns `TpScrBytecode`, which is freed with `tpscrfree()` or
+  when dropped. `tpscrload` also accepts bytes saved earlier. Load only trusted
+  code.
+- `tpscruninit` closes the VM; dropping it does the same.
+- Closures may capture Rust state. In a callback, `call.context()` gives the
+  current `AtmiCtx`; a callback may also set the script error or run another
+  script of the same VM. A panic in a callback becomes a script failure.
+- A VM stays on the thread which created it (`TpScrVm` is neither `Send` nor
+  `Sync`); this is stricter than the C API. A local async task may keep it
+  across `.await`.
+- `tpscrinit(None, 0)` uses the plugin defaults.
+  `TpScrCfg::engine(NDRX_SCR_INITSTRING_PYTHON)` makes it fail when the plugin
+  is not the Python one.
 
 The scripting integration fixture checks `ENDUROX_TPSCRIPT_PLUGIN`, installed
 Python packages discoverable by interpreters on `PATH` (including user site
@@ -540,3 +627,15 @@ Executor-independent async API tests:
 ```
 $ cargo test --features async-io
 ```
+
+Stress scenarios use NDRX_TEST_DURATATION in whole seconds, defaulting to 10
+when unset or empty. Invalid, nonpositive or out-of-range values fail the test.
+Each scenario completes its current operation/cycle before stopping and reports
+the completed count and elapsed time. Waiting/recovery cases keep their bounded
+single-pass sequence. Use NDRX_TEST_DURATATION=1 for a short check or 300 for load.
+Native test clients suppress expected-error chatter; servers retain error logs.
+Use the existing Enduro/X logging configuration for a short verbose diagnosis.
+
+Saga registration accepts an optional timeout in seconds (zero adds no limit).
+The first registration bounds the global deadline and subsequent renewals;
+lookup returns the original timeout and updates preserve it.

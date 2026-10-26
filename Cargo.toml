@@ -1,6 +1,6 @@
 [package]
 name = "endurox-rs"
-version = "0.1.341"
+version = "0.1.342"
 edition = "2021"
 
 # REQUIRED by crates.io
@@ -57,3 +57,8 @@ path = "tests/00_unittest/nstd_tests.rs"
 [[test]]
 name = "boolexpr_print_tests"
 path = "tests/00_unittest/boolexpr_print_tests.rs"
+
+[[example]]
+name = "scripting_tokio"
+path = "examples/scripting_tokio.rs"
+required-features = ["tokio"]

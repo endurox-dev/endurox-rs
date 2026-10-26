@@ -274,10 +274,9 @@ These are custom `UbfSerialize`/`UbfDeserialize` and
   The VM exposes compile/load/unload/execute, callback registration and script
   error operations. `tpscruninit` consumes it; Drop also shuts it down.
   `NDRX_TPSCR_PACKAGE`, `NDRX_TPSCR_REPLACE` and `NDRX_TPSCR_FLAT` are exported.
-- The portable core declares `tpscr_cfg_t` as opaque. Use `None` for defaults;
-  `TpScrCfg::from_raw` is an unsafe backend-specific escape hatch. Do not
-  invent a Rust configuration layout or assume the Python backend's treatment
-  of configuration applies to every engine.
+- `TpScrCfg` embeds the native `tpscr_cfg_t` and exposes field accessors.
+  Use `None` for defaults or set its engine init string explicitly. The provider
+  interprets the configuration; do not invent a separate Rust field layout.
 - `tpscrcomp` returns `TpScrBytecode`. Its allocation belongs to the plugin
   and must be freed with `tpscrfree`, not `tpfree` or Rust's allocator. Bytecode
   can outlive the VM while its borrowed `AtmiCtx` remains alive.
@@ -449,3 +448,29 @@ errors in separate processes and reports skipped language coverage explicitly.
 - Keep changes focused, document unsafe ownership assumptions, and add
   regressions for observable failures rather than tests that merely repeat
   implementation details.
+
+## Saga, tracing and named resource managers
+
+- `TpSagaCtl`, `TpTxStatus` and `Xid` contain their native C records directly.
+  Accessors update those records; do not introduce per-call mappers or duplicate
+  Rust fields. Saga payload storage is separately owned at a stable address.
+  `tpsagaget` preserves its pointer/length; URL-only relocation preserves the
+  coordinator's payload. Global XIDs, branch strings and `TpTranId` differ.
+- `trace.rs` exposes native context/span/tag APIs in both context modes. Span
+  tokens belong to their originating context; active spans end in reverse order.
+  NEXT tags persist until cleared. Queue traceparent is output-only.
+- `tpexport` uses `tpexport2` and releases its output with
+  `exjson_free_serialized_string`. Capture errors before cleanup; lengths include
+  the terminator. `tpbufcmp` returns valid -1 ordering; only -2 indicates failure.
+- Suites `09_buffer_utilities`, `10_trace`, `11_saga`, `12_multi_rm` run real
+  XATMI client/server processes for NDRX_TEST_DURATATION seconds (default 10) in default and `ctx-send`
+  modes. The Saga suite requires the core dynamic null XA driver; the RM suite
+  compiles a local fixture. They need no EE service or scripting provider.
+
+Stress scenarios use NDRX_TEST_DURATATION in whole seconds, defaulting to 10
+when unset or empty. Invalid, nonpositive or out-of-range values fail the test.
+Each scenario completes its current operation/cycle before stopping and reports
+the completed count and elapsed time. Waiting/recovery cases keep their bounded
+single-pass sequence. Use NDRX_TEST_DURATATION=1 for a short check or 300 for load.
+Native test clients suppress expected-error chatter; servers retain error logs.
+Use the existing Enduro/X logging configuration for a short verbose diagnosis.

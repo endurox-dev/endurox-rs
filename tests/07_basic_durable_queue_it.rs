@@ -17,18 +17,21 @@ fn durable_queue_enqueue_dequeue_corrid_fifo() {
         run_sh.display()
     );
 
-    let output = Command::new("bash")
-        .arg(&run_sh)
-        .current_dir(&test_dir)
-        .output()
-        .expect("failed to execute run.sh");
+    for feature in ["", "ctx-send"] {
+        let output = Command::new("bash")
+            .arg(&run_sh)
+            .arg(feature)
+            .current_dir(&test_dir)
+            .output()
+            .expect("failed to execute run.sh");
 
-    if !output.status.success() {
-        panic!(
-            "run.sh failed with status={}\nstdout:\n{}\nstderr:\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        if !output.status.success() {
+            panic!(
+                "run.sh failed with status={}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }

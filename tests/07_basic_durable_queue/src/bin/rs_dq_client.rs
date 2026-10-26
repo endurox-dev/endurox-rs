@@ -1,3 +1,7 @@
+#[path = "../../../common/test_duration.rs"]
+mod test_duration;
+use std::time::Instant;
+
 use endurox_rs::{ubf_fields, AtmiCtx, AtmiError, TpQCtl, TypedUbf, TPQCORRID, TPQGETBYCORRID};
 
 const QSPACE: &str = "SAMPLESPACE";
@@ -30,6 +34,7 @@ fn run() -> Result<(), String> {
         "enqueue-dequeue" => run_enqueue_dequeue(&ctx),
         "corrid" => run_corrid(&ctx),
         "fifo" => run_fifo(&ctx),
+        "traceparent" => run_traceparent(&ctx),
         "tx-commit" => run_tx_commit(&ctx),
         "tx-abort" => run_tx_abort(&ctx),
         "tx-suspend-resume" => run_tx_suspend_resume(&ctx),
@@ -230,5 +235,39 @@ fn run_tx_suspend_resume(ctx: &AtmiCtx) -> Result<(), String> {
 
     expect_empty_queue(ctx, "tx-suspend-resume postcondition")?;
     ctx.tpclose().map_err(|e| format!("tpclose failed: {e}"))?;
+    Ok(())
+}
+
+fn run_traceparent(ctx: &AtmiCtx) -> Result<(), String> {
+    let duration = test_duration::test_duration();
+    let started = Instant::now();
+    let mut iterations = 0u64;
+    while iterations < 1 || started.elapsed() < duration {
+        let parent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01";
+        ctx.tptracecontextset(parent, 0)
+            .map_err(|e| format!("trace context: {e}"))?;
+        let buf = ctx
+            .tpalloc_carray(b"queued trace")
+            .map_err(|e| format!("allocate: {e}"))?;
+        let mut enq = TpQCtl::default();
+        ctx.tpenqueue(QSPACE, QNAME, &mut enq, &buf, 0)
+            .map_err(|e| format!("enqueue: {e}"))?;
+        let original = enq.traceparent();
+        assert_eq!(&original[3..35], &parent[3..35]);
+        ctx.tptracecontextset("", 0)
+            .map_err(|e| format!("clear trace: {e}"))?;
+        let mut deq = TpQCtl::default();
+        let result = ctx
+            .tpdequeue(QSPACE, QNAME, &mut deq, 0)
+            .map_err(|e| format!("dequeue: {e}"))?;
+        assert_eq!(deq.traceparent(), original);
+        assert_eq!(result.as_bytes(), b"queued trace");
+        iterations += 1;
+    }
+    println!(
+        "Completed {} iterations in {:.3}s",
+        iterations,
+        started.elapsed().as_secs_f64()
+    );
     Ok(())
 }

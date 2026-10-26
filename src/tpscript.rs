@@ -34,7 +34,8 @@ macro_rules! native {
 /// the updated buffers in [`TpScrBuffers`], so a failure may still carry an output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TpScrError {
-    /// Native tperrno, or zero when only the engine reported an error.
+    /// Native tperrno for C API failures (TPESVCFAIL for script failures).
+    /// Locally constructed script errors may use zero before crossing the C API.
     pub atmi_code: u32,
     /// Engine-specific error number. Callback errors are propagated through
     /// native `tpscrseterror` before the trampoline returns failure.
@@ -493,8 +494,11 @@ struct CallbackEntry {
 /// # Lifetimes and cleanup
 ///
 /// The VM borrows its [`AtmiCtx`] and is neither `Send` nor `Sync`, including with
-/// `ctx-send`. Keep VM operations and callbacks on the creating thread. Native calls
-/// are synchronous; this API does not use the async reply drivers.
+/// `ctx-send`. Keep VM operations and callbacks on the creating thread. This is
+/// stricter than the C API, which permits serial handoff of an idle VM between
+/// threads. The Rust wrapper retains a borrowed context and permits non-Send
+/// callback captures. Native calls are synchronous; this API does not use the
+/// async reply drivers. Local async tasks may retain a VM across `.await`.
 ///
 /// Dropping the VM shuts it down and releases callback state after successful native
 /// shutdown. Call [`Self::tpscruninit`] to consume the VM and inspect shutdown errors.
