@@ -177,6 +177,8 @@ pub const TPCONVCLTID: i64 = raw::TPCONVCLTID as i64;
 pub const TPCONVTRANID: i64 = raw::TPCONVTRANID as i64;
 /// Select native XID conversion; currently unsupported by Enduro/X.
 pub const TPCONVXID: i64 = raw::TPCONVXID as i64;
+/// Global XID string to participant TPTRANID.
+pub const TPCONVXIDTRAN: i64 = raw::TPCONVXIDTRAN as i64;
 /// Invalid native context sentinel; not an [`crate::AtmiCtx`] handle.
 pub const TPINVALIDCONTEXT: isize = raw::TPINVALIDCONTEXT as isize;
 /// Legacy single-context sentinel; unused by Enduro/X.
@@ -203,6 +205,8 @@ pub const TPTXCOMMITDLOG: i64 = raw::TPTXCOMMITDLOG as i64;
 pub const TPTXNOOPTIM: i64 = raw::TPTXNOOPTIM as i64;
 /// Use TMSUSPEND (keep assoc).
 pub const TPTXTMSUSPEND: i64 = raw::TPTXTMSUSPEND as i64;
+/// Participant `tpsuspend`: mark the transaction rollback-only and detach.
+pub const TPTXABORTONLY: i64 = raw::TPTXABORTONLY as i64;
 /// Open all RMs.
 pub const TPTXOPENALL: i64 = raw::TPTXOPENALL as i64;
 /// Return after commit has logged.

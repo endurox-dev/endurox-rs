@@ -21,8 +21,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let reply = TypedUbf::from_typed(reply)?;
         let branch = reply.bget_string(f::T_STRING_FLD, 0)?;
         let global = reply.bget_string(f::T_STRING_FLD, 1)?;
-        let xid = ctx.tpxid_from_string(&global)?;
-        assert_eq!(ctx.tpxid_to_string(&xid)?, global);
+        let xid = ctx.tpxidfromstring(&global)?;
+        assert_eq!(ctx.tpxidtostring(&xid)?, global);
         let mut status = TpTxStatus::default();
         status.set_flags(TPTXS_BRXID)?.set_branch_xid(&branch)?;
         ctx.tptxstatus(&mut status, 0)?;
@@ -34,6 +34,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ctx.tptxstatus(&mut status, 0)?;
         assert_eq!(status.status(), TPTXS_STATUS_ACTIVE);
         let tranid = ctx.tpsuspend(0)?;
+        // A participant joins by the global XID only; it cannot complete.
+        let rbonly = iteration % 6 == 0;
+        let participant = ctx.tptranidfromxid(&global)?;
+        ctx.tpresume(&participant, 0)?;
+        assert_eq!(ctx.tpcommit(0).unwrap_err().code, TPEPROTO);
+        assert_eq!(ctx.tpabort(0).unwrap_err().code, TPEPROTO);
+        ctx.tpsuspend(if rbonly { TPTXABORTONLY } else { 0 })?;
+        assert_eq!(ctx.tptranidfromxid(&branch).unwrap_err().code, TPEINVAL);
         status.set_tranid(&tranid).set_flags(TPTXS_TRANID)?;
         ctx.tptxstatus(&mut status, 0)?;
         let mut joined = TpSagaCtl::default();
@@ -80,6 +88,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if iteration % 3 == 1 {
             ctx.tpabort(0)?;
+        } else if rbonly {
+            assert_eq!(ctx.tpcommit(0).unwrap_err().code, TPEABORT);
         } else {
             ctx.tpcommit(0)?;
         }
@@ -89,7 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let response = TypedUbf::from_typed(response)?;
         assert_eq!(response.bget_long(f::T_LONG_FLD, 0)?, i64::from(!removed));
         if !removed {
-            let expected = if iteration % 3 == 1 {
+            let expected = if iteration % 3 == 1 || rbonly {
                 NDRX_SAGA_ACTION_ROLLBACK
             } else {
                 NDRX_SAGA_ACTION_COMMIT

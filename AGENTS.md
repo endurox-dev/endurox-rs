@@ -277,9 +277,10 @@ These are custom `UbfSerialize`/`UbfDeserialize` and
 - `TpScrCfg` embeds the native `tpscr_cfg_t` and exposes field accessors.
   Use `None` for defaults or set its engine init string explicitly. The provider
   interprets the configuration; do not invent a separate Rust field layout.
-- `tpscrcomp` returns `TpScrBytecode`. Its allocation belongs to the plugin
-  and must be freed with `tpscrfree`, not `tpfree` or Rust's allocator. Bytecode
-  can outlive the VM while its borrowed `AtmiCtx` remains alive.
+- `tpscrcomp` returns an owned `Vec<u8>`, independent of VM/context lifetime.
+  Internally copy and immediately release the plugin allocation through native
+  `tpscrfree`, never `tpfree` or Rust's allocator. Preserve the compilation/copy
+  error when cleanup also fails.
 - Core callback registration already supports userdata:
   `tpscrregcb(vm, name, callback, void *user, flags)`. The callback typedef in
   `include/expluginbase.h` receives the same pointer. Rust uses this for a stable

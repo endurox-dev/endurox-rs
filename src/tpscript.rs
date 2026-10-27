@@ -231,54 +231,6 @@ impl Default for TpScrCfg {
     }
 }
 
-/// Compiler output owned by the scripting plugin, freed with `tpscrfree`.
-///
-/// Obtain it from [`TpScrVm::tpscrcomp`] and pass `&bytecode` directly to
-/// [`TpScrVm::tpscrload`]. Use [`Self::as_bytes`] to inspect it or copy the bytes for
-/// later loading with a compatible backend. See the [bytecode example](TpScrVm#bytecode-and-load-flags).
-#[derive(Debug)]
-pub struct TpScrBytecode<'ctx> {
-    ctx: &'ctx AtmiCtx,
-    pointer: *mut c_char,
-    length: usize,
-}
-/// Read-only access and explicit release of plugin-owned bytecode.
-impl TpScrBytecode<'_> {
-    /// Borrow the plugin-owned bytecode without copying or transferring ownership.
-    pub fn as_bytes(&self) -> &[u8] {
-        if self.length == 0 {
-            &[]
-        } else {
-            unsafe { std::slice::from_raw_parts(self.pointer.cast(), self.length) }
-        }
-    }
-    /// Explicitly release compiler output. Drop also releases it automatically.
-    pub fn tpscrfree(mut self) -> TpScrResult<()> {
-        let pointer = std::mem::replace(&mut self.pointer, ptr::null_mut());
-        if native!(self.ctx, tpscrfree, Otpscrfree, pointer) == (raw::EXSUCCEED as c_int) {
-            Ok(())
-        } else {
-            Err(self.ctx.atmi_last_error().into())
-        }
-    }
-}
-/// Borrowed access to the underlying context or bytecode.
-impl AsRef<[u8]> for TpScrBytecode<'_> {
-    /// Borrow the bytecode as a byte slice.
-    fn as_ref(&self) -> &[u8] {
-        self.as_bytes()
-    }
-}
-/// Release remaining compiler output with the scripting plugin’s allocator.
-impl Drop for TpScrBytecode<'_> {
-    /// Release remaining compiler output with the scripting plugin’s allocator.
-    fn drop(&mut self) {
-        if !self.pointer.is_null() {
-            let _ = native!(self.ctx, tpscrfree, Otpscrfree, self.pointer);
-        }
-    }
-}
-
 /// Rust callbacks may capture owned state. Invocation borrows its context and
 /// buffers only for the native callback, so neither can escape into that state.
 ///
@@ -469,9 +421,8 @@ struct CallbackEntry {
 /// # let mut vm = ctx.tpscrinit(None, 0)?;
 /// let source = "def main(name, param, incoming, flags):\n    return incoming\n";
 /// let bytecode = vm.tpscrcomp(source, 0)?;
-/// let saved = bytecode.as_bytes().to_vec();
+/// let saved = bytecode.clone();
 /// vm.tpscrload("compiled", &bytecode, NDRX_TPSCR_FLAT)?;
-/// bytecode.tpscrfree()?; // The loaded script no longer needs this compiler allocation.
 /// vm.tpscrunload("compiled", 0)?;
 /// vm.tpscrload("compiled", &saved, NDRX_TPSCR_FLAT)?;
 /// # Ok(())
@@ -479,8 +430,8 @@ struct CallbackEntry {
 /// ```
 ///
 /// Bytecode is backend-specific; reload it with a compatible engine and version.
-/// [`TpScrBytecode`] releases its plugin-owned memory with native `tpscrfree` when
-/// dropped. It may outlive the VM while its borrowed [`AtmiCtx`] remains alive.
+/// Compilation returns an owned `Vec<u8>` after releasing native compiler storage.
+/// The bytes may outlive both the VM and its context and may move between threads.
 ///
 /// Load flags can be combined with `|`:
 ///
@@ -555,19 +506,16 @@ impl<'ctx> TpScrVm<'ctx> {
         self.ctx
     }
 
-    /// Compile source to plugin-owned bytecode. Embedded NUL bytes are passed
-    /// with their explicit length for the engine to accept or reject.
+    /// Compile source to owned bytes, releasing the native allocation before returning.
+    /// The bytes remain valid after the VM and context are dropped. Embedded NUL
+    /// bytes are passed with their explicit length for the engine to accept or reject.
     ///
     /// # Arguments
     ///
     /// - `source`: Source bytes, passed with an explicit byte length for the engine to validate.
     /// - `flags`: Native scripting-operation options supported by the selected backend; use `0`
     ///   for defaults.
-    pub fn tpscrcomp(
-        &mut self,
-        source: impl AsRef<[u8]>,
-        flags: i64,
-    ) -> TpScrResult<TpScrBytecode<'ctx>> {
+    pub fn tpscrcomp(&mut self, source: impl AsRef<[u8]>, flags: i64) -> TpScrResult<Vec<u8>> {
         let source = source.as_ref();
         let mut pointer = ptr::null_mut();
         let mut length: c_long = 0;
@@ -582,26 +530,48 @@ impl<'ctx> TpScrVm<'ctx> {
             &mut length,
             native_flags(flags)?
         );
-        if rc != (raw::EXSUCCEED as c_int) {
-            let error = last_error(self.ctx, self.pointer, "tpscrcomp failed", rc);
-            if !pointer.is_null() {
-                let _ = native!(self.ctx, tpscrfree, Otpscrfree, pointer);
+        let result = (|| {
+            if rc != (raw::EXSUCCEED as c_int) {
+                return Err(last_error(self.ctx, self.pointer, "tpscrcomp failed", rc));
             }
-            return Err(error);
-        }
-        if length < 0 || length as u128 > isize::MAX as u128 || (pointer.is_null() && length != 0) {
-            if !pointer.is_null() {
-                let _ = native!(self.ctx, tpscrfree, Otpscrfree, pointer);
+            if length < 0 || (pointer.is_null() && length != 0) {
+                return Err(AtmiError::new(raw::TPESYSTEM, "invalid compiler output").into());
             }
-            return Err(TpScrError::invalid(
-                "plugin returned invalid compiler output",
-            ));
+            if length as u128 > isize::MAX as u128 {
+                return Err(AtmiError::new(
+                    raw::TPELIMIT,
+                    "compiler output exceeds vector capacity",
+                )
+                .into());
+            }
+            let length = length as usize;
+            let mut bytes = Vec::new();
+            bytes.try_reserve_exact(length).map_err(|_| {
+                TpScrError::from(AtmiError::new(
+                    raw::TPEOS,
+                    "could not allocate compiled bytecode",
+                ))
+            })?;
+            if length != 0 {
+                // The provider owns this allocation until tpscrfree below.
+                bytes.extend_from_slice(unsafe {
+                    std::slice::from_raw_parts(pointer.cast::<u8>(), length)
+                });
+            }
+            Ok(bytes)
+        })();
+        if !pointer.is_null() {
+            let released = native!(self.ctx, tpscrfree, Otpscrfree, pointer);
+            if released != (raw::EXSUCCEED as c_int) && result.is_ok() {
+                return Err(last_error(
+                    self.ctx,
+                    ptr::null_mut(),
+                    "compiler output release failed",
+                    released,
+                ));
+            }
         }
-        Ok(TpScrBytecode {
-            ctx: self.ctx,
-            pointer,
-            length: length as usize,
-        })
+        result
     }
 
     /// Load compiled bytecode under a name in this VM.

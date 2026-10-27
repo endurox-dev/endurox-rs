@@ -9,7 +9,8 @@ consumers; suspended transaction tokens from v8 must not be reused with v9.
 | --- | --- |
 | Saga participants | `tpsagaenlist`, `tpsagaend`, `tpsagaget`, `tpsagaupdate`, `tpsagaleave`, `TpSagaCtl` |
 | Transaction recovery | `tptxstatus`, `tptxrenew`, `TpTxStatus` |
-| Global identifiers | `Xid`, `tpxid_to_string`, `tpxid_from_string` |
+| Global identifiers | `Xid`, `tpxidtostring`, `tpxidfromstring` |
+| Participant join by XID | `tptranidfromxid` for `tpresume`; `tpsuspend(TPTXABORTONLY)` on failed work |
 | Named XA resources | `tpopen2`, `tprmopen`, `tprmclose`, `tprmstart`, `tprmend`, `tpgetconnrm` |
 | Tracing | `tptracecontextset/get`, `tptracestateset/get`, `tptracespanbegin/end`, `tptraceevent` |
 | Context tags | `tpcontexttagset`, `tpcontexttagclear`, `tpcontexttagclearall` |
@@ -429,9 +430,9 @@ assert_eq!(output.as_bytes(), b"hello from Rust");
   code.
 - Byte views show CARRAY data and STRING/JSON text. UBF and VIEW buffers are
   read through their typed accessors.
-- `tpscrcomp` returns `TpScrBytecode`, which is freed with `tpscrfree()` or
-  when dropped. `tpscrload` also accepts bytes saved earlier. Load only trusted
-  code.
+- `tpscrcomp` returns an owned `Vec<u8>` and immediately releases native
+  compiler storage. The bytes outlive the VM/context and can move between
+  threads. Pass them directly to `tpscrload`. Load only trusted code.
 - `tpscruninit` closes the VM; dropping it does the same.
 - Closures may capture Rust state. In a callback, `call.context()` gives the
   current `AtmiCtx`; a callback may also set the script error or run another

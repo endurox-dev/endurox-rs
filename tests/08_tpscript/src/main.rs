@@ -51,10 +51,9 @@ fn run() -> TpScrResult<()> {
 
     let source = "def main(name, param, incoming, flags):\n    return {'buftype': 'CARRAY', 'data': b'compiled\\x00bytes'}\n";
     let bytes = vm.tpscrcomp(source, 0)?;
-    assert!(!bytes.as_bytes().is_empty());
+    assert!(!bytes.is_empty());
     vm.tpscrload("compiled", &bytes, NDRX_TPSCR_FLAT)?;
-    let serialized = bytes.as_bytes().to_vec();
-    bytes.tpscrfree()?;
+    let serialized = bytes.clone();
     vm.tpscrexec("compiled", &mut buffers, 0)?;
     assert_eq!(
         buffers.get(S::Output)?.unwrap().as_bytes(),
@@ -331,11 +330,37 @@ fn run() -> TpScrResult<()> {
     vm.tpscruninit(0)?;
     assert_eq!(Rc::strong_count(&retained), 1);
     drop(buffers);
-    // Automatic bytecode and VM destruction.
-    let mut vm = ctx.tpscrinit(None, 0)?;
-    let _bytes = vm.tpscrcomp(source, 0)?;
-    drop(vm);
-    drop(_bytes);
+    drop(ctx);
+    // Owned bytecode survives both native owners and can move between threads.
+    let duration = test_duration::test_duration();
+    let started = Instant::now();
+    let mut iterations = 0;
+    while iterations < 1 || started.elapsed() < duration {
+        let ctx = AtmiCtx::new()?;
+        let mut vm = ctx.tpscrinit(None, 0)?;
+        let bytes: Vec<u8> = vm.tpscrcomp(source, 0)?;
+        drop(vm);
+        drop(ctx);
+        std::thread::spawn(move || {
+            let ctx = AtmiCtx::new().unwrap();
+            let mut vm = ctx.tpscrinit(None, 0).unwrap();
+            vm.tpscrload("compiled", &bytes, NDRX_TPSCR_FLAT).unwrap();
+            let mut buffers = TpScrBuffers::new(&ctx);
+            vm.tpscrexec("compiled", &mut buffers, 0).unwrap();
+            assert_eq!(
+                buffers.get(S::Output).unwrap().unwrap().as_bytes(),
+                b"compiled\0bytes"
+            );
+        })
+        .join()
+        .expect("bytecode thread failed");
+        iterations += 1;
+    }
+    println!(
+        "Bytecode after context cleanup: {} iterations in {:.3}s",
+        iterations,
+        started.elapsed().as_secs_f64()
+    );
     println!("scripting lifecycle, Rust callbacks, errors, aliases and reallocation passed");
     Ok(())
 }

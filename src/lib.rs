@@ -76,7 +76,7 @@ pub use flags::*;
 pub use nstdutil::NdrxStdCfgStr;
 pub use script_buffers::{TpScrBuffers, TpScrSlot};
 pub use tpscript::{
-    TpScrBytecode, TpScrCallback, TpScrCallbackContext, TpScrCfg, TpScrError, TpScrResult, TpScrVm,
+    TpScrCallback, TpScrCallbackContext, TpScrCfg, TpScrError, TpScrResult, TpScrVm,
 };
 /// Load a script unit as a package that may contain submodules.
 pub const NDRX_TPSCR_PACKAGE: i64 = raw::NDRX_TPSCR_PACKAGE as i64;

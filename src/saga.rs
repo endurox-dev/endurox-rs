@@ -9,7 +9,7 @@ use std::ffi::CString;
 use std::os::raw::{c_char, c_long};
 
 /// Native XA global identifier, obtained from Saga registration or its string codec.
-/// Its binary layout is private; use [`AtmiCtx::tpxid_to_string`] for transport.
+/// Its binary layout is private; use [`AtmiCtx::tpxidtostring`] for transport.
 #[derive(Clone, Debug)]
 pub struct Xid(pub(crate) raw::XID);
 
@@ -388,7 +388,7 @@ impl AtmiCtx {
     }
 
     /// Encode `xid` using the native global XID codec, distinct from a branch token.
-    pub fn tpxid_to_string(&self, xid: &Xid) -> AtmiResult<String> {
+    pub fn tpxidtostring(&self, xid: &Xid) -> AtmiResult<String> {
         let mut value = [0 as c_char; raw::TPCONVMAXSTR as usize];
         let mut xid = xid.0;
         let flags = (raw::TPCONVXID | raw::TPTOSTRING) as c_long;
@@ -414,7 +414,7 @@ impl AtmiCtx {
     }
 
     /// Decode `value` as a native global XID. Reject malformed text and embedded NULs.
-    pub fn tpxid_from_string(&self, value: &str) -> AtmiResult<Xid> {
+    pub fn tpxidfromstring(&self, value: &str) -> AtmiResult<Xid> {
         let value =
             CString::new(value).map_err(|_| AtmiError::new(raw::TPEINVAL, "XID contains NUL"))?;
         let mut xid: raw::XID = unsafe { std::mem::zeroed() };
@@ -437,5 +437,38 @@ impl AtmiCtx {
         };
         self.rc_to_result(rc)?;
         Ok(Xid(xid))
+    }
+
+    /// Convert a global XID string to a participant token for `tpresume`.
+    /// The token has no initiator rights: `tpcommit` and `tpabort` fail with
+    /// `TPEPROTO`. Detach with `tpsuspend`, with `TPTXABORTONLY` if the work
+    /// failed. Conversion is local and does not check the transaction state.
+    ///
+    /// # Arguments
+    ///
+    /// - `xid`: Global XID string (`tpxidtostring`), not a branch XID or LRA URL.
+    pub fn tptranidfromxid(&self, xid: &str) -> AtmiResult<TpTranId> {
+        let value =
+            CString::new(xid).map_err(|_| AtmiError::new(raw::TPEINVAL, "XID contains NUL"))?;
+        let mut tranid: raw::TPTRANID = unsafe { std::mem::zeroed() };
+        #[cfg(not(feature = "ctx-send"))]
+        let rc = unsafe {
+            raw::tpconvert(
+                value.as_ptr() as *mut c_char,
+                (&mut tranid as *mut raw::TPTRANID).cast(),
+                raw::TPCONVXIDTRAN as c_long,
+            )
+        };
+        #[cfg(feature = "ctx-send")]
+        let rc = unsafe {
+            raw::Otpconvert(
+                self.c_ctx_ptr(),
+                value.as_ptr() as *mut c_char,
+                (&mut tranid as *mut raw::TPTRANID).cast(),
+                raw::TPCONVXIDTRAN as c_long,
+            )
+        };
+        self.rc_to_result(rc)?;
+        Ok(TpTranId(tranid))
     }
 }

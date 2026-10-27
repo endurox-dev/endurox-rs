@@ -20,7 +20,7 @@ fn register(ctx: &AtmiCtx, svc: &mut TpSvcInfo<'_>) {
         assert_eq!(ctx.tpsagaenlist(&mut ctl, 0).unwrap_err().code, TPEPROTO);
         ctx.tpsagaend(&mut ctl, 0)?;
         data.bchg(f::T_STRING_FLD, 0, ctl.branch_xid(), false)?;
-        data.bchg(f::T_STRING_FLD, 1, ctx.tpxid_to_string(&ctl.xid())?, false)?;
+        data.bchg(f::T_STRING_FLD, 1, ctx.tpxidtostring(&ctl.xid())?, false)?;
         Ok(())
     })();
     let status = match result {
