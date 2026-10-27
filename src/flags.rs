@@ -169,16 +169,6 @@ pub const TPPG_SGVERIFY: i64 = raw::TPPG_SGVERIFY as i64;
 pub const TPPG_SINGLETON: i64 = raw::TPPG_SINGLETON as i64;
 /// Max identifier buffer.
 pub const TPCONVMAXSTR: usize = raw::TPCONVMAXSTR as usize;
-/// Convert to string.
-pub const TPTOSTRING: i64 = raw::TPTOSTRING as i64;
-/// Convert client id.
-pub const TPCONVCLTID: i64 = raw::TPCONVCLTID as i64;
-/// Convert transaction id.
-pub const TPCONVTRANID: i64 = raw::TPCONVTRANID as i64;
-/// Select native XID conversion; currently unsupported by Enduro/X.
-pub const TPCONVXID: i64 = raw::TPCONVXID as i64;
-/// Global XID string to participant TPTRANID.
-pub const TPCONVXIDTRAN: i64 = raw::TPCONVXIDTRAN as i64;
 /// Invalid native context sentinel; not an [`crate::AtmiCtx`] handle.
 pub const TPINVALIDCONTEXT: isize = raw::TPINVALIDCONTEXT as isize;
 /// Legacy single-context sentinel; unused by Enduro/X.

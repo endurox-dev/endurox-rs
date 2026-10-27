@@ -1,6 +1,6 @@
 [package]
 name = "endurox-rs"
-version = "0.1.343"
+version = "0.1.344"
 edition = "2021"
 
 # REQUIRED by crates.io
