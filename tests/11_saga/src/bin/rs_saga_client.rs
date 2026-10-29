@@ -44,6 +44,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(ctx.tptranidfromxid(&branch).unwrap_err().code, TPEINVAL);
         status.set_tranid(&tranid).set_flags(TPTXS_TRANID)?;
         ctx.tptxstatus(&mut status, 0)?;
+        // Durable LRA metadata
+        status
+            .set_client_id("rust-client")?
+            .set_lra_url("http://127.0.0.1:1/lra-coordinator")?;
+        ctx.tptxsetinfo(&mut status, 0)?;
+        assert_eq!(status.client_id(), "rust-client");
+        assert_eq!(status.lra_url(), "http://127.0.0.1:1/lra-coordinator");
+        assert!(status.is_lra() && !status.is_recovering());
+        assert!(0 < status.start_time() && status.start_time() < status.finish_time());
         let mut joined = TpSagaCtl::default();
         joined
             .set_xid(&xid)
@@ -54,9 +63,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .set_payload(&[1, 0, 2])?;
         ctx.tpsagaenlist(&mut joined, TPSAGA_JOINXID)?;
         let joined_branch = joined.branch_xid();
-        ctx.tpsagaenlist(&mut joined, TPSAGA_JOINXID | TPSAGA_UPDATE)?;
+        // a data-only update returns the replaced payload
+        joined.set_payload(&[3])?;
+        ctx.tpsagaenlist(
+            &mut joined,
+            TPSAGA_JOINXID | TPSAGA_UPDATE | TPSAGA_DATAONLY,
+        )?;
         assert_eq!(joined.branch_xid(), joined_branch);
-        ctx.tpsagaleave(&mut joined, 0)?;
+        assert_eq!(joined.previous_payload(), &[1, 0, 2]);
+        ctx.tpsagaleave(&mut joined, TPSAGA_BYKEY)?;
         ctx.tpresume(&tranid, 0)?;
         let mut ctl = TpSagaCtl::default();
         ctl.set_branch_xid(&branch)?.set_payload(&[9, 0, 8])?;
@@ -86,7 +101,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if removed {
             ctx.tpsagaleave(&mut moved, 0)?;
         }
-        if iteration % 3 == 1 {
+        // closes that succeed replace the participant data at completion
+        let final_data = iteration % 4 < 2 && iteration % 3 == 0 && !rbonly;
+        if iteration % 4 < 2 {
+            // coordinator completion by global XID, outside the transaction
+            ctx.tpsuspend(0)?;
+            let mut selector = TpTxStatus::default();
+            selector.set_flags(TPTXS_XID)?.set_xid(&xid);
+            let abort = iteration % 3 == 1;
+            let result = if final_data {
+                moved.set_payload(&[7, 0, 7])?;
+                ctx.tptxcomplete(&selector, Some(moved.as_mut()), 0)
+            } else {
+                ctx.tptxcomplete(&selector, None, if abort { TPTXC_ABORT } else { 0 })
+            };
+            if rbonly && !abort {
+                assert_eq!(result.unwrap_err().code, TPEABORT);
+            } else {
+                result?;
+            }
+        } else if iteration % 3 == 1 {
             ctx.tpabort(0)?;
         } else if rbonly {
             assert_eq!(ctx.tpcommit(0).unwrap_err().code, TPEABORT);
@@ -105,10 +139,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 NDRX_SAGA_ACTION_COMMIT
             };
             assert_eq!(response.bget_char(f::T_CHAR_FLD, 0)? as u8, expected);
-            assert_eq!(
-                response.bget_bytes(f::T_CARRAY_FLD, 0)?,
+            let payload = if final_data {
+                vec![7, 0, 7]
+            } else {
                 vec![255; NDRX_SAGA_PAYLOAD_MAX]
-            );
+            };
+            assert_eq!(response.bget_bytes(f::T_CARRAY_FLD, 0)?, payload);
         }
         iterations += 1;
     }

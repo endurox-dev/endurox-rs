@@ -35,15 +35,20 @@ fn run() -> TpScrResult<()> {
     }
     // A non-matching engine init string is rejected by the endurox-python plugin.
     let error = ctx
-        .tpscrinit(Some(TpScrCfg::engine("engine=nosuch")?), 0)
+        .tpscrinit(Some(&mut TpScrCfg::engine("engine=nosuch")?), 0)
         .expect_err("unsupported engine init string must be rejected");
     assert_eq!(error.atmi_code, AtmiError::TPEINVAL);
 
     // Explicitly select the Python engine via its init string.
-    let cfg = TpScrCfg::engine(NDRX_SCR_INITSTRING_PYTHON)?;
+    let mut cfg = TpScrCfg::engine(NDRX_SCR_INITSTRING_PYTHON)?;
     assert_eq!(cfg.version(), NDRX_SCR_CFG_VERSION_1);
     assert_eq!(cfg.initstring(), NDRX_SCR_INITSTRING_PYTHON);
-    let mut vm = ctx.tpscrinit(Some(cfg), 0)?;
+    let mut vm = ctx.tpscrinit(Some(&mut cfg), 0)?;
+    // Compiled code is portable only between VMs of the same format.
+    assert!(cfg.compformat().starts_with("python:") && cfg.compformat().len() > "python:".len());
+    let mut same = TpScrCfg::new();
+    ctx.tpscrinit(Some(&mut same), 0)?.tpscruninit(0)?;
+    assert_eq!(same.compformat(), cfg.compformat());
     let mut buffers = TpScrBuffers::new(&ctx);
     vm.tpscrseterror(1234, "manual error")?;
     assert_eq!(vm.tpscrerrno(), 1234);

@@ -9,6 +9,7 @@ consumers; suspended transaction tokens from v8 must not be reused with v9.
 | --- | --- |
 | Saga participants | `tpsagaenlist`, `tpsagaend`, `tpsagaget`, `tpsagaupdate`, `tpsagaleave`, `TpSagaCtl` |
 | Transaction recovery | `tptxstatus`, `tptxrenew`, `TpTxStatus` |
+| LRA coordination | `tptxsetinfo` (client id, coordinator URL), `tptxcomplete` (close / `TPTXC_ABORT`) |
 | Global identifiers | `Xid`, `tpxidtostring`, `tpxidfromstring` |
 | Participant join by XID | `tptranidfromxid` for `tpresume`; `tpsuspend(TPTXABORTONLY)` on failed work |
 | Named XA resources | `tpopen2`, `tprmopen`, `tprmclose`, `tprmstart`, `tprmend`, `tpgetconnrm` |
@@ -76,6 +77,8 @@ Other calls:
 - `tptxstatus()` and `tptxrenew()` query a transaction and extend its timeout.
   Select the transaction by global XID, branch identifier or suspended
   `TpTranId`; these are three different identifiers.
+- `tptxsetinfo()` stores the LRA client id and coordinator URL;
+  `tptxcomplete()` closes or cancels an LRA outside the transaction.
 
 `tptracespanbegin` returns a `TpTraceSpan`, valid only in the context which
 started it; pass it to `tptracespanend`. End active spans in reverse order.
@@ -442,7 +445,9 @@ assert_eq!(output.as_bytes(), b"hello from Rust");
   across `.await`.
 - `tpscrinit(None, 0)` uses the plugin defaults.
   `TpScrCfg::engine(NDRX_SCR_INITSTRING_PYTHON)` makes it fail when the plugin
-  is not the Python one.
+  is not the Python one. With `Some(&mut cfg)`, `cfg.compformat()` returns the
+  format of the code the VM compiles; store it with compiled code and
+  recompile on a mismatch.
 
 The scripting integration fixture checks `ENDUROX_TPSCRIPT_PLUGIN`, installed
 Python packages discoverable by interpreters on `PATH` (including user site

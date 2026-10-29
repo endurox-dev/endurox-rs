@@ -129,7 +129,8 @@ pub type TpScrResult<T> = Result<T, TpScrError>;
 /// Pass `None` to use the selected engine's defaults. Use [`Self::engine`] to assert
 /// which engine must handle the VM, e.g. [`crate::NDRX_SCR_INITSTRING_PYTHON`]; the
 /// plugin rejects a mismatched engine at init. The plugin reads the configuration
-/// during `tpscrinit` and does not retain it. See [`TpScrVm`] for setup and usage.
+/// and writes the compiled code format into it during `tpscrinit`, and does not
+/// retain it. See [`TpScrVm`] for setup and usage.
 #[derive(Clone, Copy, Debug)]
 pub struct TpScrCfg {
     raw: raw::tpscr_cfg_t,
@@ -184,6 +185,23 @@ impl TpScrCfg {
         Ok(())
     }
 
+    /// Read the compiled code format set by [`AtmiCtx::tpscrinit`]
+    /// (`tpscr_cfg_t.compformat`). Compiled code loads only into VMs reporting the
+    /// same value: store it next to the compiled code and recompile on a mismatch.
+    /// Empty before `tpscrinit`.
+    pub fn compformat(&self) -> Cow<'_, str> {
+        // SAFETY: compformat is a fixed char buffer within self; read it as
+        // bytes and stop at the first NUL terminator.
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                self.raw.compformat.as_ptr().cast(),
+                self.raw.compformat.len(),
+            )
+        };
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        String::from_utf8_lossy(&bytes[..end])
+    }
+
     /// Read the engine selection / init string field (`tpscr_cfg_t.initstring`),
     /// decoded up to its terminating NUL.
     pub fn initstring(&self) -> Cow<'_, str> {
@@ -219,8 +237,8 @@ impl TpScrCfg {
     }
 
     /// Native pointer to the owned configuration, valid while `self` is borrowed.
-    fn as_ptr(&self) -> *const raw::tpscr_cfg_t {
-        &self.raw
+    fn as_mut_ptr(&mut self) -> *mut raw::tpscr_cfg_t {
+        &mut self.raw
     }
 }
 
@@ -475,17 +493,18 @@ impl AtmiCtx {
     ///
     /// # Arguments
     ///
-    /// - `config`: Engine configuration ([`TpScrCfg`]), or `None` for the selected engine’s defaults.
+    /// - `config`: Engine configuration ([`TpScrCfg`]), or `None` for the selected engine’s
+    ///   defaults; receives the compiled code format ([`TpScrCfg::compformat`]).
     /// - `flags`: Native scripting-operation options supported by the selected backend; use `0`
     ///   for defaults.
     pub fn tpscrinit<'ctx>(
         &'ctx self,
-        config: Option<TpScrCfg>,
+        config: Option<&mut TpScrCfg>,
         flags: i64,
     ) -> TpScrResult<TpScrVm<'ctx>> {
-        // `config` lives to the end of this call, so the native pointer stays
-        // valid for the synchronous `tpscrinit`; the plugin does not retain it.
-        let cfg = config.as_ref().map_or(ptr::null(), TpScrCfg::as_ptr);
+        // The plugin writes the compiled code format into `config` during the
+        // synchronous `tpscrinit` and does not retain the pointer.
+        let cfg = config.map_or(ptr::null_mut(), TpScrCfg::as_mut_ptr);
         let pointer = native!(self, tpscrinit, Otpscrinit, cfg, native_flags(flags)?);
         if pointer.is_null() {
             return Err(last_error(self, pointer, "tpscrinit failed", raw::EXFAIL));

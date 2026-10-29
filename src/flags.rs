@@ -434,6 +434,18 @@ pub const TPSAGA_UPDATE: i64 = raw::TPSAGA_UPDATE as i64;
 
 /// Replace only participant URLs, including during recovery.
 pub const TPSAGA_URLSONLY: i64 = raw::TPSAGA_URLSONLY as i64;
+/// `tpsagaenlist` with `TPSAGA_UPDATE`: replace only data; return the old payload.
+pub const TPSAGA_DATAONLY: i64 = raw::TPSAGA_DATAONLY as i64;
+/// `tpsagaleave`: select by xid, Saga name and key instead of the branch.
+pub const TPSAGA_BYKEY: i64 = raw::TPSAGA_BYKEY as i64;
+/// Join the xid in LRA mode without local XA association; requires `TPSAGA_NOLOCK`.
+pub const TPSAGA_LRAJOIN: i64 = raw::TPSAGA_LRAJOIN as i64;
+/// Maximum client identity bytes stored with an LRA, excluding the terminator.
+pub const NDRX_LRA_CLIENT_ID_MAX: usize = raw::NDRX_LRA_CLIENT_ID_MAX as usize;
+/// `tptxcomplete`: cancel instead of close; zero requests close.
+pub const TPTXC_ABORT: i64 = raw::TPTXC_ABORT as i64;
+/// `tptxrenew`: only extend the deadline, still bounded by participant limits.
+pub const TPTXR_EXTEND: i64 = raw::TPTXR_EXTEND as i64;
 
 /// TPTXSTATUS.xid identifies the txn.
 pub const TPTXS_XID: i64 = raw::TPTXS_XID as i64;

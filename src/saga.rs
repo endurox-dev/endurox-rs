@@ -34,6 +34,16 @@ impl Default for TpSagaCtl {
 }
 
 impl TpSagaCtl {
+    /// Return the payload replaced by `tpsagaenlist` with `TPSAGA_DATAONLY`;
+    /// empty on a new join.
+    pub fn previous_payload(&self) -> &[u8] {
+        let len = usize::try_from(self.inner.previous_payload_len)
+            .unwrap_or(0)
+            .min(self.inner.previous_payload.len());
+        // SAFETY: the bytes are within the fixed native array of self.
+        unsafe { std::slice::from_raw_parts(self.inner.previous_payload.as_ptr().cast(), len) }
+    }
+
     /// Return registration mode flags; distinct from each operation's flags.
     pub fn flags(&self) -> i64 {
         self.inner.flags as i64
@@ -274,6 +284,41 @@ impl TpTxStatus {
     pub fn timeout_left(&self) -> i64 {
         self.inner.timeout_left as i64
     }
+    /// Return the durable LRA client identity.
+    pub fn client_id(&self) -> String {
+        crate::fixed_cstr_to_string(&self.inner.client_id)
+    }
+    /// Set the client identity stored by `tptxsetinfo`, at most `NDRX_LRA_CLIENT_ID_MAX` bytes.
+    pub fn set_client_id(&mut self, value: &str) -> AtmiResult<&mut Self> {
+        crate::write_fixed_str(&mut self.inner.client_id, value, "client_id")?;
+        Ok(self)
+    }
+    /// Return the LRA coordinator base URL; LRA ids are `<lra_url>/<global XID>`.
+    pub fn lra_url(&self) -> String {
+        crate::fixed_cstr_to_string(&self.inner.lra_url)
+    }
+    /// Set the coordinator base URL stored by `tptxsetinfo`: empty, or an http(s)
+    /// URL of at most `NDRX_SAGA_URL_MAX` bytes.
+    pub fn set_lra_url(&mut self, value: &str) -> AtmiResult<&mut Self> {
+        crate::write_fixed_str(&mut self.inner.lra_url, value, "lra_url")?;
+        Ok(self)
+    }
+    /// Return the transaction start, milliseconds since the Unix epoch.
+    pub fn start_time(&self) -> u64 {
+        self.inner.start_time
+    }
+    /// Return the deadline while active, the latest logged progress otherwise.
+    pub fn finish_time(&self) -> u64 {
+        self.inner.finish_time
+    }
+    /// Return true for a transaction begun with `TPSAGALRA`.
+    pub fn is_lra(&self) -> bool {
+        0 != self.inner.is_lra
+    }
+    /// Return true while completion or after notifications remain.
+    pub fn is_recovering(&self) -> bool {
+        0 != self.inner.is_recovering
+    }
 }
 
 impl AtmiCtx {
@@ -376,7 +421,7 @@ impl AtmiCtx {
     /// On success the coordinator replaces the status and timeout fields.
     ///
     /// - `ctl`: Native control record containing the participant or transaction selector.
-    /// - `flags`: reserved; use zero.
+    /// - `flags`: `TPTXR_EXTEND` to only extend the deadline, or zero.
     pub fn tptxrenew(&self, ctl: &mut TpTxStatus, flags: i64) -> AtmiResult<()> {
         let flags = c_long::try_from(flags)
             .map_err(|_| AtmiError::new(raw::TPEINVAL, "flags exceed native long"))?;
@@ -384,6 +429,50 @@ impl AtmiCtx {
         let rc = unsafe { raw::tptxrenew(&mut ctl.inner, flags) };
         #[cfg(feature = "ctx-send")]
         let rc = unsafe { raw::Otptxrenew(self.c_ctx_ptr(), &mut ctl.inner, flags) };
+        self.rc_to_result(rc)
+    }
+
+    /// Durably store `ctl.client_id()` and `ctl.lra_url()` with the active LRA
+    /// selected by `ctl`; each call stores both. On success the status and
+    /// metadata fields are refreshed as by `tptxstatus`.
+    ///
+    /// - `ctl`: Transaction selector and the metadata to store.
+    /// - `flags`: reserved; use zero.
+    pub fn tptxsetinfo(&self, ctl: &mut TpTxStatus, flags: i64) -> AtmiResult<()> {
+        let flags = c_long::try_from(flags)
+            .map_err(|_| AtmiError::new(raw::TPEINVAL, "flags exceed native long"))?;
+        #[cfg(not(feature = "ctx-send"))]
+        let rc = unsafe { raw::tptxsetinfo(&mut ctl.inner, flags) };
+        #[cfg(feature = "ctx-send")]
+        let rc = unsafe { raw::Otptxsetinfo(self.c_ctx_ptr(), &mut ctl.inner, flags) };
+        self.rc_to_result(rc)
+    }
+
+    /// Complete the LRA selected by `ctl`: close (commit) or, with `TPTXC_ABORT`,
+    /// cancel (roll back). The calling context must be outside a transaction.
+    /// Errors are as for `tpcommit`/`tpabort`; query the status to tell pending
+    /// work from a terminal failure.
+    ///
+    /// - `ctl`: Transaction selector as for `tptxstatus`; input only.
+    /// - `saga`: Optional participant profile, key and new payload replaced
+    ///   under the transaction lock, or `None` for no update.
+    /// - `flags`: zero for close, `TPTXC_ABORT` for cancel.
+    pub fn tptxcomplete(
+        &self,
+        ctl: &TpTxStatus,
+        saga: Option<&mut TpSagaCtl>,
+        flags: i64,
+    ) -> AtmiResult<()> {
+        let flags = c_long::try_from(flags)
+            .map_err(|_| AtmiError::new(raw::TPEINVAL, "flags exceed native long"))?;
+        let mut selector = ctl.inner;
+        let saga = saga.map_or(std::ptr::null_mut(), |c| {
+            &mut c.inner as *mut raw::TPSAGACTL
+        });
+        #[cfg(not(feature = "ctx-send"))]
+        let rc = unsafe { raw::tptxcomplete(&mut selector, saga, flags) };
+        #[cfg(feature = "ctx-send")]
+        let rc = unsafe { raw::Otptxcomplete(self.c_ctx_ptr(), &mut selector, saga, flags) };
         self.rc_to_result(rc)
     }
 
