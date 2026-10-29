@@ -45,6 +45,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ENDUROX_MKFLDHDR");
     println!("cargo:rerun-if-env-changed=CFLAGS");
     println!("cargo:rerun-if-env-changed=LDFLAGS");
+    println!("cargo:rerun-if-env-changed=CC");
     println!("cargo:rerun-if-env-changed=LIBCLANG_PATH");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
     println!("cargo:rustc-check-cfg=cfg(endurox_pollable)");
@@ -100,6 +101,13 @@ fn main() {
         }
         for def in &defines {
             builder = builder.clang_arg(format!("-D{def}"));
+        }
+        // bindgen locates clang's builtin headers (stddef.h, stdarg.h) only
+        // through a clang executable. Hosts with libclang alone (e.g. EL
+        // clang-libs without clang) then fail on <stdio.h>. -idirafter is
+        // searched last, so clang's own headers still win when present.
+        if let Some(dir) = compiler_builtin_include_dir() {
+            builder = builder.clang_arg(format!("-idirafter{dir}"));
         }
 
         // (Optional) curate what you pull in:
@@ -157,6 +165,20 @@ fn find_mkfldhdr(manifest_dir: &Path) -> PathBuf {
     }
 
     PathBuf::from("mkfldhdr")
+}
+
+fn compiler_builtin_include_dir() -> Option<String> {
+    let cc = env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    let output = Command::new(cc)
+        .arg("-print-file-name=include")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let dir = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    // An unknown name is echoed back unchanged, so require a real directory.
+    Path::new(&dir).join("stddef.h").is_file().then_some(dir)
 }
 
 fn endurox_config_has_pollable_reply_queue(include_dirs: &[String]) -> bool {
