@@ -25,6 +25,25 @@ pub(crate) mod raw {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
 
+// On Linux and FreeBSD libatmi/libubf carry no NEEDED entries for the Enduro/X
+// libraries they use. GNU ld --as-needed still keeps those when a kept library
+// references them, but rust-lld (Rust's default linker on x86_64 Linux) counts
+// only the binary's own references, so it drops e.g. libnstd when Rust code
+// calls none of its symbols; loading then fails with "undefined symbol:
+// G_ndrx_debug". Referencing one symbol of each library from a #[used] static
+// keeps them for every linker and every dependent crate, with no build flags.
+struct LinkAnchors([*const (); 3]);
+
+// SAFETY: the addresses are never dereferenced or called through.
+unsafe impl Sync for LinkAnchors {}
+
+#[used]
+static LINK_ANCHORS: LinkAnchors = LinkAnchors([
+    raw::tpinit as *const (),
+    raw::Bisubf as *const (),
+    raw::tplogex as *const (),
+]);
+
 #[doc(hidden)]
 pub mod ubf_fields {
     include!(concat!(env!("OUT_DIR"), "/test.rs"));
