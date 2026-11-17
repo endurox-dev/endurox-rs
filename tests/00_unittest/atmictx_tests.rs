@@ -91,11 +91,11 @@ fn tpalloc_ubf() {
 #[test]
 fn async_adapters_report_non_pollable_endurox_backend() {
     let _guard = endurox_test_env();
-    assert!(!AtmiCtx::ASYNC_SUPPORTED);
+    const { assert!(!AtmiCtx::ASYNC_SUPPORTED) };
 
     #[cfg(feature = "tokio")]
     {
-        assert!(!AtmiCtx::TOKIO_ASYNC_SUPPORTED);
+        const { assert!(!AtmiCtx::TOKIO_ASYNC_SUPPORTED) };
         let ctx = AtmiCtx::new().expect("failed to create Tokio AtmiCtx");
         ctx.tpinit().expect("Tokio context tpinit failed");
         let error = match ctx.into_tokio() {
@@ -164,14 +164,16 @@ fn raw_byte_mutation_is_confined_to_carray() {
 
     let mut ubf = ctx.tpalloc_ubf(1024).expect("tpalloc_ubf failed");
     ubf.bchg(
-        endurox_rs::ubf_fields::T_STRING_FLD,
+        ubf_fields::T_STRING_FLD,
         0,
         UbfValue::String("KEEP".to_string()),
         true,
     )
     .expect("bchg failed");
 
-    let generic: &mut TypedBuffer<'_> = &mut ubf;
+    // A `TypedUbf` no longer hands out `&mut TypedBuffer`, so the generic view
+    // is reached by giving the wrapper up.
+    let mut generic: TypedBuffer<'_> = ubf.into_inner();
     for err in [
         generic
             .set_bytes(&[0u8; 16])
@@ -183,10 +185,11 @@ fn raw_byte_mutation_is_confined_to_carray() {
     ] {
         assert_eq!(err.code, endurox_rs::AtmiError::TPEINVAL);
     }
+    let ubf = TypedUbf::from_typed(generic).expect("still a UBF");
 
     // The buffer is intact: neither call reached the header.
     assert_eq!(
-        ubf.bget_string(endurox_rs::ubf_fields::T_STRING_FLD, 0)
+        ubf.bget_string(ubf_fields::T_STRING_FLD, 0)
             .expect("the UBF header must be untouched"),
         "KEEP"
     );
@@ -226,17 +229,12 @@ fn extraction_does_not_mistake_capacity_for_payload() {
     target.tprealloc(4096).expect("tprealloc failed");
 
     master
-        .bchg(
-            endurox_rs::ubf_fields::T_PTR_FLD,
-            0,
-            UbfValue::Ptr(target),
-            true,
-        )
+        .bchg(ubf_fields::T_PTR_FLD, 0, UbfValue::Ptr(target), true)
         .expect("storing a BFLD_PTR field failed");
 
     // Neither borrow nor extraction may invent a length.
     let borrowed = master
-        .bget_ptr(endurox_rs::ubf_fields::T_PTR_FLD, 0)
+        .bget_ptr(ubf_fields::T_PTR_FLD, 0)
         .expect("bget_ptr failed");
     assert_eq!(
         borrowed.as_bytes().len(),
@@ -246,7 +244,7 @@ fn extraction_does_not_mistake_capacity_for_payload() {
     drop(borrowed);
 
     let mut extracted = master
-        .bextract_ptr(endurox_rs::ubf_fields::T_PTR_FLD, 0)
+        .bextract_ptr(ubf_fields::T_PTR_FLD, 0)
         .expect("bextract_ptr failed");
     assert_eq!(extracted.as_bytes().len(), 0);
 
@@ -420,6 +418,18 @@ fn import_preserves_the_decoded_length() {
     let source = ctx.tpalloc_carray(b"hello").expect("tpalloc_carray failed");
     let exported = ctx.tpexport(&source, 0).expect("tpexport failed");
 
+    // File/network slices do not necessarily include the exporter terminator.
+    let unterminated = exported.strip_suffix(&[0]).unwrap();
+    assert_eq!(ctx.tpimport(unterminated, 0).unwrap().as_bytes(), b"hello");
+    let mut padded = exported.clone();
+    padded.extend_from_slice(&[0, 0]);
+    assert_eq!(ctx.tpimport(&padded, 0).unwrap().as_bytes(), b"hello");
+    let mut embedded = unterminated.to_vec();
+    embedded.insert(1, 0);
+    assert_eq!(
+        ctx.tpimport(&embedded, 0).unwrap_err().code,
+        endurox_rs::AtmiError::TPEINVAL
+    );
     let mut imported = ctx.tpimport(&exported, 0).expect("tpimport failed");
     assert_eq!(
         imported.as_bytes(),
@@ -504,19 +514,14 @@ fn extracted_carray_keeps_its_payload() {
     let mut master = ctx.tpalloc_ubf(1024).expect("tpalloc_ubf failed");
     let target = ctx.tpalloc_carray(b"hello").expect("tpalloc_carray failed");
     master
-        .bchg(
-            endurox_rs::ubf_fields::T_PTR_FLD,
-            0,
-            UbfValue::Ptr(target),
-            true,
-        )
+        .bchg(ubf_fields::T_PTR_FLD, 0, UbfValue::Ptr(target), true)
         .expect("storing a BFLD_PTR field failed");
 
     // A BFLD_PTR field stores an address and no extent, so the borrow starts
     // empty rather than guessing from the allocation.
     assert_eq!(
         master
-            .bget_ptr(endurox_rs::ubf_fields::T_PTR_FLD, 0)
+            .bget_ptr(ubf_fields::T_PTR_FLD, 0)
             .expect("bget_ptr failed")
             .as_bytes()
             .len(),
@@ -524,7 +529,7 @@ fn extracted_carray_keeps_its_payload() {
     );
 
     let mut extracted = master
-        .bextract_ptr(endurox_rs::ubf_fields::T_PTR_FLD, 0)
+        .bextract_ptr(ubf_fields::T_PTR_FLD, 0)
         .expect("bextract_ptr failed");
     assert_eq!(extracted.len(), 0);
 
@@ -594,8 +599,11 @@ fn tpqctl_sets_flags_and_bounded_fields() {
         .set_urcode(7)
         .set_appkey(9);
 
-    assert_eq!(qctl.corrid(), b"ORDER-1001");
-    assert_eq!(qctl.msgid(), b"MSG-1");
+    // Identifiers are fixed-size binary fields: short values are zero-padded.
+    assert_eq!(&qctl.corrid()[..10], b"ORDER-1001");
+    assert!(qctl.corrid()[10..].iter().all(|&b| b == 0));
+    assert_eq!(&qctl.msgid()[..5], b"MSG-1");
+    assert!(qctl.msgid()[5..].iter().all(|&b| b == 0));
     assert_eq!(qctl.reply_queue(), "REPLYQ");
     assert_eq!(qctl.failure_queue(), "ERRORQ");
     assert_eq!(qctl.priority(), 50);
@@ -611,7 +619,17 @@ fn tpqctl_sets_flags_and_bounded_fields() {
     qctl.set_flags(TPQGETBYCORRID);
     assert_eq!(qctl.flags(), TPQGETBYCORRID);
 
-    assert!(qctl.set_corrid(&[b'x'; 32]).is_err());
+    // A native id is binary and uses the whole field, zero bytes included
+    // (`tmq_msgid_gen`): it must survive a get/set round trip unchanged.
+    let mut native_id = [0u8; 32];
+    native_id[..16].copy_from_slice(&[0xA5; 16]);
+    native_id[16..20].copy_from_slice(&[1, 0, 44, 1]);
+    qctl.set_msgid(&native_id).expect("full-width msgid");
+    assert_eq!(qctl.msgid(), &native_id);
+    qctl.set_corrid(&[b'x'; 32]).expect("full-width corrid");
+    assert_eq!(qctl.corrid(), &[b'x'; 32]);
+    assert!(qctl.set_corrid(&[b'x'; 33]).is_err());
+    assert!(qctl.set_msgid(&[0u8; 33]).is_err());
     assert!(qctl.set_reply_queue("1234567890123456").is_err());
     assert!(qctl.set_failure_queue("bad\0queue").is_err());
 }
@@ -678,4 +696,36 @@ env
             }
         }
     });
+}
+
+#[test]
+fn nul_arguments_report_validation_errors_without_native_error_state() {
+    let _guard = endurox_test_env();
+    let ctx = AtmiCtx::new().unwrap();
+    let request = ctx.tpalloc_carray(b"request").unwrap();
+    let mut reply = ctx.tpalloc_carray(b"reply").unwrap();
+    let errors = [
+        ctx.tpcall("bad\0service", &request, &mut reply, 0)
+            .unwrap_err(),
+        ctx.tpacall("bad\0service", &request, 0).unwrap_err(),
+        ctx.tpconnect("bad\0service", &request, 0).unwrap_err(),
+        ctx.tpbroadcast(Some("bad\0node"), None, None, &request, 0)
+            .unwrap_err(),
+    ];
+    for err in errors {
+        assert_eq!(err.code, endurox_rs::AtmiError::TPEINVAL);
+        assert!(err.message.contains("NUL"));
+    }
+}
+
+#[test]
+fn inplace_rejects_invalid_arguments_without_losing_the_request() {
+    let _guard = endurox_test_env();
+    let ctx = AtmiCtx::new().unwrap();
+    let mut data = ctx.tpalloc_carray(b"keep\0bytes").unwrap();
+    let error = ctx
+        .tpcall_inplace("bad\0service", &mut data, 0)
+        .unwrap_err();
+    assert_eq!(error.code, endurox_rs::AtmiError::TPEINVAL);
+    assert_eq!(data.as_bytes(), b"keep\0bytes");
 }

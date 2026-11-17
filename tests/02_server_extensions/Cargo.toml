@@ -9,4 +9,5 @@ ctx-send = ["endurox-rs/ctx-send"]
 
 [dependencies]
 endurox-rs = { path = "../.." }
+ubf_fields = { package = "endurox-rs-test-fields", path = "../ubf_fields" }
 libc = "0.2"

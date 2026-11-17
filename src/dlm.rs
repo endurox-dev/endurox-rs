@@ -5,7 +5,7 @@
 //! The DLM service requires an Enduro/X installation providing `tpdlmsv`.
 // Native long widths vary by target.
 #![allow(clippy::unnecessary_cast)]
-use crate::{raw, AtmiCtx, AtmiError, AtmiResult, TypedBuffer, TypedUbf};
+use crate::{raw, AtmiCtx, AtmiError, AtmiResult, ReplyBuffer, TypedBuffer, TypedUbf};
 use std::ffi::CString;
 use std::os::raw::{c_char, c_long};
 
@@ -117,8 +117,10 @@ impl AtmiCtx {
         let rc = unsafe { raw::tpdlmmkcall(&mut pointer, &mut ctl.inner) };
         #[cfg(feature = "ctx-send")]
         let rc = unsafe { raw::Otpdlmmkcall(self.c_ctx_ptr(), &mut pointer, &mut ctl.inner) };
-        data.replace_ptr(pointer.cast());
-        data.set_len_reported(0);
+        // SAFETY: `tpdlmmkcall` only reallocates the UBF it was given.
+        unsafe {
+            crate::typed_buf::reply_slot::ReplySlot::reply_adopt(data, pointer.cast(), 0);
+        }
         self.rc_to_result(rc)
     }
 
@@ -132,16 +134,27 @@ impl AtmiCtx {
         &self,
         svc: &str,
         idata: &mut TypedUbf<'_>,
-        odata: &mut TypedBuffer<'_>,
+        odata: &mut impl ReplyBuffer,
         flags: i64,
     ) -> AtmiResult<()> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         let svc = CString::new(svc)
             .map_err(|_| AtmiError::new(AtmiError::TPEINVAL, "DLM service contains NUL"))?;
         idata
             .ensure_owned_tree()
             .map_err(|e| AtmiError::new(AtmiError::TPEINVAL, e.message))?;
-        let mut pointer = odata.as_ptr();
-        let mut len = c_long::try_from(odata.len())
+        // Native tpdlmcall receives each attempt into its own NULL scratch,
+        // so passing TPNOCHANGE would reject even a matching UBF response.
+        // Enforce that policy at handover, keeping the original output alive.
+        let fixed_type = (flags | odata.reply_flags()) & raw::TPNOCHANGE as i64 != 0;
+        let flags = flags & !(raw::TPNOCHANGE as i64);
+        let mut pointer = if fixed_type {
+            std::ptr::null_mut()
+        } else {
+            odata.reply_ptr()
+        };
+        let mut len = c_long::try_from(if fixed_type { 0 } else { odata.reply_len() })
             .map_err(|_| AtmiError::new(AtmiError::TPEINVAL, "reply length exceeds native long"))?;
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe {
@@ -166,15 +179,46 @@ impl AtmiCtx {
                 flags as c_long,
             )
         };
-        odata.replace_ptr(pointer);
-        odata.set_len_reported(len.max(0) as usize);
-        self.rc_to_result(rc)
+        let result = self.rc_to_result(rc);
+        let len = len.max(0) as usize;
+        if fixed_type {
+            // No reply on an ordinary failure; preserve the original output.
+            if pointer.is_null() && matches!(&result, Err(err) if err.code != raw::TPESVCFAIL) {
+                return result;
+            }
+            // SAFETY: native code owns/frees only its temporary output here.
+            let received = unsafe { TypedBuffer::from_raw_with_len(self, pointer, len) };
+            let got = received.tptypes()?;
+            let want =
+                unsafe { TypedBuffer::borrowed_from_raw(odata.reply_context(), odata.reply_ptr()) }
+                    .tptypes()?;
+            if got.type_name != want.type_name || got.subtype != want.subtype {
+                return Err(AtmiError::new(
+                    raw::TPEOTYPE,
+                    format!(
+                        "TPNOCHANGE: receiver expects {}/{} but got {}/{} buffer",
+                        want.type_name, want.subtype, got.type_name, got.subtype
+                    ),
+                ));
+            }
+            // SAFETY: the old allocation remains owned by the destination until
+            // it adopts the checked temporary. No payload is copied.
+            let previous = unsafe { TypedBuffer::from_raw(self, odata.reply_ptr()) };
+            unsafe { odata.reply_adopt(received.into_raw(), len) };
+            drop(previous);
+        } else {
+            // SAFETY: generic output accepts the native pointer/type change.
+            unsafe { odata.reply_adopt(pointer, len) };
+        }
+        result
     }
 
     /// Submit a DLM request with native send retries and return its call descriptor.
     /// Collect the reply with `tpgetrply`. Submission is synchronous and can block;
     /// only submission is retried. The core enforces `TPNOTRAN`.
     pub fn tpdlmacall(&self, svc: &str, data: &TypedUbf<'_>, flags: i64) -> AtmiResult<i32> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         let svc = CString::new(svc)
             .map_err(|_| AtmiError::new(AtmiError::TPEINVAL, "DLM service contains NUL"))?;
         #[cfg(not(feature = "ctx-send"))]
@@ -207,6 +251,8 @@ impl AtmiCtx {
     /// Subsequent `tpsend`/`tprecv` calls and reconnection belong to the caller.
     /// The core enforces `TPNOTRAN`.
     pub fn tpdlmconnect(&self, svc: &str, data: &TypedUbf<'_>, flags: i64) -> AtmiResult<i32> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         let svc = CString::new(svc)
             .map_err(|_| AtmiError::new(AtmiError::TPEINVAL, "DLM service contains NUL"))?;
         #[cfg(not(feature = "ctx-send"))]

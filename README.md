@@ -177,9 +177,14 @@ estimates UBF allocation size from a positive field count and total value size.
 `UbfSerialize` / `UbfDeserialize` map named Rust structs to native UBF fields.
 These are the binding's own derive traits, not implementations of the generic
 `serde::Serialize` / `serde::Deserialize` traits. No async feature is required.
+The repository's tests and examples use the dev-only `ubf_fields` helper crate.
+Applications generate their own constants from their field table with
+`mkfldhdr -m4`; the library does not export test fields or run `mkfldhdr` when
+built as a dependency.
 
 ```rust,no_run
-use endurox_rs::{AtmiCtx, UbfDeserialize, UbfSerialize, ubf_fields as f};
+use endurox_rs::{AtmiCtx, UbfDeserialize, UbfSerialize};
+use ubf_fields as f;
 
 #[derive(Debug, PartialEq, UbfSerialize, UbfDeserialize)]
 struct Item {
@@ -320,8 +325,8 @@ The layout must be compiled and loaded through the usual `VIEWDIR` / `VIEWFILES`
 configuration; the derive does not generate a native layout.
 
 ```rust
-use endurox_rs::{UbfDeserialize, UbfSerialize, ViewDeserialize, ViewSerialize,
-                 ubf_fields as f};
+use endurox_rs::{UbfDeserialize, UbfSerialize, ViewDeserialize, ViewSerialize};
+use ubf_fields as f;
 
 #[derive(ViewSerialize, ViewDeserialize)]
 #[view(name = "POSITION")]
@@ -575,14 +580,20 @@ context.
 
 Concurrent async calls on one context share a single reactor registration.
 Replies are demultiplexed by call descriptor using `tpgetrply(TPGETANY)`, so a
-reply wakes exactly the future waiting for it, and no reply is ever diverted
-into Enduro/X's in-memory queue where the reply fd could not signal it again.
+reply wakes the future waiting for it. Synchronous operations made through
+`context()`, a retained context reference, or `Deref` may move replies into
+Enduro/X's memory queue. On return they wake the adapter to drain that queue;
+the notification itself makes no native calls and preserves diagnostics.
+Synchronous calls still block their executor thread while running.
 
 Dropping a send future while it waits for queue space stops all further attempts.
 Dropping `AsyncAtmiCtx::tpcall` after submission cancels its call descriptor; dropping
 `AsyncAtmiCtx::tpgetrply` leaves its caller-owned descriptor pending so it can
 be awaited again, collected with `TPGETANY`, or cancelled explicitly. A
 nonblocking receive that returns `TPEBLOCK` also releases its temporary claim.
+Explicit `AsyncAtmiCtx::tpcancel` wakes a collector with `TPEBADDESC`, including
+when it used `TPNOTIME`. Its descriptor stays reserved until that collector
+consumes the cancellation or is dropped.
 Concurrent waits for the same descriptor return `TPEPROTO`; a pending `tpcall`
 retains exclusive ownership of its reply. Multiple adapters may share one
 executor thread; each owns a separate Enduro/X context and reply queue.
@@ -590,6 +601,49 @@ executor thread; each owns a separate Enduro/X context and reply queue.
 The generic form is `AsyncAtmiCtx<D>`, where `D: AsyncReplyDriver`. The provided
 drivers are `TokioReplyDriver` and `AsyncIoReplyDriver`. Because the adapter
 owns `AtmiCtx`, a context cannot accidentally be registered with two reactors.
+
+# Reply buffer types
+
+Existing calls with separate buffers remain unchanged:
+
+```rust,ignore
+ctx.tpcall("SERVICE", &request, &mut reply, 0)?;
+```
+
+Use `tpcall_inplace` to send and receive through one owned buffer:
+
+```rust,no_run
+# use endurox_rs::{AtmiCtx, AtmiResult};
+# fn example(ctx: &AtmiCtx) -> AtmiResult<()> {
+let mut data = ctx.tpalloc_ubf(1024)?;
+ctx.tpcall_inplace("SERVICE", &mut data, 0)?;
+# Ok(())
+# }
+```
+
+Both forms also exist on `AsyncAtmiCtx`, where they are awaited. In-place calls
+retain the same flag, deadline, retry and cancellation behavior. Native growth
+or error replies update the original owner; the binding does not clone the
+request payload. A `TypedBuffer` can change type; a `TypedUbf` stays UBF.
+
+Synchronous and async `tpcall`/`tpgetrply` accept either `TypedBuffer` or
+`TypedUbf` through `ReplyBuffer`. `TypedUbf` automatically requires `TPNOCHANGE`:
+a different reply type, including NULL, returns `TPEOTYPE` and preserves the
+UBF destination. It can still grow or relocate. `TypedUbf` has its own
+`tprealloc` and UBF mutation methods; it does not expose `DerefMut` to a generic
+buffer that could change type.
+
+For a service returning different buffer types, receive into `TypedBuffer`
+without `TPNOCHANGE`, inspect `tptypes()`, then use `TypedUbf::from_typed` or
+`TypedView::from_typed` as appropriate. `TypedUbf::into_inner()` gives up the
+UBF restriction without copying the payload. Conversion back validates the
+allocation type. A service failure may still update the reply buffer.
+
+Queue `msgid()` and `corrid()` return references to the complete 32-byte binary
+IDs, including embedded zeroes. The setters accept up to 32 bytes and pad
+shorter IDs with zeroes. Use the whole returned ID for dequeue-by-msgid.
+UBF `bboolev`, `bfloatev`, `bcmp` and `bsubset` return `UbfResult` so native
+errors remain distinct from false, unequal, or a numeric result of -1.
 
 # Server dispatch threads
 
@@ -607,6 +661,22 @@ Rust integration also uses `ATMI_SRVLIB_NOLONGJUMP`, so `tpreturn` and
 `tpforward` return through Rust normally instead of performing a C `longjmp`
 across Rust stack frames. Service handlers must protect any shared application
 state because the same handler function can run concurrently.
+If a handler retains its request and replies/forwards with a different buffer,
+the binding defers the native operation until the handler returns. Returning
+the request itself, or dropping it before replying, sends immediately. Only
+the first reply is sent. An invalid forward name sends a failure reply.
+
+Without `ctx-send`, all `AtmiCtx` handles on a thread share a native session.
+Dropping a secondary handle no longer terminates another live handle's session;
+explicit `tpterm()` still terminates it immediately.
+
+# Documentation builds
+
+All builds, including `cargo doc --no-deps --all-features`, generate bindings
+from the installed Enduro/X headers into Cargo's `OUT_DIR`. Generated bindings
+are build artifacts and are not checked into Git. Documentation builds require
+the same native dependencies as ordinary builds.
+Tests and examples using the dev-only field helper run from a repository checkout.
 
 # Testing
 

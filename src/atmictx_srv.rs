@@ -3,6 +3,7 @@ use crate::{raw, AtmiCtx, AtmiError, AtmiResult, TpSvcInfo, TypedBuffer, TypedUb
 use core::ffi::{c_char, c_int, c_long};
 use std::ffi::{CStr, CString};
 use std::{
+    cell::RefCell,
     collections::HashMap,
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{Mutex, OnceLock},
@@ -284,6 +285,62 @@ impl Drop for ServerThreadModeGuard {
     }
 }
 
+/// What a service handler asked Enduro/X to do with its reply buffer.
+enum ReplyKind {
+    /// `tpreturn(rval, rcode, ..)`.
+    Return { rval: c_int, rcode: c_long },
+    /// `tpforward(svc, ..)`.
+    Forward { svc: CString },
+}
+
+/// A reply whose buffer ownership has already left Rust.
+struct ServiceReply {
+    kind: ReplyKind,
+    data: *mut c_char,
+    len: c_long,
+    flags: c_long,
+}
+
+/// Reply bookkeeping for the service call being dispatched on this thread.
+///
+/// Enduro/X registers the request as the call's auto-buffer and frees it inside
+/// `tpreturn`/`tpforward` whenever the reply is a different buffer
+/// (`libatmisrv/tpreturn.c`). A handler that keeps the request and replies
+/// with a new buffer would then hold freed memory: reading it is a
+/// use-after-free, and dropping it frees the address again, which under
+/// dispatch threads may by then belong to another worker's buffer.
+///
+/// The public C API offers no way to detach the auto-buffer, so the native
+/// reply is only issued once that cannot happen: at once when the reply is the
+/// request itself or the request was already freed, otherwise after the
+/// handler has returned and dropped everything it held.
+#[derive(Default)]
+struct DispatchFrame {
+    /// The request wrapper was dropped, which ran `tpfree` and cleared the
+    /// native auto-buffer. Stays `false` when ownership left Rust another way
+    /// (for example into a `BFLD_PTR` field), where the auto-buffer is still
+    /// armed.
+    request_released: bool,
+    /// A reply was issued or parked; any further one is discarded.
+    replied: bool,
+    /// Reply held back until the handler returns.
+    pending: Option<ServiceReply>,
+}
+
+thread_local! {
+    static DISPATCH_FRAME: RefCell<Option<DispatchFrame>> = const { RefCell::new(None) };
+}
+
+/// Record that the dispatched request buffer was freed through its Rust wrapper.
+pub(crate) fn service_request_released() {
+    // Ignore a destroyed thread-local: no dispatch is active while a thread exits.
+    let _ = DISPATCH_FRAME.try_with(|slot| {
+        if let Some(frame) = slot.borrow_mut().as_mut() {
+            frame.request_released = true;
+        }
+    });
+}
+
 /// Return the original native request buffer with a failure status.
 ///
 /// # Arguments
@@ -352,6 +409,14 @@ unsafe extern "C" fn rust_service_dispatch(svc_ptr: *mut raw::TPSVCINFO) {
     let ctx = worker_ctx
         .as_ref()
         .unwrap_or_else(|| &*(ctx_addr as *const AtmiCtx));
+    // Open the reply bookkeeping before the request wrapper exists. A null
+    // request has no auto-buffer to protect.
+    let outer_frame = DISPATCH_FRAME.with(|slot| {
+        slot.replace(Some(DispatchFrame {
+            request_released: (*svc_ptr).data.is_null(),
+            ..DispatchFrame::default()
+        }))
+    });
     let mut svc = TpSvcInfo::from_raw(ctx, svc_ptr);
 
     let key = if svc.fname().is_empty() {
@@ -369,28 +434,41 @@ unsafe extern "C" fn rust_service_dispatch(svc_ptr: *mut raw::TPSVCINFO) {
         Err(_) => None,
     };
 
-    match cb {
-        Some(handler) => {
-            if catch_unwind(AssertUnwindSafe(|| handler(ctx, &mut svc))).is_err() {
-                // Handler panicked. If it hadn't consumed the data buffer yet,
-                // use it for the error response; otherwise allocate a fresh one.
-                let err_ptr = match svc.take_data() {
-                    Some(buf) => buf.into_raw(),
-                    None => ctx
-                        .tpalloc_ubf(256)
-                        .map(|u| u.into_inner().into_raw())
-                        .unwrap_or(std::ptr::null_mut()),
-                };
-                ctx.tpreturn_raw(TpReturnStatus::Fail.to_raw(), 0, err_ptr, 0, 0);
-            }
-        }
-        None => {
-            let err_ptr = svc
-                .take_data()
-                .map(|b| b.into_raw())
-                .unwrap_or(std::ptr::null_mut());
-            ctx.tpreturn_raw(TpReturnStatus::Fail.to_raw(), 0, err_ptr, 0, 0);
-        }
+    let panicked = match cb {
+        Some(handler) => catch_unwind(AssertUnwindSafe(|| handler(ctx, &mut svc))).is_err(),
+        None => false,
+    };
+
+    // The handler has returned or unwound, so nothing it held is alive any
+    // more: a native reply can no longer free a buffer Rust still reaches.
+    let untouched = svc.take_data();
+    let frame = DISPATCH_FRAME
+        .with(|slot| slot.replace(outer_frame))
+        .unwrap_or_default();
+
+    if let Some(reply) = frame.pending {
+        // Free an untaken request first, which also clears the auto-buffer.
+        drop(untouched);
+        ctx.reply_value(reply);
+    } else if !frame.replied && (panicked || cb.is_none()) {
+        // No handler, or it panicked before replying. Fail the call with the
+        // request if it is still here, otherwise with a fresh buffer.
+        let err_ptr = match untouched {
+            Some(buf) => buf.into_raw(),
+            None => ctx
+                .tpalloc_ubf(256)
+                .map(|u| u.into_inner().into_raw())
+                .unwrap_or(std::ptr::null_mut()),
+        };
+        ctx.reply_value(ServiceReply {
+            kind: ReplyKind::Return {
+                rval: TpReturnStatus::Fail.to_raw(),
+                rcode: 0,
+            },
+            data: err_ptr,
+            len: 0,
+            flags: 0,
+        });
     }
 }
 
@@ -768,8 +846,10 @@ impl AtmiCtx {
         p_func: Option<ServiceCallback>,
         fn_nm: &str,
     ) -> AtmiResult<()> {
-        let c_svc = CString::new(svc_nm).map_err(|_| self.atmi_last_error())?;
-        let c_fn = CString::new(fn_nm).map_err(|_| self.atmi_last_error())?;
+        let c_svc = CString::new(svc_nm)
+            .map_err(|_| AtmiError::new(raw::TPEINVAL, "svc_nm contains NUL"))?;
+        let c_fn =
+            CString::new(fn_nm).map_err(|_| AtmiError::new(raw::TPEINVAL, "fn_nm contains NUL"))?;
 
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpadvertise_full(c_svc.as_ptr(), p_func, c_fn.as_ptr()) };
@@ -824,7 +904,8 @@ impl AtmiCtx {
     ///
     /// - `svc_nm`: Advertised service name, without embedded NUL bytes.
     pub fn tpunadvertise(&self, svc_nm: &str) -> AtmiResult<()> {
-        let c_svc = CString::new(svc_nm).map_err(|_| self.atmi_last_error())?;
+        let c_svc = CString::new(svc_nm)
+            .map_err(|_| AtmiError::new(raw::TPEINVAL, "svc_nm contains NUL"))?;
         let self_addr = self as *const AtmiCtx as usize;
 
         #[cfg(not(feature = "ctx-send"))]
@@ -842,83 +923,106 @@ impl AtmiCtx {
         Ok(())
     }
 
-    /// Transfer a native reply buffer to Enduro/X with the service outcome.
+    /// Hand a reply to Enduro/X through native `tpreturn` or `tpforward`.
     ///
     /// # Arguments
     ///
-    /// - `rval`: Native service return status, normally `TPSUCCESS` or `TPFAIL`.
-    /// - `rcode`: Application-defined service return code delivered to the caller.
-    /// - `data`: Reply or forwarded buffer whose ownership transfers to Enduro/X.
-    /// - `len`: Payload length in bytes; must be valid for the supplied native allocation.
-    /// - `flags`: Native service-operation flags; use `0` for default behavior.
+    /// - `reply`: Operation, buffer and flags; buffer ownership transfers to Enduro/X.
     ///
     /// # Safety
     ///
-    /// The native buffer and length must be valid and exclusively available for ownership
-    /// transfer. Call only during service dispatch with long jumps disabled.
-    unsafe fn tpreturn_raw(
-        &self,
-        rval: i32,
-        rcode: i64,
-        data: *mut c_char,
-        len: usize,
-        flags: i64,
-    ) {
-        #[cfg(not(feature = "ctx-send"))]
-        raw::tpreturn(
-            rval as c_int,
-            rcode as c_long,
-            data,
-            len as c_long,
-            flags as c_long,
-        );
+    /// The buffer must be valid and exclusively available for ownership transfer, and no Rust
+    /// wrapper may still refer to the request buffer of the current call unless it is the
+    /// buffer being passed. Call only during service dispatch with long jumps disabled.
+    unsafe fn reply_value(&self, reply: ServiceReply) {
+        match reply.kind {
+            ReplyKind::Return { rval, rcode } => {
+                #[cfg(not(feature = "ctx-send"))]
+                raw::tpreturn(rval, rcode, reply.data, reply.len, reply.flags);
 
-        #[cfg(feature = "ctx-send")]
-        raw::Otpreturn(
-            self.c_ctx_ptr(),
-            rval as c_int,
-            rcode as c_long,
-            data,
-            len as c_long,
-            flags as c_long,
-        );
+                #[cfg(feature = "ctx-send")]
+                raw::Otpreturn(
+                    self.c_ctx_ptr(),
+                    rval,
+                    rcode,
+                    reply.data,
+                    reply.len,
+                    reply.flags,
+                );
+            }
+            ReplyKind::Forward { svc } => {
+                #[cfg(not(feature = "ctx-send"))]
+                raw::tpforward(
+                    svc.as_ptr() as *mut c_char,
+                    reply.data,
+                    reply.len,
+                    reply.flags,
+                );
+
+                #[cfg(feature = "ctx-send")]
+                raw::Otpforward(
+                    self.c_ctx_ptr(),
+                    svc.as_ptr() as *mut c_char,
+                    reply.data,
+                    reply.len,
+                    reply.flags,
+                );
+            }
+        }
     }
 
-    /// Transfer the current request to another service through the native forwarding API.
+    /// Issue a handler's reply now, or park it until the handler has returned.
     ///
     /// # Arguments
     ///
-    /// - `svc`: Destination service name, without embedded NUL bytes.
-    /// - `data`: Reply or forwarded buffer whose ownership transfers to Enduro/X.
-    /// - `len`: Payload length in bytes; must be valid for the supplied native allocation.
+    /// - `kind`: Native operation to perform.
+    /// - `data`: Reply or forwarded buffer; consumed on every path.
     /// - `flags`: Native service-operation flags; use `0` for default behavior.
     ///
-    /// # Safety
-    ///
-    /// The service name must be a valid C string and the buffer must be exclusively available
-    /// for transfer with a valid length. Call during service dispatch with long jumps disabled.
-    pub(crate) unsafe fn tpforward(&self, svc: &str, data: *mut c_char, len: usize, flags: i64) {
-        let c_svc = match CString::new(svc) {
-            Ok(s) => s,
-            Err(_) => return,
+    /// See [`DispatchFrame`] for why a reply can be held back. Outside a Rust
+    /// dispatch (a native callback registered through
+    /// [`Self::tpadvertise_full`]) the reply always goes out at once.
+    fn submit_reply(&self, kind: ReplyKind, data: TypedBuffer<'_>, flags: i64) {
+        enum Action {
+            Now,
+            Park,
+            Discard,
+        }
+
+        let data_is_request = data.is_request();
+        let action = DISPATCH_FRAME.with(|slot| match slot.borrow_mut().as_mut() {
+            None => Action::Now,
+            Some(frame) if frame.replied => Action::Discard,
+            Some(frame) => {
+                frame.replied = true;
+                if data_is_request || frame.request_released {
+                    Action::Now
+                } else {
+                    Action::Park
+                }
+            }
+        });
+
+        if matches!(action, Action::Discard) {
+            // A second reply for one call: the first stands, free this buffer.
+            return;
+        }
+
+        let reply = ServiceReply {
+            kind,
+            len: data.len() as c_long,
+            data: data.into_raw(),
+            flags: flags as c_long,
         };
-
-        #[cfg(not(feature = "ctx-send"))]
-        raw::tpforward(
-            c_svc.as_ptr() as *mut c_char,
-            data,
-            len as c_long,
-            flags as c_long,
-        );
-
-        #[cfg(feature = "ctx-send")]
-        raw::Otpforward(
-            self.c_ctx_ptr(),
-            c_svc.as_ptr() as *mut c_char,
-            data,
-            len as c_long,
-            flags as c_long,
-        );
+        match action {
+            Action::Now => unsafe { self.reply_value(reply) },
+            Action::Park => DISPATCH_FRAME.with(|slot| {
+                if let Some(frame) = slot.borrow_mut().as_mut() {
+                    frame.pending = Some(reply);
+                }
+            }),
+            Action::Discard => unreachable!("handled above"),
+        }
     }
 
     /// Forward a UBF request from the current service to another service.
@@ -931,9 +1035,14 @@ impl AtmiCtx {
     ///
     /// This consumes `data` and transfers ownership to Enduro/X. The function
     /// returns normally under `tp_run`; return from the handler after forwarding.
+    /// As with [`Self::tpreturn`], the forward is issued when the handler returns
+    /// if the handler still holds the request buffer and forwards a different one.
     pub fn tpforward_ubf(&self, svc: &str, data: TypedUbf<'_>, flags: i64) {
-        let ptr = data.into_raw();
-        unsafe { self.tpforward(svc, ptr, 0, flags) };
+        let Ok(svc) = CString::new(svc) else {
+            self.tpreturn_ubf(TpReturnStatus::Fail, raw::TPEINVAL as i64, data, 0);
+            return;
+        };
+        self.submit_reply(ReplyKind::Forward { svc }, data.into_inner(), flags);
     }
 
     /// Request termination of the native server from a service callback.
@@ -1446,11 +1555,10 @@ impl AtmiCtx {
         let _runtime_guard = ServerRuntimeGuard;
         let _thread_mode_guard = unsafe { ServerThreadModeGuard::enable() };
 
-        let args: Vec<String> = std::env::args().collect();
-        let mut cargs: Vec<CString> = args
-            .iter()
+        use std::os::unix::ffi::OsStrExt;
+        let mut cargs: Vec<CString> = std::env::args_os()
             .map(|s| {
-                CString::new(s.as_str())
+                CString::new(s.as_bytes())
                     .map_err(|_| AtmiError::new(raw::TPEINVAL, "argv contains NUL byte"))
             })
             .collect::<Result<_, _>>()?;
@@ -1496,10 +1604,22 @@ impl AtmiCtx {
     /// transferred to the XATMI framework. The buffer's tracked `len()` is
     /// forwarded as the `tpreturn` length argument (relevant for CARRAY/STRING;
     /// ignored for self-describing buffer types).
+    ///
+    /// The reply is sent immediately when `data` is the request buffer or the
+    /// request buffer has already been dropped. If the handler still holds the
+    /// request and replies with a different buffer, the reply is sent when the
+    /// handler returns: Enduro/X frees the request as part of replying, which
+    /// must not happen while Rust code can still use it. Only the first reply
+    /// of a call is sent; a later one is discarded and its buffer freed.
     pub fn tpreturn(&self, status: TpReturnStatus, rcode: i64, data: TypedBuffer<'_>, flags: i64) {
-        let len = data.len();
-        let ptr = data.into_raw();
-        unsafe { self.tpreturn_raw(status.to_raw(), rcode, ptr, len, flags) };
+        self.submit_reply(
+            ReplyKind::Return {
+                rval: status.to_raw(),
+                rcode: rcode as c_long,
+            },
+            data,
+            flags,
+        );
     }
 
     /// Return a UBF buffer from a service callback.

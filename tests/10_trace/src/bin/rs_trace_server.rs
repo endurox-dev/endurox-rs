@@ -1,4 +1,5 @@
-use endurox_rs::{ubf_fields as f, *};
+use endurox_rs::*;
+use ubf_fields as f;
 
 fn traced(ctx: &AtmiCtx, svc: &mut TpSvcInfo<'_>) {
     let mut data = TypedUbf::from_typed(svc.take_data().expect("request")).expect("UBF");

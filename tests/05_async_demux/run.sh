@@ -64,8 +64,8 @@ if [ "${1:-}" = "--send-only" ]; then
     # queue backend has no reactor-compatible reply fd. The ignored unit test
     # supplies a socket registration and exercises real native queue sends.
     export ENDUROX_RS_TEST_SEND_DOMAIN=1
-    if ! cargo test --manifest-path "$PROJECT_DIR/Cargo.toml" --features tokio --lib \
-        native_queue_pressure_preserves_priority -- --ignored --test-threads=1; then
+    if ! cargo test --manifest-path "$PROJECT_DIR/Cargo.toml" --all-features --lib \
+        native_ -- --ignored --test-threads=1; then
         dump_logs
         exit 1
     fi

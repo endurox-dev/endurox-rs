@@ -2,7 +2,8 @@
 mod test_duration;
 use std::time::Instant;
 
-use endurox_rs::{ubf_fields as f, *};
+use endurox_rs::*;
+use ubf_fields as f;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = AtmiCtx::new()?;

@@ -1,0 +1,8 @@
+[package]
+name = "endurox-rs-test-fields"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "UBF field constants generated from tests/ubftab/test.fd for the endurox-rs tests and examples."
+
+[dependencies]

@@ -22,6 +22,41 @@ type CtxMarker = Cell<()>; // -> Send & !Sync
 #[cfg(feature = "ctx-send")]
 type CtxHandle = raw::TPCONTEXT_T;
 
+// Without `ctx-send` there is no native handle: every `AtmiCtx` on a thread is
+// a view of that thread's one ATMI session. Count the live views, borrowed
+// callback ones included, so that only the last owner leaving runs `tpterm()`.
+// Terminating on every drop let a short-lived second context close the reply
+// queue, call descriptors and XA connection under the first, and inside a
+// service handler it closed the dispatch worker's own session mid-request
+// (workers join as clients, `libatmi/init.c`).
+#[cfg(not(feature = "ctx-send"))]
+thread_local! {
+    static THREAD_CTX_VIEWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Record one more live view of the current thread's ATMI session.
+#[cfg(not(feature = "ctx-send"))]
+#[inline]
+fn thread_view_enter() {
+    THREAD_CTX_VIEWS.with(|views| views.set(views.get() + 1));
+}
+
+/// Drop one view of the current thread's session; `true` when it was the last.
+///
+/// A destroyed thread-local means the thread is exiting, where the session is
+/// treated as unshared.
+#[cfg(not(feature = "ctx-send"))]
+#[inline]
+fn thread_view_leave() -> bool {
+    THREAD_CTX_VIEWS
+        .try_with(|views| {
+            let left = views.get().saturating_sub(1);
+            views.set(left);
+            left == 0
+        })
+        .unwrap_or(true)
+}
+
 /// Per-thread XATMI context.
 ///
 /// By default the context is neither `Send` nor `Sync`. With the `ctx-send`
@@ -35,6 +70,12 @@ pub struct AtmiCtx {
 
     #[cfg(feature = "ctx-send")]
     handle: Cell<CtxHandle>,
+
+    // Installed only while an AsyncAtmiCtx owns this context. The demux is
+    // pinned, so moving the adapter does not invalidate this pointer. Cleared
+    // before the demux is destroyed or this context leaves the adapter.
+    #[cfg(feature = "async")]
+    pub(crate) reply_demux: Option<std::ptr::NonNull<crate::async_atmi::ReplyDemux>>,
 }
 
 // SAFETY: `ctx-send` creates the handle detached (`tpnewctxt(0, 0)`). Operations
@@ -49,9 +90,14 @@ unsafe impl Send for AtmiCtx {}
 /// Context lifecycle, allocation, and native error access.
 impl AtmiCtx {
     /// Create a new ATMI context handle.
+    ///
+    /// Without the `ctx-send` feature all contexts created on one thread share
+    /// that thread's native session: the session is terminated when the last of
+    /// them is dropped, or at once by an explicit [`Self::tpterm`].
     pub fn new() -> Result<Self, AtmiError> {
         #[cfg(not(feature = "ctx-send"))]
         {
+            thread_view_enter();
             Ok(AtmiCtx {
                 _marker: PhantomData,
                 borrowed: false,
@@ -74,6 +120,8 @@ impl AtmiCtx {
                     _marker: PhantomData,
                     borrowed: false,
                     handle: Cell::new(handle),
+                    #[cfg(feature = "async")]
+                    reply_demux: None,
                 })
             }
         }
@@ -332,6 +380,7 @@ impl AtmiCtx {
     pub(crate) unsafe fn borrow_current_context() -> AtmiResult<Self> {
         #[cfg(not(feature = "ctx-send"))]
         {
+            thread_view_enter();
             Ok(Self {
                 _marker: PhantomData,
                 borrowed: true,
@@ -347,6 +396,8 @@ impl AtmiCtx {
                     _marker: PhantomData,
                     borrowed: true,
                     handle: Cell::new(handle),
+                    #[cfg(feature = "async")]
+                    reply_demux: None,
                 })
             } else if rc == raw::EXFAIL as c_int {
                 Err(Self::current_thread_atmi_error())
@@ -378,8 +429,10 @@ impl AtmiCtx {
 impl Drop for AtmiCtx {
     /// Terminate and free an owned context, or restore a borrowed callback context to native TLS.
     fn drop(&mut self) {
+        // The native caller owns a borrowed session, and a session still
+        // viewed by another context on this thread must stay open.
         #[cfg(not(feature = "ctx-send"))]
-        if !self.borrowed {
+        if thread_view_leave() && !self.borrowed {
             unsafe {
                 raw::tpterm();
             }

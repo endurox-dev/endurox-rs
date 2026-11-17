@@ -1,7 +1,8 @@
 //! Native client and transaction identifiers used by the safe XATMI wrappers.
 /// Opaque ATMI client identifier returned by `TpSvcInfo::cltid()`.
 /// Pass it to `AtmiCtx::tpnotify()`.
-pub type ClientId = crate::raw::CLIENTID;
+#[derive(Debug, Clone, Copy)]
+pub struct ClientId(pub(crate) crate::raw::CLIENTID);
 
 /// Transaction identifier filled by `tpsuspend` and consumed by `tpresume`.
 #[derive(Debug)]

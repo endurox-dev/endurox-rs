@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use endurox_rs::{ubf_fields, AtmiCtx, UbfValue};
+use endurox_rs::{AtmiCtx, UbfValue};
 
 #[test]
 fn bboolpr_prints_simple_field_comparison() {
@@ -47,7 +47,7 @@ fn bboolpr_prints_compound_expression() {
         .bboolco("(T_LONG_FLD > 50) && (T_STRING_FLD == 'hello')")
         .expect("Bboolco failed");
 
-    assert!(ubf.bboolev(&tree));
+    assert!(ubf.bboolev(&tree).unwrap());
 
     let printed = ctx.bboolpr(&tree).expect("Bboolpr failed");
     assert!(!printed.is_empty());

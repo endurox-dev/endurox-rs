@@ -1,6 +1,4 @@
-use endurox_rs::{
-    ubf_fields, AtmiCtx, AtmiResult, ServerHooks, TpReturnStatus, TpSvcInfo, TypedUbf, UbfValue,
-};
+use endurox_rs::{AtmiCtx, AtmiResult, ServerHooks, TpReturnStatus, TpSvcInfo, TypedUbf, UbfValue};
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -236,6 +234,11 @@ fn rs_it_init(ctx: &AtmiCtx, _args: &[String]) -> AtmiResult<()> {
     ctx.tpadvertise("RS_IT_EVENTCOUNT", rs_it_eventcount)?;
     ctx.tpadvertise("RS_IT_REQLOG", rs_it_reqlog)?;
     ctx.tpadvertise("RS_IT_DLM", rs_it_dlm)?;
+    ctx.tpadvertise("RS_IT_REPLY_IMAGE", rs_it_reply_image)?;
+    ctx.tpadvertise("RS_IT_INPLACE", rs_it_inplace)?;
+    ctx.tpadvertise("RS_IT_BAD_FORWARD", rs_it_bad_forward)?;
+    ctx.tpadvertise("RS_IT_REPLY_NEW", rs_it_reply_new)?;
+    ctx.tpadvertise("RS_IT_REPLY_UNTAKEN", rs_it_reply_untaken)?;
     Ok(())
 }
 
@@ -355,4 +358,127 @@ fn rs_it_dlm(ctx: &AtmiCtx, svc: &mut TpSvcInfo<'_>) {
     } else {
         ctx.tpreturn_ubf(TpReturnStatus::Success, 0, data, 0);
     }
+}
+
+static REPLY_NEW_CORRUPT: AtomicUsize = AtomicUsize::new(0);
+
+/// Replies with a freshly allocated buffer instead of the request.
+///
+/// Enduro/X frees the request (its auto-buffer) when it sends a different
+/// buffer. The request field selects how the handler treats its request:
+/// `keep` holds it across the reply, `drop` frees it first, and `ctx` also
+/// creates and drops a second context before replying. Corruption seen after
+/// a reply is reported by the following replies.
+fn rs_it_reply_new(ctx: &AtmiCtx, svc: &mut TpSvcInfo<'_>) {
+    let req_fld = ubf_fields::T_STRING_FLD;
+    let rsp_fld = ubf_fields::T_STRING_2_FLD;
+    let corrupt_before = REPLY_NEW_CORRUPT.load(Ordering::SeqCst);
+
+    let Some(req) = svc.take_data_ubf() else {
+        return;
+    };
+    let Ok(mode) = req.bget_string(req_fld, 0) else {
+        ctx.tpreturn_ubf(TpReturnStatus::Fail, 1, req, 0);
+        return;
+    };
+    let size = req.tptypes().map(|info| info.size).unwrap_or(1024);
+
+    if mode == "ctx" {
+        // Another context on this thread shares the worker's session. Dropping
+        // it must not terminate that session under the handler.
+        drop(AtmiCtx::new());
+        if ctx.tpgetsrvid().is_err() {
+            ctx.tpreturn_ubf(TpReturnStatus::Fail, 2, req, 0);
+            return;
+        }
+    }
+
+    let Ok(mut rsp) = ctx.tpalloc_ubf(1024) else {
+        ctx.tpreturn_ubf(TpReturnStatus::Fail, 3, req, 0);
+        return;
+    };
+    let text = format!("NEW:{mode}:corrupt={corrupt_before}");
+    if rsp.bchg(rsp_fld, 0, UbfValue::String(text), true).is_err() {
+        ctx.tpreturn_ubf(TpReturnStatus::Fail, 4, req, 0);
+        return;
+    }
+
+    if mode == "drop" {
+        drop(req);
+        ctx.tpreturn_ubf(TpReturnStatus::Success, 0, rsp, 0);
+        return;
+    }
+
+    ctx.tpreturn_ubf(TpReturnStatus::Success, 0, rsp, 0);
+
+    // The request must still be intact here. Allocate over anything the reply
+    // may have freed, then read the request back.
+    let mut spill = Vec::new();
+    for _ in 0..8 {
+        if let Ok(mut other) = ctx.tpalloc_ubf(size) {
+            let _ = other.bchg(req_fld, 0, "OVERWRITE-OVERWRITE-OVERWRITE", true);
+            spill.push(other);
+        }
+    }
+    if req.bget_string(req_fld, 0).ok().as_deref() != Some(mode.as_str()) {
+        REPLY_NEW_CORRUPT.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Replies with a new buffer without ever taking the request out of `svc`.
+fn rs_it_reply_untaken(ctx: &AtmiCtx, _svc: &mut TpSvcInfo<'_>) {
+    let Ok(mut rsp) = ctx.tpalloc_ubf(1024) else {
+        return;
+    };
+    let text = format!(
+        "NEW:untaken:corrupt={}",
+        REPLY_NEW_CORRUPT.load(Ordering::SeqCst)
+    );
+    if rsp
+        .bchg(ubf_fields::T_STRING_2_FLD, 0, UbfValue::String(text), true)
+        .is_ok()
+    {
+        ctx.tpreturn_ubf(TpReturnStatus::Success, 0, rsp, 0);
+    }
+}
+
+fn rs_it_reply_image(ctx: &AtmiCtx, svc: &mut TpSvcInfo<'_>) {
+    let Some(request) = svc.take_data_ubf() else {
+        return;
+    };
+    let Ok(image) = request.bwrite() else {
+        return;
+    };
+    let Ok(reply) = ctx.tpalloc_carray(&image) else {
+        return;
+    };
+    ctx.tpreturn(TpReturnStatus::Success, 0, reply, 0);
+}
+
+fn rs_it_bad_forward(ctx: &AtmiCtx, svc: &mut TpSvcInfo<'_>) {
+    if let Some(request) = svc.take_data_ubf() {
+        ctx.tpforward_ubf("bad\0service", request, 0);
+    }
+}
+
+fn rs_it_inplace(ctx: &AtmiCtx, svc: &mut TpSvcInfo<'_>) {
+    let Some(mut data) = svc.take_data_ubf() else {
+        return;
+    };
+    let mode = data.bget_string(ubf_fields::T_STRING_FLD, 0).unwrap();
+    data.bchg(ubf_fields::T_CARRAY_FLD, 0, vec![0x5Au8; 12000], true)
+        .unwrap();
+    data.bchg(
+        ubf_fields::T_STRING_2_FLD,
+        0,
+        format!("INPLACE:{mode}"),
+        true,
+    )
+    .unwrap();
+    let status = if mode == "fail" {
+        TpReturnStatus::Fail
+    } else {
+        TpReturnStatus::Success
+    };
+    ctx.tpreturn_ubf(status, 37, data, 0);
 }

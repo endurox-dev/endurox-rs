@@ -12,8 +12,8 @@
 //! routed to its own descriptor, so both calls complete.
 
 use endurox_rs::{
-    ubf_fields, AtmiCtx, AtmiError, TokioAtmiCtx, TypedBuffer, UbfValue, TPABSOLUTE, TPBLK_NEXT,
-    TPNOBLOCK, TPNOREPLY, TPNOTIME,
+    AtmiCtx, AtmiError, TokioAtmiCtx, TypedBuffer, UbfValue, TPABSOLUTE, TPBLK_NEXT, TPNOBLOCK,
+    TPNOREPLY, TPNOTIME,
 };
 use std::cell::Cell;
 use std::time::{Duration, Instant};

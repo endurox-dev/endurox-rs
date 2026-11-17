@@ -1,5 +1,5 @@
 //! XATMI calls, conversations, transactions, events, queues, and timeout configuration.
-use crate::{raw, AtmiCtx, AtmiError, AtmiResult, TpTranId, TypedBuffer, TypedUbf};
+use crate::{raw, AtmiCtx, AtmiError, AtmiResult, ReplyBuffer, TpTranId, TypedBuffer, TypedUbf};
 use core::ffi::{c_char, c_int, c_long};
 use std::ffi::{CStr, CString};
 use std::ptr;
@@ -60,39 +60,80 @@ fn cstr_prefix_to_string(bytes: &[u8]) -> String {
 impl AtmiCtx {
     /// Synchronous RPC call with separate input and output buffers.
     ///
-    /// # Arguments
-    ///
-    /// - `svc`: Advertised destination service name, without embedded NUL bytes.
-    /// - `idata`: Borrowed request buffer; the call uses its tracked payload length.
-    /// - `odata`: Reply buffer, updated with native pointer and length changes even when the
-    ///   call fails.
-    /// - `flags`: Call flags such as `TPNOBLOCK`, `TPNOTIME`, or `TPNOCHANGE`; `TPNOREPLY` is
-    ///   invalid.
-    ///
-    /// This mirrors the C API: `idata` is the request buffer, and `odata` is the
-    /// reply buffer. Enduro/X may reallocate `odata`; this wrapper adopts the
-    /// returned pointer and length on both success and failure.
+    /// `idata` supplies the request and `odata` receives the reply. Native
+    /// pointer and length updates are preserved even on errors. A `TypedUbf`
+    /// output requires a UBF reply; a generic `TypedBuffer` accepts any type.
+    /// Use [`Self::tpcall_inplace`] to send and receive through one buffer.
+    /// `TPNOREPLY` is invalid; other flags retain their native meanings.
     pub fn tpcall(
         &self,
         svc: &str,
         idata: &TypedBuffer<'_>,
-        odata: &mut TypedBuffer<'_>,
+        odata: &mut impl ReplyBuffer,
         flags: i64,
     ) -> AtmiResult<()> {
-        let c_svc = CString::new(svc).map_err(|_| self.atmi_last_error())?;
-        let ilen = idata.len() as c_long;
-        let mut reply = odata.as_ptr();
+        self.tpcall_value(svc, Some(idata), odata, flags)
+    }
+
+    /// Send this buffer as the request and replace its contents with the reply.
+    ///
+    /// Calls native `tpcall` with the same input/output allocation. No second
+    /// buffer or Rust-side payload copy is needed, though Enduro/X may grow or
+    /// replace the allocation. Pointer/length changes are adopted on errors too.
+    /// A `TypedUbf` requires a UBF reply; convert with `into_inner()` first when
+    /// the service may return a different type. Flags/timeouts match [`Self::tpcall`].
+    ///
+    /// ```no_run
+    /// # use endurox_rs::{AtmiCtx, AtmiResult};
+    /// # fn example(ctx: &AtmiCtx) -> AtmiResult<()> {
+    /// let mut data = ctx.tpalloc_ubf(1024)?;
+    /// ctx.tpcall_inplace("SERVICE", &mut data, 0)?;
+    /// let mut reply = ctx.tpalloc_ubf(1024)?;
+    /// ctx.tpcall("SERVICE", &data, &mut reply, 0)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn tpcall_inplace(
+        &self,
+        svc: &str,
+        data: &mut impl ReplyBuffer,
+        flags: i64,
+    ) -> AtmiResult<()> {
+        self.tpcall_value(svc, None, data, flags)
+    }
+
+    /// Shared native call and ownership handover for both buffer-borrow forms.
+    fn tpcall_value(
+        &self,
+        svc: &str,
+        idata: Option<&TypedBuffer<'_>>,
+        odata: &mut impl ReplyBuffer,
+        flags: i64,
+    ) -> AtmiResult<()> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
+        let c_svc =
+            CString::new(svc).map_err(|_| AtmiError::new(raw::TPEINVAL, "svc contains NUL"))?;
+        // Snapshot the input before native code is allowed to replace the
+        // output. None passes the same allocation for input and output.
+        let (input, ilen) = match idata {
+            Some(input) => (input.as_ptr(), input.len() as c_long),
+            None => (odata.reply_ptr(), odata.reply_len() as c_long),
+        };
+        // A typed wrapper such as `TypedUbf` adds `TPNOCHANGE` here.
+        let flags = flags | odata.reply_flags();
+        let mut reply = odata.reply_ptr();
         // `olen` is in/out: it carries the current length in and the reply
         // length back. Seeding it with zero meant an error path where Enduro/X
         // returns before touching the buffer reported a length of zero, wiping
         // the caller's existing contents from view.
-        let mut olen: c_long = odata.len() as c_long;
+        let mut olen: c_long = odata.reply_len() as c_long;
 
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe {
             raw::tpcall(
                 c_svc.as_ptr() as *mut c_char,
-                idata.as_ptr(),
+                input,
                 ilen,
                 &mut reply,
                 &mut olen,
@@ -105,7 +146,7 @@ impl AtmiCtx {
             raw::Otpcall(
                 self.c_ctx_ptr(),
                 c_svc.as_ptr() as *mut c_char,
-                idata.as_ptr(),
+                input,
                 ilen,
                 &mut reply,
                 &mut olen,
@@ -117,8 +158,8 @@ impl AtmiCtx {
         // runs `ndrx_mbuf_prepare_incoming(.., char **odata, long *olen, ..)`,
         // which can reallocate, *before* raising TPESVCFAIL. Keeping the old
         // pointer on that path leaves it dangling and leaks the replacement.
-        odata.replace_ptr(reply);
-        odata.set_len_reported(olen.max(0) as usize);
+        // SAFETY: `reply`/`olen` are what the call stored back for this slot.
+        unsafe { odata.reply_adopt(reply, olen.max(0) as usize) };
 
         if rc == raw::EXSUCCEED as c_int {
             Ok(())
@@ -139,7 +180,10 @@ impl AtmiCtx {
     /// - `flags`: Submission flags; `TPNOBLOCK` fails on a full queue, and `TPNOREPLY` requests
     ///   no reply.
     pub fn tpacall(&self, svc: &str, data: &TypedBuffer<'_>, flags: i64) -> AtmiResult<i32> {
-        let c_svc = CString::new(svc).map_err(|_| self.atmi_last_error())?;
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
+        let c_svc =
+            CString::new(svc).map_err(|_| AtmiError::new(raw::TPEINVAL, "svc contains NUL"))?;
         let ilen = data.len() as c_long;
 
         #[cfg(not(feature = "ctx-send"))]
@@ -184,16 +228,20 @@ impl AtmiCtx {
     pub fn tpgetrply(
         &self,
         cd: &mut i32,
-        data: &mut TypedBuffer<'_>,
+        data: &mut impl ReplyBuffer,
         flags: i64,
     ) -> AtmiResult<()> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         let mut c_cd = *cd as c_int;
-        let mut odata = data.as_ptr();
+        // A typed wrapper such as `TypedUbf` adds `TPNOCHANGE` here.
+        let flags = flags | data.reply_flags();
+        let mut odata = data.reply_ptr();
         // `olen` is in/out: it carries the current length in and the reply
         // length back. Seeding it with zero meant an error path where Enduro/X
         // returns before touching the buffer reported a length of zero, wiping
         // the caller's existing contents from view.
-        let mut olen: c_long = data.len() as c_long;
+        let mut olen: c_long = data.reply_len() as c_long;
 
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpgetrply(&mut c_cd, &mut odata, &mut olen, flags as c_long) };
@@ -216,8 +264,8 @@ impl AtmiCtx {
         // old pointer on those paths leaves it dangling and leaks the
         // replacement, and drops the descriptor that says which call failed.
         *cd = c_cd as i32;
-        data.replace_ptr(odata);
-        data.set_len_reported(olen.max(0) as usize);
+        // SAFETY: `odata`/`olen` are what the call stored back for this slot.
+        unsafe { data.reply_adopt(odata, olen.max(0) as usize) };
 
         if rc == raw::EXSUCCEED as c_int {
             Ok(())
@@ -232,6 +280,8 @@ impl AtmiCtx {
     ///
     /// - `cd`: Outstanding call descriptor returned by `tpacall`.
     pub fn tpcancel(&self, cd: i32) -> AtmiResult<()> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpcancel(cd as c_int) };
 
@@ -288,7 +338,7 @@ impl AtmiCtx {
         &self,
         svc: &str,
         idata: &TypedBuffer<'_>,
-        odata: &mut TypedBuffer<'_>,
+        odata: &mut impl ReplyBuffer,
         flags: i64,
     ) -> AtmiResult<()> {
         #[cfg(not(endurox_pollable))]
@@ -318,7 +368,7 @@ impl AtmiCtx {
         &self,
         svc: &str,
         idata: &TypedBuffer<'_>,
-        odata: &mut TypedBuffer<'_>,
+        odata: &mut impl ReplyBuffer,
         flags: i64,
     ) -> AtmiResult<()> {
         if flags & raw::TPNOREPLY as i64 != 0 {
@@ -362,7 +412,7 @@ impl AtmiCtx {
     fn tpgetrply_polled(
         &self,
         cd: &mut i32,
-        data: &mut TypedBuffer<'_>,
+        data: &mut impl ReplyBuffer,
         flags: i64,
         deadline: Option<Instant>,
     ) -> AtmiResult<()> {
@@ -482,7 +532,10 @@ impl AtmiCtx {
     /// argument bypassed the allocation checks on `set_len`, so a value larger
     /// than the buffer reached the native copy.
     pub fn tpconnect(&self, svc: &str, data: &TypedBuffer<'_>, flags: i64) -> AtmiResult<i32> {
-        let c_svc = CString::new(svc).map_err(|_| self.atmi_last_error())?;
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
+        let c_svc =
+            CString::new(svc).map_err(|_| AtmiError::new(raw::TPEINVAL, "svc contains NUL"))?;
 
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe {
@@ -518,6 +571,8 @@ impl AtmiCtx {
     ///
     /// - `cd`: Conversation descriptor returned by `tpconnect` or supplied to a service.
     pub fn tpdiscon(&self, cd: i32) -> AtmiResult<()> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpdiscon(cd as c_int) };
 
@@ -544,16 +599,20 @@ impl AtmiCtx {
     pub fn tprecv(
         &self,
         cd: i32,
-        data: &mut TypedBuffer<'_>,
+        data: &mut impl ReplyBuffer,
         flags: i64,
         revent: &mut i64,
     ) -> AtmiResult<usize> {
-        let mut odata = data.as_ptr();
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
+        // A typed wrapper such as `TypedUbf` adds `TPNOCHANGE` here.
+        let flags = flags | data.reply_flags();
+        let mut odata = data.reply_ptr();
         // `olen` is in/out: it carries the current length in and the reply
         // length back. Seeding it with zero meant an error path where Enduro/X
         // returns before touching the buffer reported a length of zero, wiping
         // the caller's existing contents from view.
-        let mut olen: c_long = data.len() as c_long;
+        let mut olen: c_long = data.reply_len() as c_long;
         let mut c_revent: c_long = 0;
 
         #[cfg(not(feature = "ctx-send"))]
@@ -583,8 +642,8 @@ impl AtmiCtx {
         // before the error was raised, and the length was previously dropped
         // even on success.
         *revent = c_revent as i64;
-        data.replace_ptr(odata);
-        data.set_len_reported(olen.max(0) as usize);
+        // SAFETY: `odata`/`olen` are what the call stored back for this slot.
+        unsafe { data.reply_adopt(odata, olen.max(0) as usize) };
 
         if rc == raw::EXSUCCEED as c_int {
             Ok(olen.max(0) as usize)
@@ -614,6 +673,8 @@ impl AtmiCtx {
         flags: i64,
         revent: &mut i64,
     ) -> AtmiResult<()> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         let mut c_revent: c_long = 0;
 
         #[cfg(not(feature = "ctx-send"))]
@@ -654,6 +715,8 @@ impl AtmiCtx {
     ///
     /// - `flags`: Reserved by the native abort API; pass `0`.
     pub fn tpabort(&self, flags: i64) -> AtmiResult<()> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpabort(flags as c_long) };
 
@@ -686,6 +749,8 @@ impl AtmiCtx {
     /// - `timeout`: Maximum transaction lifetime in seconds.
     /// - `flags`: Reserved by the native begin API; pass `0`.
     pub fn tpbegin(&self, timeout: u64, flags: i64) -> AtmiResult<()> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpbegin(timeout as _, flags as c_long) };
 
@@ -702,6 +767,8 @@ impl AtmiCtx {
     /// - `flags`: `0` uses the configured commit mode; native `TPTXCOMMITDLOG` returns after
     ///   the commit decision is logged.
     pub fn tpcommit(&self, flags: i64) -> AtmiResult<()> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpcommit(flags as c_long) };
 
@@ -718,6 +785,8 @@ impl AtmiCtx {
     ///
     /// - `flags`: XATMI operation flags; use `0` for the native default behavior.
     pub fn tpsuspend(&self, flags: i64) -> AtmiResult<TpTranId> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         let mut tranid: raw::TPTRANID = unsafe { std::mem::zeroed() };
 
         #[cfg(not(feature = "ctx-send"))]
@@ -740,6 +809,8 @@ impl AtmiCtx {
     /// - `tranid`: Identifier returned when the transaction was suspended.
     /// - `flags`: XATMI operation flags; use `0` for the native default behavior.
     pub fn tpresume(&self, tranid: &TpTranId, flags: i64) -> AtmiResult<()> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         let mut inner = tranid.0;
 
         #[cfg(not(feature = "ctx-send"))]
@@ -753,6 +824,8 @@ impl AtmiCtx {
 
     /// Open the XA resource manager associated with this context.
     pub fn tpopen(&self) -> AtmiResult<()> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpopen() };
 
@@ -764,6 +837,8 @@ impl AtmiCtx {
 
     /// Close the XA resource manager associated with this context.
     pub fn tpclose(&self) -> AtmiResult<()> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpclose() };
 
@@ -881,6 +956,8 @@ impl AtmiCtx {
         ctl: &crate::TpEvCtl,
         flags: i64,
     ) -> AtmiResult<i64> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         let c_expr = CString::new(eventexpr)
             .map_err(|_| AtmiError::new(AtmiError::TPEINVAL, "event expression contains NUL"))?;
         let c_filter = filter
@@ -931,6 +1008,8 @@ impl AtmiCtx {
     ///
     /// Returns the number of subscriptions removed.
     pub fn tpunsubscribe(&self, subscription: i64, flags: i64) -> AtmiResult<i32> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpunsubscribe(subscription as c_long, flags as c_long) };
 
@@ -956,6 +1035,8 @@ impl AtmiCtx {
     ///
     /// Returns the number of servers that consumed the event.
     pub fn tppost(&self, eventname: &str, data: &TypedBuffer<'_>, flags: i64) -> AtmiResult<i32> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         let c_event = CString::new(eventname)
             .map_err(|_| AtmiError::new(AtmiError::TPEINVAL, "event name contains NUL"))?;
 
@@ -1039,7 +1120,7 @@ impl AtmiCtx {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe {
             raw::tpnotify(
-                clientid,
+                &mut clientid.0,
                 data.as_ptr(),
                 data.len() as c_long,
                 flags as c_long,
@@ -1050,7 +1131,7 @@ impl AtmiCtx {
         let rc = unsafe {
             raw::Otpnotify(
                 self.c_ctx_ptr(),
-                clientid,
+                &mut clientid.0,
                 data.as_ptr(),
                 data.len() as c_long,
                 flags as c_long,
@@ -1080,15 +1161,15 @@ impl AtmiCtx {
         let c_lmid = lmid
             .map(CString::new)
             .transpose()
-            .map_err(|_| self.atmi_last_error())?;
+            .map_err(|_| AtmiError::new(raw::TPEINVAL, "lmid contains NUL"))?;
         let c_usr = usrname
             .map(CString::new)
             .transpose()
-            .map_err(|_| self.atmi_last_error())?;
+            .map_err(|_| AtmiError::new(raw::TPEINVAL, "usrname contains NUL"))?;
         let c_clt = cltname
             .map(CString::new)
             .transpose()
-            .map_err(|_| self.atmi_last_error())?;
+            .map_err(|_| AtmiError::new(raw::TPEINVAL, "cltname contains NUL"))?;
 
         let p_lmid = c_lmid
             .as_ref()
@@ -1133,6 +1214,8 @@ impl AtmiCtx {
 
     /// Ask Enduro/X to dispatch pending unsolicited messages.
     pub fn tpchkunsol(&self) -> AtmiResult<()> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpchkunsol() };
 
@@ -1177,18 +1260,29 @@ impl AtmiCtx {
     ///
     /// # Arguments
     ///
-    /// - `payload`: Exported buffer bytes to decode.
+    /// - `payload`: Exported buffer text to decode, as produced by [`Self::tpexport`]. Trailing
+    ///   NUL bytes are ignored; a NUL anywhere else is rejected with `TPEINVAL`.
     /// - `flags`: Import options; `0` reads JSON export data, and `TPEX_STRING` reads
     ///   base64-encoded export data.
     pub fn tpimport<'ctx>(&'ctx self, payload: &[u8], flags: i64) -> AtmiResult<TypedBuffer<'ctx>> {
+        // Native tpimport ignores `ilen`: it runs `strlen(istr)` and a
+        // NUL-terminated JSON parse (`ndrx_tpimportex`, `libatmi/tpimport.c`).
+        // Handing it the slice as-is reads past the end whenever the caller's
+        // bytes are not terminated, so the text is copied into a C string.
+        let text_len = payload.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+        let c_payload = CString::new(&payload[..text_len]).map_err(|_| {
+            AtmiError::new(raw::TPEINVAL, "tpimport: payload contains an embedded NUL")
+        })?;
+        let ilen = c_long::try_from(text_len)
+            .map_err(|_| AtmiError::new(raw::TPEINVAL, "payload length exceeds native long"))?;
         let mut obuf: *mut c_char = ptr::null_mut();
         let mut olen: c_long = 0;
 
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe {
             raw::tpimport(
-                payload.as_ptr() as *mut c_char,
-                payload.len() as c_long,
+                c_payload.as_ptr() as *mut c_char,
+                ilen,
                 &mut obuf,
                 &mut olen,
                 flags as c_long,
@@ -1199,8 +1293,8 @@ impl AtmiCtx {
         let rc = unsafe {
             raw::Otpimport(
                 self.c_ctx_ptr(),
-                payload.as_ptr() as *mut c_char,
-                payload.len() as c_long,
+                c_payload.as_ptr() as *mut c_char,
+                ilen,
                 &mut obuf,
                 &mut olen,
                 flags as c_long,
@@ -1372,7 +1466,8 @@ impl AtmiCtx {
     /// - `json`: JSON text in Enduro/X field format, without embedded NUL bytes.
     pub fn tpjsontoubf(&self, ubf: &mut TypedUbf<'_>, json: &str) -> AtmiResult<()> {
         use std::ffi::CString;
-        let c_json = CString::new(json).map_err(|_| self.atmi_last_error())?;
+        let c_json =
+            CString::new(json).map_err(|_| AtmiError::new(raw::TPEINVAL, "json contains NUL"))?;
 
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpjsontoubf(ubf.as_ubfh(), c_json.as_ptr() as *mut c_char) };
@@ -1395,33 +1490,39 @@ impl AtmiCtx {
     ///
     /// - `ubf`: UBF buffer whose fields are converted to JSON.
     pub fn tpubftojson(&self, ubf: &TypedUbf<'_>) -> AtmiResult<String> {
-        // Allocate a reasonably-sized output buffer; grow on first call if needed.
-        let mut out = vec![0u8; 65536];
+        // JSON spells out field names, so its size is not bounded by the
+        // binary size. Start from an estimate and grow while Enduro/X reports
+        // `TPEOS` ("buffer too short", `libatmi/ubf2exjson.c`); a fixed 64 KiB
+        // area failed for buffers above the default message size.
+        let mut cap = self.bused(ubf).unwrap_or(0).saturating_mul(4).max(4096);
+        loop {
+            let bufsize = c_int::try_from(cap).unwrap_or(c_int::MAX);
+            let mut out = vec![0u8; bufsize as usize];
 
-        #[cfg(not(feature = "ctx-send"))]
-        let rc = unsafe {
-            raw::tpubftojson(
-                ubf.as_ubfh(),
-                out.as_mut_ptr() as *mut c_char,
-                out.len() as c_int,
-            )
-        };
+            #[cfg(not(feature = "ctx-send"))]
+            let rc = unsafe {
+                raw::tpubftojson(ubf.as_ubfh(), out.as_mut_ptr() as *mut c_char, bufsize)
+            };
 
-        #[cfg(feature = "ctx-send")]
-        let rc = unsafe {
-            raw::Otpubftojson(
-                self.c_ctx_ptr(),
-                ubf.as_ubfh(),
-                out.as_mut_ptr() as *mut c_char,
-                out.len() as c_int,
-            )
-        };
+            #[cfg(feature = "ctx-send")]
+            let rc = unsafe {
+                raw::Otpubftojson(
+                    self.c_ctx_ptr(),
+                    ubf.as_ubfh(),
+                    out.as_mut_ptr() as *mut c_char,
+                    bufsize,
+                )
+            };
 
-        if rc == raw::EXSUCCEED as c_int {
-            let end = out.iter().position(|&b| b == 0).unwrap_or(out.len());
-            Ok(String::from_utf8_lossy(&out[..end]).into_owned())
-        } else {
-            Err(self.atmi_last_error())
+            if rc == raw::EXSUCCEED as c_int {
+                let end = out.iter().position(|&b| b == 0).unwrap_or(out.len());
+                return Ok(String::from_utf8_lossy(&out[..end]).into_owned());
+            }
+            let err = self.atmi_last_error();
+            if err.code != AtmiError::TPEOS || bufsize == c_int::MAX {
+                return Err(err);
+            }
+            cap = cap.saturating_mul(2);
         }
     }
 
@@ -1508,8 +1609,12 @@ impl AtmiCtx {
         data: &TypedBuffer<'_>,
         flags: i64,
     ) -> AtmiResult<()> {
-        let c_qspace = CString::new(qspace).map_err(|_| self.atmi_last_error())?;
-        let c_qname = CString::new(qname).map_err(|_| self.atmi_last_error())?;
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
+        let c_qspace = CString::new(qspace)
+            .map_err(|_| AtmiError::new(raw::TPEINVAL, "qspace contains NUL"))?;
+        let c_qname =
+            CString::new(qname).map_err(|_| AtmiError::new(raw::TPEINVAL, "qname contains NUL"))?;
         let ctl_ptr = ctl.as_mut_ptr();
 
         #[cfg(not(feature = "ctx-send"))]
@@ -1556,8 +1661,12 @@ impl AtmiCtx {
         ctl: &mut crate::TpQCtl,
         flags: i64,
     ) -> AtmiResult<TypedBuffer<'ctx>> {
-        let c_qspace = CString::new(qspace).map_err(|_| self.atmi_last_error())?;
-        let c_qname = CString::new(qname).map_err(|_| self.atmi_last_error())?;
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
+        let c_qspace = CString::new(qspace)
+            .map_err(|_| AtmiError::new(raw::TPEINVAL, "qspace contains NUL"))?;
+        let c_qname =
+            CString::new(qname).map_err(|_| AtmiError::new(raw::TPEINVAL, "qname contains NUL"))?;
         let ctl_ptr = ctl.as_mut_ptr();
         let mut odata: *mut c_char = ptr::null_mut();
         let mut olen: c_long = 0;
@@ -1618,7 +1727,10 @@ impl AtmiCtx {
         data: &TypedBuffer<'_>,
         flags: i64,
     ) -> AtmiResult<()> {
-        let c_qname = CString::new(qname).map_err(|_| self.atmi_last_error())?;
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
+        let c_qname =
+            CString::new(qname).map_err(|_| AtmiError::new(raw::TPEINVAL, "qname contains NUL"))?;
         let ctl_ptr = ctl.as_mut_ptr();
 
         #[cfg(not(feature = "ctx-send"))]
@@ -1669,7 +1781,10 @@ impl AtmiCtx {
         ctl: &mut crate::TpQCtl,
         flags: i64,
     ) -> AtmiResult<TypedBuffer<'ctx>> {
-        let c_qname = CString::new(qname).map_err(|_| self.atmi_last_error())?;
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
+        let c_qname =
+            CString::new(qname).map_err(|_| AtmiError::new(raw::TPEINVAL, "qname contains NUL"))?;
         let ctl_ptr = ctl.as_mut_ptr();
         let mut odata: *mut c_char = ptr::null_mut();
         let mut olen: c_long = 0;

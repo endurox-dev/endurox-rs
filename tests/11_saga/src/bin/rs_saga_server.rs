@@ -1,6 +1,7 @@
-use endurox_rs::{ubf_fields as f, *};
+use endurox_rs::*;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+use ubf_fields as f;
 
 type Records = HashMap<String, (i8, Vec<u8>)>;
 static RECORDS: OnceLock<Mutex<Records>> = OnceLock::new();

@@ -329,6 +329,8 @@ impl AtmiCtx {
     /// - `ctl`: Native control record containing the participant or transaction selector.
     /// - `flags`: `TPSAGA_JOINXID`, `TPSAGA_UPDATE`, or zero.
     pub fn tpsagaenlist(&self, ctl: &mut TpSagaCtl, flags: i64) -> AtmiResult<()> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         let flags = c_long::try_from(flags)
             .map_err(|_| AtmiError::new(raw::TPEINVAL, "flags exceed native long"))?;
         #[cfg(not(feature = "ctx-send"))]
@@ -347,6 +349,8 @@ impl AtmiCtx {
     /// - `ctl`: Native control record containing the participant or transaction selector.
     /// - `flags`: reserved; use zero.
     pub fn tpsagaend(&self, ctl: &mut TpSagaCtl, flags: i64) -> AtmiResult<()> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         let flags = c_long::try_from(flags)
             .map_err(|_| AtmiError::new(raw::TPEINVAL, "flags exceed native long"))?;
         #[cfg(not(feature = "ctx-send"))]
@@ -362,6 +366,8 @@ impl AtmiCtx {
     /// - `ctl`: Native control record containing the participant or transaction selector.
     /// - `flags`: reserved; use zero.
     pub fn tpsagaget(&self, ctl: &mut TpSagaCtl, flags: i64) -> AtmiResult<()> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         let flags = c_long::try_from(flags)
             .map_err(|_| AtmiError::new(raw::TPEINVAL, "flags exceed native long"))?;
         #[cfg(not(feature = "ctx-send"))]
@@ -377,6 +383,8 @@ impl AtmiCtx {
     /// - `ctl`: Native control record containing the participant or transaction selector.
     /// - `flags`: `TPSAGA_URLSONLY` or zero.
     pub fn tpsagaupdate(&self, ctl: &mut TpSagaCtl, flags: i64) -> AtmiResult<()> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         let flags = c_long::try_from(flags)
             .map_err(|_| AtmiError::new(raw::TPEINVAL, "flags exceed native long"))?;
         #[cfg(not(feature = "ctx-send"))]
@@ -392,6 +400,8 @@ impl AtmiCtx {
     /// - `ctl`: Native control record containing the participant or transaction selector.
     /// - `flags`: reserved; use zero.
     pub fn tpsagaleave(&self, ctl: &mut TpSagaCtl, flags: i64) -> AtmiResult<()> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         let flags = c_long::try_from(flags)
             .map_err(|_| AtmiError::new(raw::TPEINVAL, "flags exceed native long"))?;
         #[cfg(not(feature = "ctx-send"))]
@@ -407,6 +417,8 @@ impl AtmiCtx {
     /// - `ctl`: Native control record containing the participant or transaction selector.
     /// - `flags`: reserved; use zero.
     pub fn tptxstatus(&self, ctl: &mut TpTxStatus, flags: i64) -> AtmiResult<()> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         let flags = c_long::try_from(flags)
             .map_err(|_| AtmiError::new(raw::TPEINVAL, "flags exceed native long"))?;
         #[cfg(not(feature = "ctx-send"))]
@@ -423,6 +435,8 @@ impl AtmiCtx {
     /// - `ctl`: Native control record containing the participant or transaction selector.
     /// - `flags`: `TPTXR_EXTEND` to only extend the deadline, or zero.
     pub fn tptxrenew(&self, ctl: &mut TpTxStatus, flags: i64) -> AtmiResult<()> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         let flags = c_long::try_from(flags)
             .map_err(|_| AtmiError::new(raw::TPEINVAL, "flags exceed native long"))?;
         #[cfg(not(feature = "ctx-send"))]
@@ -439,6 +453,8 @@ impl AtmiCtx {
     /// - `ctl`: Transaction selector and the metadata to store.
     /// - `flags`: reserved; use zero.
     pub fn tptxsetinfo(&self, ctl: &mut TpTxStatus, flags: i64) -> AtmiResult<()> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         let flags = c_long::try_from(flags)
             .map_err(|_| AtmiError::new(raw::TPEINVAL, "flags exceed native long"))?;
         #[cfg(not(feature = "ctx-send"))]
@@ -463,6 +479,8 @@ impl AtmiCtx {
         saga: Option<&mut TpSagaCtl>,
         flags: i64,
     ) -> AtmiResult<()> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         let flags = c_long::try_from(flags)
             .map_err(|_| AtmiError::new(raw::TPEINVAL, "flags exceed native long"))?;
         let mut selector = ctl.inner;

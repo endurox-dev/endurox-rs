@@ -20,7 +20,7 @@ fn run() -> Result<(), String> {
         ctx.tpinit()
             .map_err(|e| format!("[iter {iter}] tpinit: {e}"))?;
 
-        let req = ctx
+        let mut req = ctx
             .tpalloc_carray(&REQUEST_BYTES)
             .map_err(|e| format!("[iter {iter}] tpalloc_carray: {e}"))?;
 
@@ -74,6 +74,13 @@ fn run() -> Result<(), String> {
                 "[iter {iter}] reply payload mismatch: got {bytes:?}, expected {expected:?}"
             ));
         }
+
+        // Reuse the request allocation; both the send length and the new
+        // receive length must survive the in-place call.
+        ctx.tpcall_inplace("TESTSVC", &mut req, 0)
+            .map_err(|e| format!("[iter {iter}] inplace tpcall: {e}"))?;
+        assert_eq!(req.as_bytes(), expected);
+        assert_eq!(req.len(), expected.len());
 
         ctx.tpterm()
             .map_err(|e| format!("[iter {iter}] tpterm: {e}"))?;

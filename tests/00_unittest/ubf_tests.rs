@@ -5,9 +5,9 @@ use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use endurox_rs::{
-    ubf_fields, ubf_read_adhoc, ubf_read_nested, ubf_write_nested, AtmiCtx, TypedBuffer, TypedUbf,
-    UbfCarray, UbfDeserialize, UbfFieldDeserialize, UbfFieldSerialize, UbfFieldType, UbfGetValue,
-    UbfResult, UbfSerialize, UbfValue, TPBLK_ALL,
+    ubf_read_adhoc, ubf_read_nested, ubf_write_nested, AtmiCtx, TypedBuffer, TypedUbf, UbfCarray,
+    UbfDeserialize, UbfFieldDeserialize, UbfFieldSerialize, UbfFieldType, UbfGetValue, UbfResult,
+    UbfSerialize, UbfValue, TPBLK_ALL,
 };
 
 #[test]
@@ -489,9 +489,8 @@ fn atmictx_ubf_presence_count_length_and_delete_apis() {
         .expect("Bdelall failed");
     assert!(!ctx.bpres(&ubf, ubf_fields::T_STRING_2_FLD, 0));
 
-    let mut delete_list = [ubf_fields::T_LONG_FLD, 0];
-    ctx.bdelete(&mut ubf, &mut delete_list)
-        .expect("Bdelete failed");
+    let delete_list = [ubf_fields::T_LONG_FLD, 0];
+    ctx.bdelete(&mut ubf, &delete_list).expect("Bdelete failed");
     assert!(!ctx.bpres(&ubf, ubf_fields::T_LONG_FLD, 0));
 }
 
@@ -514,11 +513,11 @@ fn atmictx_ubf_copy_compare_project_and_subset_apis() {
         .expect("source long Bchg failed");
 
     ctx.bcpy(&mut dst, &src).expect("Bcpy failed");
-    assert!(ctx.bcmp(&src, &dst));
-    assert!(ctx.bsubset(&src, &dst));
+    assert!(ctx.bcmp(&src, &dst).unwrap());
+    assert!(ctx.bsubset(&src, &dst).unwrap());
 
-    let mut project_list = [ubf_fields::T_STRING_FLD, 0];
-    ctx.bprojcpy(&mut projected, &src, &mut project_list)
+    let project_list = [ubf_fields::T_STRING_FLD, 0];
+    ctx.bprojcpy(&mut projected, &src, &project_list)
         .expect("Bprojcpy failed");
     assert_eq!(
         projected.bget_string(ubf_fields::T_STRING_FLD, 0).unwrap(),
@@ -526,8 +525,8 @@ fn atmictx_ubf_copy_compare_project_and_subset_apis() {
     );
     assert!(!ctx.bpres(&projected, ubf_fields::T_LONG_FLD, 0));
 
-    let mut in_place_project_list = [ubf_fields::T_LONG_FLD, 0];
-    ctx.bproj(&mut dst, &mut in_place_project_list)
+    let in_place_project_list = [ubf_fields::T_LONG_FLD, 0];
+    ctx.bproj(&mut dst, &in_place_project_list)
         .expect("Bproj failed");
     assert!(!ctx.bpres(&dst, ubf_fields::T_STRING_FLD, 0));
     assert_eq!(dst.bget_long(ubf_fields::T_LONG_FLD, 0).unwrap(), 1234);
@@ -684,12 +683,12 @@ fn ubf_boolean_expression_compile_eval_and_print() {
         .expect("Bboolsetcbf failed");
 
     let tree = ctx.bboolco("rust_long_is_77()").expect("Bboolco failed");
-    assert!(ubf.bboolev(&tree));
+    assert!(ubf.bboolev(&tree).unwrap());
     assert!(ubf.bqboolev("rust_long_is_77()").expect("BQBoolEv failed"));
 
     let printed = ctx.bboolpr(&tree).expect("Bboolpr failed");
     assert!(!printed.is_empty());
-    assert_eq!(ubf.bfloatev(&tree), 1.0);
+    assert_eq!(ubf.bfloatev(&tree).unwrap(), 1.0);
 
     ctx.btreefree(tree);
 }
@@ -733,8 +732,8 @@ fn check_context_probes(ctx: &AtmiCtx, timeout: i32) {
     ubf.bchg(ubf_fields::T_LONG_FLD, 0, 77_i64, false).unwrap();
     for expr in ["rust_ctx_identity()", "rust_ctx_identity2('probe')"] {
         let tree = ctx.bboolco(expr).unwrap();
-        assert!(ubf.bboolev(&tree));
-        assert_eq!(ubf.bfloatev(&tree), 1.0);
+        assert!(ubf.bboolev(&tree).unwrap());
+        assert_eq!(ubf.bfloatev(&tree).unwrap(), 1.0);
         assert!(ubf.bqboolev(expr).unwrap());
     }
     assert_eq!(ctx.tpgblktime(TPBLK_ALL).unwrap(), timeout);
@@ -1358,9 +1357,7 @@ fn typed_accessors_reject_mismatched_types() {
 
     // Buffer level: a CARRAY is not a UBF.
     let carray = ctx.tpalloc_carray(b"not a ubf").expect("tpalloc_carray");
-    let err = TypedUbf::from_typed(carray)
-        .err()
-        .expect("from_typed on a CARRAY buffer must fail");
+    let err = TypedUbf::from_typed(carray).expect_err("from_typed on a CARRAY buffer must fail");
     assert_eq!(err.code, endurox_rs::UbfError::BTYPERR);
 
     drop(ubf);

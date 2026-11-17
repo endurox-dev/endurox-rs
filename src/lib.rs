@@ -15,12 +15,14 @@
     dead_code,
     non_camel_case_types,
     non_snake_case,
-    non_upper_case_globals
+    non_upper_case_globals,
+    clippy::unnecessary_cast // native long widths vary by target
 )]
-use std::ffi::CStr;
 
 pub use endurox_rs_derive::{UbfDeserialize, UbfSerialize, ViewDeserialize, ViewSerialize};
 
+// Bindgen output follows native C names and layouts, including platform casts.
+#[allow(clippy::all)]
 pub(crate) mod raw {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
@@ -43,11 +45,6 @@ static LINK_ANCHORS: LinkAnchors = LinkAnchors([
     raw::Bisubf as *const (),
     raw::tplogex as *const (),
 ]);
-
-#[doc(hidden)]
-pub mod ubf_fields {
-    include!(concat!(env!("OUT_DIR"), "/test.rs"));
-}
 
 #[cfg(feature = "async")]
 mod async_atmi;
@@ -112,7 +109,7 @@ pub const NDRX_SCR_CFG_VERSION_1: i32 = raw::NDRX_SCR_CFG_VERSION_1 as i32;
 pub use saga::{TpSagaCtl, TpTxStatus, Xid};
 pub use tpsvcinfo::TpSvcInfo;
 pub use trace::TpTraceSpan;
-pub use typed_buf::{TpTypeInfo, TypedBuffer};
+pub use typed_buf::{ReplyBuffer, TpTypeInfo, TypedBuffer};
 pub use typed_ubf::{
     BorrowedBuffer, BorrowedUbf, FastAdder, IntoUbfValue, TypedUbf, UbfField, UbfGetValue,
     UbfIterator, UbfValue,
@@ -297,34 +294,38 @@ impl TpQCtl {
         fixed_cstr_to_string(&self.inner.diagmsg)
     }
 
-    /// Borrow the stored message identifier up to its first zero byte.
-    pub fn msgid(&self) -> &[u8] {
-        fixed_bytes_until_nul(&self.inner.msgid)
+    /// Borrow the complete binary message identifier (`TMMSGIDLEN` bytes).
+    ///
+    /// Queue identifiers are binary, not text: `tmqueue` builds one from a
+    /// UUID followed by the node and server ids (`tmq_msgid_gen`,
+    /// `tmqueue/qspace.c`), so zero bytes are part of the value.
+    pub fn msgid(&self) -> &[u8; raw::TMMSGIDLEN as usize] {
+        fixed_bytes(&self.inner.msgid)
     }
 
     /// Copy a message identifier into the control block, zero-filling the remaining storage.
     ///
     /// # Arguments
     ///
-    /// - `msgid`: Identifier bytes; must leave room for one trailing zero byte in the native field.
+    /// - `msgid`: Identifier bytes, at most `TMMSGIDLEN`; pass [`Self::msgid`] output back
+    ///   unchanged to address a message.
     pub fn set_msgid(&mut self, msgid: &[u8]) -> AtmiResult<&mut Self> {
-        write_fixed_bytes(&mut self.inner.msgid, msgid, "msgid")?;
+        write_fixed_binary(&mut self.inner.msgid, msgid, "msgid")?;
         Ok(self)
     }
 
-    /// Borrow the stored correlation identifier up to its first zero byte.
-    pub fn corrid(&self) -> &[u8] {
-        fixed_bytes_until_nul(&self.inner.corrid)
+    /// Borrow the complete binary correlation identifier (`TMCORRIDLEN` bytes).
+    pub fn corrid(&self) -> &[u8; raw::TMCORRIDLEN as usize] {
+        fixed_bytes(&self.inner.corrid)
     }
 
     /// Copy a correlation identifier into the control block, zero-filling the remaining storage.
     ///
     /// # Arguments
     ///
-    /// - `corrid`: Correlation bytes; must leave room for one trailing zero byte in the native
-    ///   field.
+    /// - `corrid`: Correlation bytes, at most `TMCORRIDLEN`; shorter values are zero-padded.
     pub fn set_corrid(&mut self, corrid: &[u8]) -> AtmiResult<&mut Self> {
-        write_fixed_bytes(&mut self.inner.corrid, corrid, "corrid")?;
+        write_fixed_binary(&mut self.inner.corrid, corrid, "corrid")?;
         Ok(self)
     }
 
@@ -477,27 +478,62 @@ fn write_fixed_bytes(
     Ok(())
 }
 
-/// Borrow a fixed C field as bytes, stopping at the first NUL or the slice end.
+/// Copy bytes into a fixed binary field, zero-filling unused storage.
 ///
 /// # Arguments
 ///
-/// - `src`: Source character array; a missing NUL uses the entire slice.
-fn fixed_bytes_until_nul(src: &[std::os::raw::c_char]) -> &[u8] {
-    let len = src.iter().position(|&b| b == 0).unwrap_or(src.len());
-    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u8, len) }
+/// - `dst`: Destination binary field; every byte is significant, none is reserved.
+/// - `value`: Contents to copy; must not be longer than the destination field.
+/// - `field`: Field name to include in validation errors.
+fn write_fixed_binary(
+    dst: &mut [std::os::raw::c_char],
+    value: &[u8],
+    field: &str,
+) -> AtmiResult<()> {
+    if value.len() > dst.len() {
+        return Err(AtmiError::new(
+            raw::TPEINVAL,
+            format!("{field} too long: max {} bytes", dst.len()),
+        ));
+    }
+    dst.fill(0);
+    for (out, byte) in dst.iter_mut().zip(value.iter().copied()) {
+        *out = byte as std::os::raw::c_char;
+    }
+    Ok(())
+}
+
+/// Borrow a fixed binary C field as bytes, in full.
+///
+/// # Arguments
+///
+/// - `src`: Source character array; all of it is returned.
+fn fixed_bytes<const N: usize>(src: &[std::os::raw::c_char; N]) -> &[u8; N] {
+    // SAFETY: `c_char` is `i8` or `u8`, both layout-identical to `u8`.
+    unsafe { &*(src as *const [std::os::raw::c_char; N] as *const [u8; N]) }
 }
 
 /// Copy a NUL-terminated C field into a string, replacing invalid UTF-8.
 ///
 /// # Arguments
 ///
-/// - `src`: Source C field; string conversion requires a terminating NUL within it.
+/// - `src`: Source C field; a missing NUL uses the full field.
 fn fixed_cstr_to_string(src: &[std::os::raw::c_char]) -> String {
-    if src.first().copied().unwrap_or_default() == 0 {
-        String::new()
-    } else {
-        unsafe { CStr::from_ptr(src.as_ptr()) }
-            .to_string_lossy()
-            .into_owned()
+    let end = src.iter().position(|&byte| byte == 0).unwrap_or(src.len());
+    // SAFETY: c_char and u8 have the same size/alignment; bound by the slice.
+    let bytes = unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<u8>(), end) };
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[cfg(test)]
+mod fixed_string_tests {
+    #[test]
+    fn unterminated_native_fields_remain_bounded() {
+        assert_eq!(
+            super::fixed_cstr_to_string(&[b'x' as std::os::raw::c_char; 32]),
+            "x".repeat(32)
+        );
+        assert_eq!(super::fixed_cstr_to_string(&[65, 0, 66]), "A");
+        assert_eq!(super::fixed_cstr_to_string(&[]), "");
     }
 }

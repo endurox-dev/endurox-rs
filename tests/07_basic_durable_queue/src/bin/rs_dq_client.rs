@@ -2,7 +2,7 @@
 mod test_duration;
 use std::time::Instant;
 
-use endurox_rs::{ubf_fields, AtmiCtx, AtmiError, TpQCtl, TypedUbf, TPQCORRID, TPQGETBYCORRID};
+use endurox_rs::{AtmiCtx, AtmiError, TpQCtl, TypedUbf, TPQCORRID, TPQGETBYCORRID, TPQGETBYMSGID};
 
 const QSPACE: &str = "SAMPLESPACE";
 const QNAME: &str = "TESTQ";
@@ -33,6 +33,7 @@ fn run() -> Result<(), String> {
     let result = match scenario.as_str() {
         "enqueue-dequeue" => run_enqueue_dequeue(&ctx),
         "corrid" => run_corrid(&ctx),
+        "msgid" => run_msgid(&ctx),
         "fifo" => run_fifo(&ctx),
         "traceparent" => run_traceparent(&ctx),
         "tx-commit" => run_tx_commit(&ctx),
@@ -78,8 +79,9 @@ fn run_enqueue_dequeue(ctx: &AtmiCtx) -> Result<(), String> {
 }
 
 fn run_corrid(ctx: &AtmiCtx) -> Result<(), String> {
-    let corrid: [u8; 31] = {
-        let mut c = [0u8; 31];
+    let corrid: [u8; 32] = {
+        let mut c = [0u8; 32];
+        c[31] = 0xA5;
         c[..4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
         c
     };
@@ -269,5 +271,30 @@ fn run_traceparent(ctx: &AtmiCtx) -> Result<(), String> {
         iterations,
         started.elapsed().as_secs_f64()
     );
+    Ok(())
+}
+
+fn run_msgid(ctx: &AtmiCtx) -> Result<(), String> {
+    let mut request = ctx.tpalloc_ubf(1024).map_err(|e| e.to_string())?;
+    request
+        .bchg(ubf_fields::T_STRING_FLD, 0, "BY-MSGID", false)
+        .map_err(|e| e.to_string())?;
+    let mut enqueued = TpQCtl::default();
+    ctx.tpenqueue(QSPACE, QNAME, &mut enqueued, &request, 0)
+        .map_err(|e| e.to_string())?;
+    let mut selected = TpQCtl::default();
+    selected
+        .set_msgid(enqueued.msgid())
+        .map_err(|e| e.to_string())?;
+    selected.add_flags(TPQGETBYMSGID);
+    let reply = ctx
+        .tpdequeue(QSPACE, QNAME, &mut selected, 0)
+        .map_err(|e| e.to_string())?;
+    let reply = TypedUbf::from_typed(reply).map_err(|e| e.to_string())?;
+    assert_eq!(
+        reply.bget_string(ubf_fields::T_STRING_FLD, 0).unwrap(),
+        "BY-MSGID"
+    );
+    assert_eq!(selected.msgid(), enqueued.msgid());
     Ok(())
 }

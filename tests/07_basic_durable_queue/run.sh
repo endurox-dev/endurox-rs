@@ -64,7 +64,7 @@ sleep 2
 
 export NDRX_CCTAG=RM1TMQ
 
-for scenario in enqueue-dequeue corrid fifo traceparent; do
+for scenario in enqueue-dequeue corrid msgid fifo traceparent; do
     if ! "$PROJECT_DIR/target/debug/rs_dq_client" "$scenario"; then
         dump_logs
         exit 1

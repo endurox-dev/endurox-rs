@@ -134,7 +134,8 @@ impl<'ctx> TypedUbf<'ctx> {
     /// An absent field returns `BNOTPRES`.
     ///
     /// ```compile_fail
-    /// # use endurox_rs::{AtmiCtx, UbfFieldRef, ubf_fields::T_CARRAY_FLD};
+    /// # use endurox_rs::{AtmiCtx, UbfFieldRef};
+    /// # use ubf_fields::T_CARRAY_FLD;
     /// # let ctx = AtmiCtx::new().unwrap();
     /// let mut ubf = ctx.tpalloc_ubf(1024).unwrap();
     /// let (_, value) = ubf.bfindlast(T_CARRAY_FLD).unwrap();

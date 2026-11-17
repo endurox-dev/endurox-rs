@@ -1051,6 +1051,8 @@ fn execute_value(
     buffers: &mut TpScrBuffers<'_>,
     flags: i64,
 ) -> TpScrResult<()> {
+    #[cfg(feature = "async")]
+    let _resync = ctx.resync_replies();
     if !ptr::eq(ctx, buffers.ctx) {
         return Err(TpScrError::invalid(
             "script buffers belong to a different context",

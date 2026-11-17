@@ -1,5 +1,5 @@
 //! Async request submission, reply routing, and runtime-specific reply-queue drivers.
-use crate::{raw, AtmiCtx, AtmiError, AtmiResult, TypedBuffer};
+use crate::{raw, AtmiCtx, AtmiError, AtmiResult, ReplyBuffer, TypedBuffer};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_char;
@@ -7,7 +7,7 @@ use std::fmt;
 use std::future::{poll_fn, Future};
 use std::io;
 use std::ops::Deref;
-use std::pin::pin;
+use std::pin::{pin, Pin};
 use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -108,6 +108,8 @@ where
 struct ParkedBuf {
     ptr: *mut c_char,
     len: usize,
+    // Distinguish an actual NULL reply from an error with no reply at all.
+    has_data: bool,
 }
 
 // SAFETY: a corollary of `unsafe impl Send for AtmiCtx` in atmictx.rs, which
@@ -130,6 +132,7 @@ impl ParkedBuf {
     const EMPTY: Self = Self {
         ptr: std::ptr::null_mut(),
         len: 0,
+        has_data: false,
     };
 
     /// Release the parked native buffer through its owning context.
@@ -182,8 +185,14 @@ impl Drop for ReplyClaimGuard<'_> {
                     *claim = None;
                     *waker = None;
                 }
-                Some(Slot::Ready { claim, .. }) if *claim == Some(ReplyClaim::Waiter(self.id)) => {
-                    *claim = None;
+                Some(Slot::Ready { claim, outcome, .. })
+                    if *claim == Some(ReplyClaim::Waiter(self.id)) =>
+                {
+                    if matches!(outcome, Err(err) if err.code == raw::TPEBADDESC) {
+                        slots.remove(&self.cd);
+                    } else {
+                        *claim = None;
+                    }
                 }
                 _ => return,
             }
@@ -281,7 +290,7 @@ enum Target {
 /// waiting on it stalls. With `TPGETANY` every reply is accepted and the `cd`
 /// out-parameter identifies its owner, so nothing is buffered out of band.
 #[derive(Default)]
-struct ReplyDemux {
+pub(crate) struct ReplyDemux {
     slots: RefCell<HashMap<i32, Slot>>,
     /// Buffer lent to `tpgetrply` during a drain. Swapped with a slot's buffer
     /// on each routed reply, so routing costs a pointer move, not a copy.
@@ -304,6 +313,11 @@ struct ReplyDemux {
     deadlines: RefCell<HashMap<i32, Option<Instant>>>,
     /// Guards against re-entering a drain from within a drain.
     draining: Cell<bool>,
+    /// A synchronous operation may have moved replies off the native fd.
+    resync: Cell<bool>,
+    // The context retains a shared pointer; pinning also prevents unique
+    // Box reborrows from invalidating that pointer when the adapter moves.
+    _pin: std::marker::PhantomPinned,
 }
 
 /// Debug formatting of runtime state without dumping owned native buffers.
@@ -322,6 +336,61 @@ impl fmt::Debug for ReplyDemux {
 
 /// Descriptor registration, buffered replies, wakeups, and shared queue draining.
 impl ReplyDemux {
+    /// Schedule a drain after a synchronous operation on this same context.
+    /// Only wake Rust tasks here: calling native APIs would overwrite the
+    /// synchronous operation's error, timeout, priority and return-code state.
+    fn request_resync(&self) {
+        if self.draining.get() {
+            return;
+        }
+        self.resync.set(true);
+        let wakers: Vec<_> = self
+            .slots
+            .borrow_mut()
+            .values_mut()
+            .filter_map(|slot| match slot {
+                Slot::Waiting { waker, .. } => waker.take(),
+                _ => None,
+            })
+            .collect();
+        for waker in wakers {
+            waker.wake();
+        }
+        self.wake_any_waiters();
+    }
+
+    /// Preserve a cancellation result until its existing collector consumes
+    /// it. Keeping the claimed slot also prevents descriptor reuse while that
+    /// collector is asleep, so it cannot cancel or consume a later generation.
+    fn cancel(&self, cd: i32) {
+        self.forget_deadline(cd);
+        let slot = self.slots.borrow_mut().remove(&cd);
+        let (claim, waker) = match slot {
+            Some(Slot::Waiting { claim, waker }) => (claim, waker),
+            Some(Slot::Ready { claim, buf, .. }) => {
+                self.stash(buf);
+                (claim, None)
+            }
+            None => (None, None),
+        };
+        if claim.is_some() {
+            self.slots.borrow_mut().insert(
+                cd,
+                Slot::Ready {
+                    outcome: Err(AtmiError::new(
+                        raw::TPEBADDESC,
+                        "asynchronous call was cancelled",
+                    )),
+                    buf: ParkedBuf::EMPTY,
+                    claim,
+                },
+            );
+        }
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
     /// Register a slot for a descriptor known to be free.
     ///
     /// # Arguments
@@ -603,7 +672,7 @@ impl ReplyDemux {
     fn take_ready(
         &self,
         target: Target,
-        data: &mut TypedBuffer<'_>,
+        data: &mut impl ReplyBuffer,
         flags: i64,
     ) -> Option<(i32, AtmiResult<()>)> {
         let cd = match target {
@@ -629,44 +698,54 @@ impl ReplyDemux {
         &self,
         outcome: AtmiResult<()>,
         buf: ParkedBuf,
-        data: &mut TypedBuffer<'_>,
+        data: &mut impl ReplyBuffer,
         flags: i64,
     ) -> AtmiResult<()> {
-        if buf.ptr.is_null() {
-            // A routed error that carried no buffer; leave `data` as it was.
+        // Synthetic/native failures without a reply carry no allocation. A
+        // successful NULL reply (or TPESVCFAIL with NULL data) is a real reply
+        // and must still replace the generic output or fail TPNOCHANGE.
+        if !buf.has_data {
             return outcome;
         }
 
+        let flags = flags | data.reply_flags();
         if flags & raw::TPNOCHANGE as i64 != 0 {
-            // Enduro/X would have raised TPEOTYPE against the buffer handed to
-            // tpgetrply. It saw the scratch, so re-check against the real one.
-            let incoming = unsafe { TypedBuffer::borrowed_from_raw(data.ctx, buf.ptr) };
-            // Compare subtype as well as type: for VIEW buffers Enduro/X
-            // treats a subtype change as a TPNOCHANGE failure too
-            // (libatmi/typed_view.c: `strcmp(outbufobj->subtype, p_hdr->vname)`).
-            // Non-VIEW buffers carry an empty subtype, so this stays correct
-            // for them without a special case.
-            match (incoming.tptypes(), data.tptypes()) {
-                (Ok(got), Ok(want))
-                    if got.type_name != want.type_name || got.subtype != want.subtype =>
-                {
-                    let message = format!(
-                        "TPNOCHANGE: receiver expects {}/{} but got {}/{} buffer",
-                        want.type_name, want.subtype, got.type_name, got.subtype
-                    );
+            // The drain receives into generic scratch storage. Validate the
+            // allocation metadata, never the untrusted payload's UBF magic.
+            let incoming = unsafe { TypedBuffer::borrowed_from_raw(data.reply_context(), buf.ptr) };
+            let current =
+                unsafe { TypedBuffer::borrowed_from_raw(data.reply_context(), data.reply_ptr()) };
+            let types = incoming
+                .tptypes()
+                .and_then(|got| current.tptypes().map(|want| (got, want)));
+            match types {
+                Ok((got, want))
+                    if got.type_name == want.type_name && got.subtype == want.subtype => {}
+                Ok((got, want)) => {
                     self.stash(buf);
-                    return Err(AtmiError::new(raw::TPEOTYPE, message));
+                    return Err(AtmiError::new(
+                        raw::TPEOTYPE,
+                        format!(
+                            "TPNOCHANGE: receiver expects {}/{} but got {}/{} buffer",
+                            want.type_name, want.subtype, got.type_name, got.subtype
+                        ),
+                    ));
                 }
-                _ => {}
+                Err(err) => {
+                    self.stash(buf);
+                    return Err(err);
+                }
             }
         }
 
         let previous = ParkedBuf {
-            ptr: data.as_ptr(),
-            len: data.len(),
+            ptr: data.reply_ptr(),
+            len: data.reply_len(),
+            has_data: true,
         };
-        data.replace_ptr(buf.ptr);
-        data.set_len_reported(buf.len);
+        // SAFETY: the parked allocation is uniquely owned and has passed the
+        // receiving wrapper's type policy. The old allocation becomes scratch.
+        unsafe { data.reply_adopt(buf.ptr, buf.len) };
         self.stash(previous);
         outcome
     }
@@ -703,6 +782,7 @@ impl ReplyDemux {
         if self.draining.replace(true) {
             return;
         }
+        self.resync.set(false);
         self.drain_inner(ctx, flags);
         self.draining.set(false);
     }
@@ -738,12 +818,15 @@ impl ReplyDemux {
             // Enduro/X call descriptors are 1-based, so 0 reliably means "the
             // call failed before any reply was matched to a descriptor".
             let mut cd = 0i32;
+            let previous_ptr = buffer.as_ptr();
+            let previous_len = buffer.len();
             let outcome = ctx.tpgetrply(&mut cd, &mut buffer, get_flags);
 
             let len = buffer.len();
             let buf = ParkedBuf {
                 ptr: buffer.into_raw(),
                 len,
+                has_data: true,
             };
 
             let blocked = matches!(&outcome, Err(err) if err.code == raw::TPEBLOCK);
@@ -754,6 +837,19 @@ impl ReplyDemux {
             }
 
             if cd > 0 {
+                let buf = if outcome.is_ok()
+                    || matches!(&outcome, Err(err) if err.code == raw::TPESVCFAIL)
+                    || buf.ptr != previous_ptr
+                    || buf.len != previous_len
+                {
+                    buf
+                } else {
+                    // No receive-side pointer/length change: this is a timeout
+                    // or another failure without data. Preserve the caller's
+                    // buffer, but retain any replacement even on native errors.
+                    self.stash(buf);
+                    ParkedBuf::EMPTY
+                };
                 self.route(cd, outcome, buf);
                 continue;
             }
@@ -913,11 +1009,35 @@ impl ReplyDemux {
 
 // ---------------------------------------------------------------------------
 
+/// Wake the adapter after a native operation can receive another call's reply.
+/// Its borrow prevents the context/adapter from moving or being destroyed.
+pub(crate) struct ReplyResync<'a>(&'a AtmiCtx);
+
+impl Drop for ReplyResync<'_> {
+    fn drop(&mut self) {
+        if let Some(demux) = self.0.reply_demux {
+            // SAFETY: AsyncAtmiCtx installs a pointer to its pinned demux and
+            // clears it before dropping the demux or returning the context.
+            // AtmiCtx is !Sync, and its borrow prevents moving the owner, so
+            // no other thread can access the demux during this notification.
+            unsafe { demux.as_ref() }.request_resync();
+        }
+    }
+}
+
+impl AtmiCtx {
+    pub(crate) fn resync_replies(&self) -> ReplyResync<'_> {
+        ReplyResync(self)
+    }
+}
+
 /// An ATMI context with one explicitly selected asynchronous reply driver.
 ///
 /// The adapter owns the context, which guarantees that the reply fd is
 /// registered only once. It dereferences to [`AtmiCtx`] for allocation,
-/// logging and APIs unrelated to async calls. Its inherent
+/// logging and synchronous APIs. Synchronous receives notify the router so
+/// replies moved into native memory are collected; they still block the
+/// executor thread while running.
 /// `tpcall`, `tpacall`, `tpgetrply`, `tpcancel`, and `tpterm` methods provide the
 /// async-aware variants of those operations.
 ///
@@ -936,7 +1056,7 @@ pub struct AsyncAtmiCtx<D> {
     // Drivers own a duplicated reply fd and must be dropped before the context
     // closes the original descriptor. Rust drops fields in declaration order.
     driver: D,
-    demux: ReplyDemux,
+    demux: Pin<Box<ReplyDemux>>,
     context: AtmiCtx,
     // Adapter-owned one-shot metadata stays out of native TLS until a logical
     // send starts. Retries must not consume another future's pending priority.
@@ -983,7 +1103,7 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
     ///
     /// `context.tpinit()` must have completed so Enduro/X has opened its reply
     /// queue. On a non-pollable backend this returns `TPEINVAL`.
-    pub fn new(context: AtmiCtx) -> AtmiResult<Self> {
+    pub fn new(mut context: AtmiCtx) -> AtmiResult<Self> {
         let reply_fd = context.reply_queue_fd()?;
         let driver = D::register(reply_fd).map_err(|err| {
             AtmiError::new(
@@ -991,9 +1111,11 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
                 format!("failed to register Enduro/X reply queue fd: {err}"),
             )
         })?;
+        let demux = Box::pin(ReplyDemux::default());
+        context.reply_demux = Some(std::ptr::NonNull::from(demux.as_ref().get_ref()));
         Ok(Self {
             driver,
-            demux: ReplyDemux::default(),
+            demux,
             context,
             next_priority: Cell::new(None),
         })
@@ -1027,7 +1149,8 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
     /// Remove the asynchronous driver and return the synchronous context.
     ///
     /// No call future may still borrow this adapter.
-    pub fn into_inner(self) -> AtmiCtx {
+    pub fn into_inner(mut self) -> AtmiCtx {
+        self.context.reply_demux = None;
         if let Some(priority) = self.next_priority.take() {
             // Already validated; transfer the unused one-shot setting back to
             // the native context when ownership leaves the adapter.
@@ -1068,7 +1191,33 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
         &self,
         svc: &str,
         idata: &TypedBuffer<'_>,
-        odata: &mut TypedBuffer<'_>,
+        odata: &mut impl ReplyBuffer,
+        flags: i64,
+    ) -> AtmiResult<()> {
+        self.tpcall_value(svc, Some(idata), odata, flags).await
+    }
+
+    /// Submit this buffer and replace its contents with the reply.
+    ///
+    /// Uses the same send retries, original deadline, type policy and drop
+    /// cancellation as [`Self::tpcall`]. The request is borrowed read-only until
+    /// submission completes; reply handover then replaces it without copying.
+    /// `TypedUbf` accepts only UBF replies; `TypedBuffer` accepts any type.
+    pub async fn tpcall_inplace(
+        &self,
+        svc: &str,
+        data: &mut impl ReplyBuffer,
+        flags: i64,
+    ) -> AtmiResult<()> {
+        self.tpcall_value(svc, None, data, flags).await
+    }
+
+    /// Shared submission, deadline and cancellation for both buffer-borrow forms.
+    async fn tpcall_value(
+        &self,
+        svc: &str,
+        idata: Option<&TypedBuffer<'_>>,
+        odata: &mut impl ReplyBuffer,
         flags: i64,
     ) -> AtmiResult<()> {
         Self::check_supported_flags(flags)?;
@@ -1076,7 +1225,21 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
         // Read before tpacall: a TPBLK_NEXT setting is one-shot and the call
         // consumes it.
         let deadline = self.deadline_for(flags)?;
-        let cd = self.submit(svc, idata, flags, deadline, true).await?;
+        let cd = match idata {
+            Some(input) => self.submit(svc, input, flags, deadline, true).await?,
+            None => {
+                // Borrow only for submission; release this read-only view
+                // before the reply handover mutates or replaces the buffer.
+                // SAFETY: the exclusive outer borrow keeps this allocation
+                // live and unchanged through send retries. This temporary is
+                // unowned and is passed only as a shared request reference.
+                let mut input = unsafe {
+                    TypedBuffer::borrowed_from_raw(odata.reply_context(), odata.reply_ptr())
+                };
+                input.set_len_reported(odata.reply_len());
+                self.submit(svc, &input, flags, deadline, true).await?
+            }
+        };
         let mut pending = AsyncPendingCall::new(self, cd);
         // Always Target::One here: a tpcall owns its descriptor, so it must not
         // pick up someone else's reply even if the caller passed TPGETANY.
@@ -1368,7 +1531,7 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
         &self,
         svc: &str,
         idata: &TypedBuffer<'_>,
-        odata: &mut TypedBuffer<'_>,
+        odata: &mut impl ReplyBuffer,
         flags: i64,
     ) -> AtmiResult<()> {
         self.tpcall(svc, idata, odata, flags).await
@@ -1393,7 +1556,7 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
     pub async fn tpgetrply(
         &self,
         cd: &mut i32,
-        data: &mut TypedBuffer<'_>,
+        data: &mut impl ReplyBuffer,
         flags: i64,
     ) -> AtmiResult<()> {
         Self::check_supported_flags(flags)?;
@@ -1476,7 +1639,7 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
     pub async fn tpgetrply_async(
         &self,
         cd: &mut i32,
-        data: &mut TypedBuffer<'_>,
+        data: &mut impl ReplyBuffer,
         flags: i64,
     ) -> AtmiResult<()> {
         self.tpgetrply(cd, data, flags).await
@@ -1488,8 +1651,10 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
     ///
     /// - `cd`: Native call descriptor identifying the outstanding request or parked reply.
     pub fn tpcancel(&self, cd: i32) -> AtmiResult<()> {
-        self.release_slot(cd);
         let result = self.context.tpcancel(cd);
+        if result.is_ok() {
+            self.demux.cancel(cd);
+        }
         // ndrx_tpcancel performs its own per-cd
         // `ndrx_tpgetrply(.., TPNOBLOCK|TPNOABORT, ..)` (libatmi/tpcall.c), which
         // is exactly the shape that moves another descriptor's reply into
@@ -1605,7 +1770,7 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
     async fn await_reply(
         &self,
         target: Target,
-        data: &mut TypedBuffer<'_>,
+        data: &mut impl ReplyBuffer,
         flags: i64,
         deadline: Option<Instant>,
         cancel_on_timeout: bool,
@@ -1718,7 +1883,7 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
                         Target::One(cd) => self.demux.park_waker(target, cd as u64, cx.waker()),
                         Target::Any(id) => self.demux.park_waker(target, id, cx.waker()),
                     }
-                    if self.demux.is_target_ready(target) {
+                    if self.demux.resync.get() || self.demux.is_target_ready(target) {
                         return Poll::Ready(Ok(Wake::Progress));
                     }
                     if let Poll::Ready(result) = readable.as_mut().poll(cx) {
@@ -1743,7 +1908,7 @@ impl<D: AsyncReplyDriver> AsyncAtmiCtx<D> {
                         Target::One(cd) => self.demux.park_waker(target, cd as u64, cx.waker()),
                         Target::Any(id) => self.demux.park_waker(target, id, cx.waker()),
                     }
-                    if self.demux.is_target_ready(target) {
+                    if self.demux.resync.get() || self.demux.is_target_ready(target) {
                         return Poll::Ready(Ok(Wake::Progress));
                     }
                     if let Poll::Ready(result) = readable.as_mut().poll(cx) {
@@ -1792,6 +1957,7 @@ impl<D> AsRef<AtmiCtx> for AsyncAtmiCtx<D> {
 impl<D> Drop for AsyncAtmiCtx<D> {
     /// Free parked replies while the owning native context is still alive.
     fn drop(&mut self) {
+        self.context.reply_demux = None;
         // SAFETY: `context` is still alive and owns every parked buffer.
         unsafe { self.demux.release(&self.context) };
     }
@@ -1844,6 +2010,7 @@ impl<D: AsyncReplyDriver> Drop for AsyncPendingCall<'_, D> {
     fn drop(&mut self) {
         if self.armed {
             let _ = self.context.tpcancel(self.cd);
+            self.context.release_slot(self.cd);
         } else {
             self.context.release_slot(self.cd);
         }
@@ -2065,6 +2232,131 @@ mod tests {
     }
 
     #[test]
+    fn typed_receivers_reject_foreign_and_null_replies_without_changing_ubf() {
+        let ctx = AtmiCtx::new().unwrap();
+        let demux = ReplyDemux::default();
+        let mut output = ctx.tpalloc_ubf(1024).unwrap();
+        let field = ctx.bmkfldid_typed(crate::UbfFieldType::Long, 1);
+        output.bchg(field, 0, 42i64, false).unwrap();
+        // A serialized UBF image is still a CARRAY allocation. Header magic
+        // must never be used to decide whether it can become a TypedUbf.
+        let image = output.bwrite().unwrap();
+        let foreign = ctx.tpalloc_carray(&image).unwrap();
+        let foreign = ParkedBuf {
+            len: image.len(),
+            ptr: foreign.into_raw(),
+            has_data: true,
+        };
+        let null_reply = || ParkedBuf {
+            has_data: true,
+            ..ParkedBuf::EMPTY
+        };
+        for buf in [foreign, null_reply()] {
+            let err = demux.hand_over(Ok(()), buf, &mut output, 0).unwrap_err();
+            assert_eq!(err.code, raw::TPEOTYPE);
+            assert_eq!(output.bget_long(field, 0).unwrap(), 42);
+        }
+        // Generic receivers retain the normal type-changing and NULL behavior.
+        let mut generic = output.into_inner();
+        demux
+            .hand_over(Ok(()), null_reply(), &mut generic, 0)
+            .unwrap();
+        assert_eq!(generic.tptypes().unwrap().type_name, "NULL");
+        assert_eq!(generic.len(), 0);
+        let bytes = ctx.tpalloc_carray(b"error payload").unwrap();
+        let failure = ParkedBuf {
+            ptr: bytes.into_raw(),
+            len: 13,
+            has_data: true,
+        };
+        let err = demux
+            .hand_over(
+                Err(AtmiError::new(raw::TPESYSTEM, "post-receive failure")),
+                failure,
+                &mut generic,
+                0,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, raw::TPESYSTEM);
+        assert_eq!(generic.as_bytes(), b"error payload");
+        unsafe { demux.release(&ctx) };
+    }
+
+    #[test]
+    fn cancellation_wakes_an_untimed_collector_and_preserves_its_generation() {
+        for drop_waiter in [false, true] {
+            let ctx = AsyncAtmiCtx {
+                driver: PendingReplyDriver { fail_read: false },
+                demux: Box::pin(ReplyDemux::default()),
+                context: AtmiCtx::new().unwrap(),
+                next_priority: Cell::new(None),
+            };
+            ctx.demux.draining.set(true); // inject instead of using native IPC
+            ctx.demux.register_fresh(7, false);
+            let counter = Arc::new(CountingWaker(AtomicUsize::new(0)));
+            let waker = Waker::from(counter.clone());
+            let mut task = std::task::Context::from_waker(&waker);
+            let mut output = ctx.tpalloc_carray(b"keep").unwrap();
+            let mut cd = 7;
+            let mut future = Box::pin(ctx.tpgetrply(&mut cd, &mut output, raw::TPNOTIME as i64));
+            assert!(future.as_mut().poll(&mut task).is_pending());
+            ctx.demux.cancel(7);
+            assert!(counter.0.load(Ordering::SeqCst) > 0);
+            assert!(ctx.demux.is_descriptor_busy(7));
+            assert!(ctx.demux.any_unclaimed().is_none());
+            if !drop_waiter {
+                assert!(
+                    matches!(future.as_mut().poll(&mut task), Poll::Ready(Err(err)) if err.code == raw::TPEBADDESC)
+                );
+            }
+            drop(future);
+            assert!(!ctx.demux.is_descriptor_busy(7));
+            assert_eq!(output.as_bytes(), b"keep");
+            ctx.demux.register_fresh(7, false);
+            assert!(!ctx.demux.is_ready(7));
+        }
+    }
+
+    #[test]
+    fn synchronous_access_wakes_specific_and_any_waiters_after_adapter_move() {
+        let demux = Box::pin(ReplyDemux::default());
+        let mut native = AtmiCtx::new().unwrap();
+        native.reply_demux = Some(std::ptr::NonNull::from(demux.as_ref().get_ref()));
+        let adapter = AsyncAtmiCtx {
+            driver: PendingReplyDriver { fail_read: false },
+            demux,
+            context: native,
+            next_priority: Cell::new(None),
+        };
+        let ctx = Box::new(adapter); // move while retaining the installed hook
+        ctx.demux.register_fresh(7, false);
+        let any = ctx.demux.register_any_waiter();
+        let counter = Arc::new(CountingWaker(AtomicUsize::new(0)));
+        let waker = Waker::from(counter.clone());
+        let mut task = std::task::Context::from_waker(&waker);
+        let mut one = Box::pin(ctx.wait_for_wake(Target::One(7), None));
+        let mut all = Box::pin(ctx.wait_for_wake(Target::Any(any), None));
+        assert!(one.as_mut().poll(&mut task).is_pending());
+        assert!(all.as_mut().poll(&mut task).is_pending());
+        let request = ctx.tpalloc_carray(b"x").unwrap();
+        let mut reply = ctx.tpalloc_carray(b"y").unwrap();
+        // Even failure paths notify; no native domain is needed for this case.
+        assert_eq!(
+            ctx.context()
+                .tpcall("bad\0service", &request, &mut reply, 0)
+                .unwrap_err()
+                .code,
+            raw::TPEINVAL
+        );
+        assert!(counter.0.load(Ordering::SeqCst) >= 2);
+        assert!(one.as_mut().poll(&mut task).is_ready());
+        assert!(all.as_mut().poll(&mut task).is_ready());
+        drop((one, all, request, reply));
+        let native = (*ctx).into_inner();
+        assert!(native.reply_demux.is_none());
+    }
+
+    #[test]
     fn released_specific_wait_remains_collectable_by_any() {
         // A nonblocking probe, dropped wait, dropped ready wait, and driver
         // failure must all retain the caller's reply and original deadline.
@@ -2073,7 +2365,7 @@ mod tests {
                 driver: PendingReplyDriver {
                     fail_read: scenario == 3,
                 },
-                demux: ReplyDemux::default(),
+                demux: Box::pin(ReplyDemux::default()),
                 context: AtmiCtx::new().unwrap(),
                 next_priority: Cell::new(None),
             };
@@ -2094,6 +2386,7 @@ mod tests {
             let mut reply = Some(ParkedBuf {
                 ptr: reply.into_raw(),
                 len: 5,
+                has_data: true,
             });
             {
                 let mut future = Box::pin(ctx.tpgetrply(&mut cd, &mut data, flags));
@@ -2224,7 +2517,7 @@ mod tests {
             context.tpinit().unwrap();
             let ctx = AsyncAtmiCtx {
                 driver: TokioReplyDriver::register(socket.as_raw_fd()).unwrap(),
-                demux: ReplyDemux::default(),
+                demux: Box::pin(ReplyDemux::default()),
                 context,
                 next_priority: Cell::new(None),
             };
@@ -2329,6 +2622,143 @@ mod tests {
             );
             drop(request);
             native.tpterm().unwrap();
+        });
+    }
+
+    /// Real Enduro/X receives with an intentionally silent reactor. A blocking
+    /// call moves the earlier async reply into the native memory queue. Only
+    /// the resync notification can wake its untimed collector.
+    #[cfg(all(feature = "tokio", feature = "async-io"))]
+    #[test]
+    #[ignore = "requires the 05_async_demux domain; run its --send-only launcher"]
+    fn native_sync_receive_and_cancel_wake_both_drivers() {
+        assert_eq!(
+            std::env::var("ENDUROX_RS_TEST_SEND_DOMAIN").as_deref(),
+            Ok("1")
+        );
+        async fn exercise<D: AsyncReplyDriver>(driver: D) {
+            let mut context = AtmiCtx::new().unwrap();
+            context.tpinit().unwrap();
+            let demux = Box::pin(ReplyDemux::default());
+            context.reply_demux = Some(std::ptr::NonNull::from(demux.as_ref().get_ref()));
+            let ctx = AsyncAtmiCtx {
+                driver,
+                demux,
+                context,
+                next_priority: Cell::new(None),
+            };
+            let request = ctx.tpalloc_ubf(1024).unwrap();
+            let mut output = ctx.tpalloc_ubf(1024).unwrap();
+
+            // A retained &AtmiCtx must notify too, not only a fresh deref.
+            let sync = ctx.context();
+            let mut cd = ctx
+                .tpacall("RS_DEMUX_SLOW", &request, raw::TPNOTIME as i64)
+                .await
+                .unwrap();
+            let counter = Arc::new(CountingWaker(AtomicUsize::new(0)));
+            let waker = Waker::from(counter.clone());
+            let mut task = std::task::Context::from_waker(&waker);
+            let mut wait = Box::pin(ctx.tpgetrply(&mut cd, &mut output, raw::TPNOTIME as i64));
+            assert!(wait.as_mut().poll(&mut task).is_pending());
+            // HOLD replies later than SLOW, forcing its receive to park SLOW.
+            let mut blocking_output = ctx.tpalloc_ubf(1024).unwrap();
+            sync.tpcall("RS_DEMUX_HOLD", &request, &mut blocking_output, 0)
+                .unwrap();
+            assert!(
+                counter.0.load(Ordering::SeqCst) > 0,
+                "blocking receive lost the async waker"
+            );
+            wait.await.unwrap();
+
+            let mut cd = ctx
+                .tpacall("RS_DEMUX_SLOW", &request, raw::TPNOTIME as i64)
+                .await
+                .unwrap();
+            let cancelled = cd;
+            let mut wait = Box::pin(ctx.tpgetrply(&mut cd, &mut output, raw::TPNOTIME as i64));
+            assert!(wait.as_mut().poll(&mut task).is_pending());
+            counter.0.store(0, Ordering::SeqCst);
+            ctx.tpcancel(cancelled).unwrap();
+            assert!(
+                counter.0.load(Ordering::SeqCst) > 0,
+                "cancellation lost the async waker"
+            );
+            assert_eq!(wait.await.unwrap_err().code, raw::TPEBADDESC);
+
+            for mode in ["INPLACE_OK", "INPLACE_FAIL"] {
+                let mut data = ctx.tpalloc_ubf(256).unwrap();
+                data.bchg(ubf_fields::T_STRING_FLD, 0, mode, false).unwrap();
+                let mut call =
+                    Box::pin(ctx.tpcall_inplace("RS_DEMUX_SLOW", &mut data, raw::TPNOTIME as i64));
+                assert!(call.as_mut().poll(&mut task).is_pending());
+                sync.tpcall("RS_DEMUX_HOLD", &request, &mut blocking_output, 0)
+                    .unwrap();
+                let result = call.await;
+                if mode == "INPLACE_FAIL" {
+                    assert_eq!(result.unwrap_err().code, raw::TPESVCFAIL);
+                } else {
+                    result.unwrap();
+                }
+                assert_eq!(
+                    data.bget_string(ubf_fields::T_STRING_2_FLD, 0).unwrap(),
+                    format!("SLOW:{mode}")
+                );
+                assert_eq!(
+                    data.bget_bytes(ubf_fields::T_CARRAY_FLD, 0).unwrap(),
+                    vec![0x5A; 12000]
+                );
+            }
+
+            let mut bytes = ctx.tpalloc_carray(b"in\0place").unwrap();
+            let mut call =
+                Box::pin(ctx.tpcall_inplace("RS_DEMUX_BYTES", &mut bytes, raw::TPNOTIME as i64));
+            assert!(call.as_mut().poll(&mut task).is_pending());
+            sync.tpcall("RS_DEMUX_HOLD", &request, &mut blocking_output, 0)
+                .unwrap();
+            call.await.unwrap();
+            assert_eq!(bytes.as_bytes(), vec![0x33; 12000]);
+
+            // Dropping a submitted in-place call leaves its request owner and
+            // contents valid while cancelling only that call's descriptor.
+            let mut data = ctx.tpalloc_ubf(256).unwrap();
+            data.bchg(ubf_fields::T_STRING_FLD, 0, "KEEP", false)
+                .unwrap();
+            let mut call =
+                Box::pin(ctx.tpcall_inplace("RS_DEMUX_SLOW", &mut data, raw::TPNOTIME as i64));
+            assert!(call.as_mut().poll(&mut task).is_pending());
+            drop(call);
+            assert_eq!(
+                data.bget_string(ubf_fields::T_STRING_FLD, 0).unwrap(),
+                "KEEP"
+            );
+        }
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                exercise(TokioReplyDriver::register(socket.as_raw_fd()).unwrap()),
+            )
+            .await
+            .unwrap();
+        });
+        async_io::block_on(async {
+            let mut work = pin!(exercise(
+                AsyncIoReplyDriver::register(socket.as_raw_fd()).unwrap()
+            ));
+            let mut limit = pin!(async_io::Timer::after(Duration::from_secs(30)));
+            poll_fn(|cx| {
+                assert!(
+                    limit.as_mut().poll(cx).is_pending(),
+                    "async-io collector did not wake"
+                );
+                work.as_mut().poll(cx)
+            })
+            .await;
         });
     }
 
@@ -2779,7 +3209,7 @@ mod tests {
         assert!(demux.is_descriptor_busy(6));
 
         // Only once the slot is gone does the number become reusable.
-        drop(demux.deregister(9));
+        let _ = demux.deregister(9);
         assert!(!demux.is_descriptor_busy(9));
     }
 
@@ -2814,7 +3244,7 @@ mod tests {
         assert!(demux.is_descriptor_busy(9));
 
         // Collected or cancelled by its owner.
-        drop(demux.deregister(9));
+        let _ = demux.deregister(9);
         assert!(!demux.is_descriptor_busy(9));
 
         demux.register_fresh(9, true);

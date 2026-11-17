@@ -1,6 +1,6 @@
 //! Native UBF operations, field identifiers, expression evaluation, and callback I/O.
 use crate::raw::*;
-use crate::{raw, AtmiCtx, BorrowedUbf, TypedUbf, UbfResult};
+use crate::{raw, AtmiCtx, TypedUbf, UbfError, UbfResult};
 use core::ffi::{c_char, c_int, c_long, c_void};
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -731,43 +731,85 @@ impl AtmiCtx {
         }
     }
 
-    /// Read and convert a field in a borrowed UBF without taking ownership of the child.
+    /// Read one occurrence converted to `usrtype` into storage sized from the stored value.
     ///
     /// # Arguments
     ///
-    /// - `ubf`: UBF buffer to inspect.
+    /// - `p_ub`: Valid UBF header, top-level or embedded.
     /// - `bfldid`: Typed field identifier, including the native field-type bits.
     /// - `occ`: Zero-based field occurrence to access.
-    /// - `buf`: Writable native destination with at least the input `len` bytes.
-    /// - `len`: Destination capacity on input and returned value length on output, in bytes.
-    /// - `usrtype`: Native `BFLD_*` type describing the value storage used for conversion.
+    /// - `usrtype`: Native `BFLD_STRING` or `BFLD_CARRAY` output type.
     ///
-    #[inline]
-    pub(crate) fn cbget_borrowed_ubf_value(
+    /// Returns the storage and the value length Enduro/X reported. The storage
+    /// is zero-initialised, so a string result is always NUL-terminated within
+    /// it.
+    ///
+    /// The capacity follows `Blen(3)` rather than a fixed `NDRX_ATMI_MSG_MAX_SIZE`
+    /// scratch area: that constant is not the runtime message limit
+    /// (`NDRX_MSGSIZEMAX` raises it), so larger values failed with `BNOSPACE`,
+    /// and every small read paid for allocating and clearing 64 KiB. A numeric
+    /// field rendered as text can outgrow its stored size, hence the floor and
+    /// the bounded retry.
+    ///
+    /// # Safety
+    ///
+    /// `p_ub` must point to a live UBF buffer for the duration of the call.
+    pub(crate) unsafe fn cbget_sized(
         &self,
-        ubf: &BorrowedUbf<'_, '_>,
+        p_ub: *mut raw::UBFH,
         bfldid: BFLDID,
         occ: BFLDOCC,
-        buf: *mut c_char,
-        len: &mut BFLDLEN,
         usrtype: c_int,
-    ) -> c_int {
+    ) -> UbfResult<(Vec<u8>, usize)> {
+        const MIN_SCRATCH: usize = 64;
+        const MAX_GROWTHS: usize = 5;
+
         #[cfg(not(feature = "ctx-send"))]
-        unsafe {
-            raw::CBget(ubf.as_ubfh(), bfldid, occ, buf, len, usrtype)
-        }
+        let stored = raw::Blen(p_ub, bfldid, occ);
 
         #[cfg(feature = "ctx-send")]
-        unsafe {
-            raw::OCBget(
-                self.c_ctx_ptr(),
-                ubf.as_ubfh(),
+        let stored = raw::OBlen(self.c_ctx_ptr(), p_ub, bfldid, occ);
+
+        if stored < 0 {
+            return Err(self.ubf_last_error());
+        }
+
+        let mut cap = (stored as usize).saturating_add(1).max(MIN_SCRATCH);
+        let mut growths = 0;
+        loop {
+            let mut buf = vec![0u8; cap];
+            let mut len = BFLDLEN::try_from(cap).unwrap_or(BFLDLEN::MAX);
+
+            #[cfg(not(feature = "ctx-send"))]
+            let rc = raw::CBget(
+                p_ub,
                 bfldid,
                 occ,
-                buf,
-                len,
+                buf.as_mut_ptr() as *mut c_char,
+                &mut len,
                 usrtype,
-            )
+            );
+
+            #[cfg(feature = "ctx-send")]
+            let rc = raw::OCBget(
+                self.c_ctx_ptr(),
+                p_ub,
+                bfldid,
+                occ,
+                buf.as_mut_ptr() as *mut c_char,
+                &mut len,
+                usrtype,
+            );
+
+            if rc == 0 {
+                return Ok((buf, (len.max(0) as usize).min(cap)));
+            }
+            let err = self.ubf_last_error();
+            if err.code != UbfError::BNOSPACE || growths == MAX_GROWTHS {
+                return Err(err);
+            }
+            growths += 1;
+            cap = cap.saturating_mul(2);
         }
     }
 
@@ -969,16 +1011,23 @@ impl AtmiCtx {
     /// - `tree`: Compiled expression to evaluate or print.
     ///
     #[inline]
-    pub(crate) fn bfloatev_value(&self, ubf: &TypedUbf<'_>, tree: &UbfExprTree<'_>) -> f64 {
+    pub(crate) fn bfloatev_value(
+        &self,
+        ubf: &TypedUbf<'_>,
+        tree: &UbfExprTree<'_>,
+    ) -> UbfResult<f64> {
         let _evaluation = ExprEvaluation::enter(self);
         #[cfg(not(feature = "ctx-send"))]
-        unsafe {
-            raw::Bfloatev(ubf.as_ubfh(), tree.as_ptr())
-        }
+        let value = unsafe { raw::Bfloatev(ubf.as_ubfh(), tree.as_ptr()) };
 
         #[cfg(feature = "ctx-send")]
-        unsafe {
-            raw::OBfloatev(self.c_ctx_ptr(), ubf.as_ubfh(), tree.as_ptr())
+        let value = unsafe { raw::OBfloatev(self.c_ctx_ptr(), ubf.as_ubfh(), tree.as_ptr()) };
+        // -1 is also a valid expression result. Public Bfloatev clears
+        // Berror on entry, so inspect it before calling any other UBF API.
+        if value == -1.0 && unsafe { *self.ndrx_bget_ferror_addr() } != 0 {
+            Err(self.ubf_last_error())
+        } else {
+            Ok(value)
         }
     }
 
@@ -1145,15 +1194,16 @@ impl AtmiCtx {
     ///
     /// - `ubf1`: First UBF buffer to compare.
     /// - `ubf2`: Second UBF buffer to compare.
-    pub fn bcmp(&self, ubf1: &TypedUbf<'_>, ubf2: &TypedUbf<'_>) -> bool {
+    pub fn bcmp(&self, ubf1: &TypedUbf<'_>, ubf2: &TypedUbf<'_>) -> UbfResult<bool> {
         #[cfg(not(feature = "ctx-send"))]
-        unsafe {
-            raw::Bcmp(ubf1.as_ubfh(), ubf2.as_ubfh()) == 0
-        }
+        let rc = unsafe { raw::Bcmp(ubf1.as_ubfh(), ubf2.as_ubfh()) };
 
         #[cfg(feature = "ctx-send")]
-        unsafe {
-            raw::OBcmp(self.c_ctx_ptr(), ubf1.as_ubfh(), ubf2.as_ubfh()) == 0
+        let rc = unsafe { raw::OBcmp(self.c_ctx_ptr(), ubf1.as_ubfh(), ubf2.as_ubfh()) };
+        if rc == -2 {
+            Err(self.ubf_last_error())
+        } else {
+            Ok(rc == 0)
         }
     }
 
@@ -1910,16 +1960,17 @@ impl AtmiCtx {
     /// - `ubf1`: Containing buffer to search.
     /// - `ubf2`: Candidate subset whose fields and values are sought in `ubf1`.
     ///
-    /// This wrapper maps any nonzero native result to `true`, including a native error.
-    pub fn bsubset(&self, ubf1: &TypedUbf<'_>, ubf2: &TypedUbf<'_>) -> bool {
+    /// Native failures are returned as errors, separately from a non-matching subset.
+    pub fn bsubset(&self, ubf1: &TypedUbf<'_>, ubf2: &TypedUbf<'_>) -> UbfResult<bool> {
         #[cfg(not(feature = "ctx-send"))]
-        unsafe {
-            raw::Bsubset(ubf1.as_ubfh(), ubf2.as_ubfh()) != 0
-        }
+        let rc = unsafe { raw::Bsubset(ubf1.as_ubfh(), ubf2.as_ubfh()) };
 
         #[cfg(feature = "ctx-send")]
-        unsafe {
-            raw::OBsubset(self.c_ctx_ptr(), ubf1.as_ubfh(), ubf2.as_ubfh()) != 0
+        let rc = unsafe { raw::OBsubset(self.c_ctx_ptr(), ubf1.as_ubfh(), ubf2.as_ubfh()) };
+        if rc < 0 {
+            Err(self.ubf_last_error())
+        } else {
+            Ok(rc == 1)
         }
     }
 
@@ -2024,5 +2075,29 @@ impl AtmiCtx {
         } else {
             Ok(rc as i32)
         }
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+
+    #[test]
+    fn evaluation_and_comparison_keep_native_errors_separate_from_values() {
+        let ctx = AtmiCtx::new().unwrap();
+        let valid = ctx.tpalloc_ubf(1024).unwrap();
+        // Deliberately invalid native argument: all four public C APIs check
+        // NULL before reading the header. The borrowed wrapper frees nothing.
+        let invalid = unsafe { TypedUbf::borrowed_from_raw(&ctx, std::ptr::null_mut()) };
+        let expression = ctx.bboolco("-1").unwrap();
+        assert!(invalid.bboolev(&expression).is_err());
+        assert!(invalid.bqboolev("1").is_err());
+        assert!(invalid.bfloatev(&expression).is_err());
+        assert!(ctx.bcmp(&valid, &invalid).is_err());
+        assert!(ctx.bsubset(&valid, &invalid).is_err());
+        // Success after an error, including a legitimate native -1 result.
+        assert_eq!(valid.bfloatev(&expression).unwrap(), -1.0);
+        assert!(ctx.bcmp(&valid, &valid).unwrap());
+        assert!(ctx.bsubset(&valid, &valid).unwrap());
     }
 }

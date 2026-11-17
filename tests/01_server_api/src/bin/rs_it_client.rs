@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use endurox_rs::{ubf_fields, AtmiCtx, AtmiError, TypedUbf, UbfValue, TPGETANY};
+use endurox_rs::{AtmiCtx, AtmiError, TypedUbf, UbfValue, TPGETANY};
 
 fn main() {
     let rc = match run() {
@@ -30,6 +30,9 @@ fn run() -> Result<(), String> {
         "dispatch-threads" => return run_dispatch_threads(&ctx),
         "dynamic-advertise" => return run_dynamic_advertise(&ctx),
         "api-additions" => return run_api_additions(&ctx).map_err(|e| e.to_string()),
+        "reply-new" => return run_reply_new(&ctx),
+        "reply-types" => return run_reply_types(&ctx),
+        "inplace" => return run_inplace(&ctx),
         other => return Err(format!("unknown integration scenario `{other}`")),
     };
 
@@ -77,7 +80,7 @@ fn run() -> Result<(), String> {
         // A callback must not terminate the client's session. Receiving an
         // already pending reply detects this even if later ATMI calls would
         // silently initialize a new session. Merely checking TLS cannot.
-        if !buf.bboolev(&tree) || buf.bfloatev(&tree) != 1.0 {
+        if !buf.bboolev(&tree).unwrap() || buf.bfloatev(&tree).unwrap() != 1.0 {
             return Err("pending-reply callback evaluation failed".to_string());
         }
         ctx.tpgetrply(&mut cd, &mut buf, 0)
@@ -187,7 +190,7 @@ fn run_dispatch_threads(ctx: &AtmiCtx) -> Result<(), String> {
 
     // Each of those workers must also have run the Rust tpsvrthrinit hook, on
     // its own thread, with a usable worker context.
-    let mut info = build_echo_request(ctx, "THRINFO")?;
+    let info = build_echo_request(ctx, "THRINFO")?;
     let mut rsp = ctx
         .tpalloc_ubf(1024)
         .map_err(|e| format!("tpalloc for thread info failed: {e}"))?;
@@ -306,6 +309,42 @@ fn expect_no_entry(ctx: &AtmiCtx, svc: &str, phase: &str) -> Result<(), String> 
             e.code
         )),
     }
+}
+
+/// A service may reply with a buffer other than its request, whether it kept,
+/// dropped or never took the request. Enduro/X frees the request itself in
+/// that case, so the binding must keep it from being used or freed twice.
+fn run_reply_new(ctx: &AtmiCtx) -> Result<(), String> {
+    let rsp_fld = ubf_fields::T_STRING_2_FLD;
+
+    for round in 0..40 {
+        for (svc, mode) in [
+            ("RS_IT_REPLY_NEW", "keep"),
+            ("RS_IT_REPLY_NEW", "drop"),
+            ("RS_IT_REPLY_NEW", "ctx"),
+            ("RS_IT_REPLY_UNTAKEN", "untaken"),
+        ] {
+            let req = build_echo_request(ctx, mode)?;
+            let mut rsp = ctx
+                .tpalloc_ubf(1024)
+                .map_err(|e| format!("reply tpalloc_ubf failed: {e}"))?;
+            ctx.tpcall(svc, &req, &mut rsp, 0)
+                .map_err(|e| format!("round {round}: tpcall {svc} ({mode}) failed: {e}"))?;
+            assert_response(&rsp, rsp_fld, &format!("NEW:{mode}:corrupt=0"))?;
+        }
+    }
+
+    // The ordinary path must still work on the same workers afterwards.
+    let req = build_echo_request(ctx, "AFTER")?;
+    let mut rsp = ctx
+        .tpalloc_ubf(1024)
+        .map_err(|e| format!("reply tpalloc_ubf failed: {e}"))?;
+    ctx.tpcall("RS_IT_ECHO", &req, &mut rsp, 0)
+        .map_err(|e| format!("echo after reply-new failed: {e}"))?;
+    assert_response(&rsp, rsp_fld, "RUST-SERVER:AFTER")?;
+
+    ctx.tpterm().map_err(|e| format!("tpterm failed: {e}"))?;
+    Ok(())
 }
 
 fn build_echo_request<'a>(ctx: &'a AtmiCtx, value: &str) -> Result<TypedUbf<'a>, String> {
@@ -445,5 +484,121 @@ fn run_api_additions(ctx: &AtmiCtx) -> Result<(), Box<dyn std::error::Error>> {
         .code,
         AtmiError::TPEINVAL
     );
+    Ok(())
+}
+
+fn run_reply_types(ctx: &AtmiCtx) -> Result<(), String> {
+    let request = build_echo_request(ctx, "SOURCE")?;
+    let mut output = build_echo_request(ctx, "KEEP")?;
+    let error = ctx
+        .tpcall("RS_IT_REPLY_IMAGE", &request, &mut output, 0)
+        .unwrap_err();
+    assert_eq!(error.code, AtmiError::TPEOTYPE);
+    assert_eq!(
+        output.bget_string(ubf_fields::T_STRING_FLD, 0).unwrap(),
+        "KEEP"
+    );
+    let mut cd = ctx
+        .tpacall("RS_IT_REPLY_IMAGE", &request, 0)
+        .map_err(|e| e.to_string())?;
+    assert_eq!(
+        ctx.tpgetrply(&mut cd, &mut output, 0).unwrap_err().code,
+        AtmiError::TPEOTYPE
+    );
+    output
+        .bchg(ubf_fields::T_STRING_FLD, 0, "STILL-UBF", true)
+        .unwrap();
+    let mut generic = output.into_inner();
+    ctx.tpcall("RS_IT_REPLY_IMAGE", &request, &mut generic, 0)
+        .map_err(|e| e.to_string())?;
+    assert_eq!(generic.tptypes().unwrap().type_name, "CARRAY");
+    assert_eq!(generic.as_bytes(), request.bwrite().unwrap());
+    assert!(TypedUbf::from_typed(generic).is_err());
+    let mut request = request;
+    let mut ctl = endurox_rs::TpDlmCtl::default();
+    ctl.set_svcname("RS_IT_REPLY_IMAGE")
+        .unwrap()
+        .set_wait_time(1000)
+        .unwrap();
+    ctx.tpdlmmkcall(&mut request, &mut ctl)
+        .map_err(|e| e.to_string())?;
+    let mut output = build_echo_request(ctx, "KEEP")?;
+    assert_eq!(
+        ctx.tpdlmcall("RS_IT_REPLY_IMAGE", &mut request, &mut output, 0)
+            .unwrap_err()
+            .code,
+        AtmiError::TPEOTYPE
+    );
+    assert_eq!(
+        output.bget_string(ubf_fields::T_STRING_FLD, 0).unwrap(),
+        "KEEP"
+    );
+    let mut generic = output.into_inner();
+    ctx.tpdlmcall("RS_IT_REPLY_IMAGE", &mut request, &mut generic, 0)
+        .map_err(|e| e.to_string())?;
+    assert_eq!(generic.tptypes().unwrap().type_name, "CARRAY");
+    let mut output = ctx.tpalloc_ubf(1024).map_err(|e| e.to_string())?;
+    assert_eq!(
+        ctx.tpcall("RS_IT_BAD_FORWARD", &request, &mut output, 0)
+            .unwrap_err()
+            .code,
+        AtmiError::TPESVCFAIL
+    );
+    Ok(())
+}
+
+fn run_inplace(ctx: &AtmiCtx) -> Result<(), String> {
+    for mode in ["success", "fail"] {
+        let mut data = build_echo_request(ctx, mode)?;
+        assert!(data.tptypes().unwrap().size < 12000);
+        let result = ctx.tpcall_inplace("RS_IT_INPLACE", &mut data, 0);
+        if mode == "fail" {
+            assert_eq!(result.unwrap_err().code, AtmiError::TPESVCFAIL);
+        } else {
+            result.map_err(|e| e.to_string())?;
+        }
+        assert_response(
+            &data,
+            ubf_fields::T_STRING_2_FLD,
+            &format!("INPLACE:{mode}"),
+        )?;
+        assert_eq!(
+            data.bget_bytes(ubf_fields::T_CARRAY_FLD, 0).unwrap(),
+            vec![0x5A; 12000]
+        );
+        data.bchg(ubf_fields::T_STRING_FLD, 0, "still mutable", true)
+            .unwrap();
+    }
+    // Existing callers still pass a shared request and a separate mutable output.
+    let request = build_echo_request(ctx, "separate")?;
+    let mut output = ctx.tpalloc_ubf(1024).map_err(|e| e.to_string())?;
+    ctx.tpcall("RS_IT_INPLACE", &request, &mut output, 0)
+        .map_err(|e| e.to_string())?;
+    assert_response(&output, ubf_fields::T_STRING_2_FLD, "INPLACE:separate")?;
+    assert!(request.bget_bytes(ubf_fields::T_CARRAY_FLD, 0).is_err());
+
+    let mut data = build_echo_request(ctx, "preserve")?;
+    for (service, flags, code) in [
+        ("RS_IT_MISSING_INPLACE", 0, AtmiError::TPENOENT),
+        ("RS_IT_REPLY_IMAGE", 0, AtmiError::TPEOTYPE),
+        ("RS_IT_INPLACE", endurox_rs::TPNOREPLY, AtmiError::TPEINVAL),
+    ] {
+        assert_eq!(
+            ctx.tpcall_inplace(service, &mut data, flags)
+                .unwrap_err()
+                .code,
+            code
+        );
+        assert_eq!(
+            data.bget_string(ubf_fields::T_STRING_FLD, 0).unwrap(),
+            "preserve"
+        );
+    }
+    let image = data.bwrite().unwrap();
+    let mut generic = data.into_inner();
+    ctx.tpcall_inplace("RS_IT_REPLY_IMAGE", &mut generic, 0)
+        .map_err(|e| e.to_string())?;
+    assert_eq!(generic.tptypes().unwrap().type_name, "CARRAY");
+    assert_eq!(generic.as_bytes(), image);
     Ok(())
 }

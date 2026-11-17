@@ -9,6 +9,11 @@ use std::ffi::CStr;
 /// `take_data_ubf()` and passes it to `tpreturn`.  If the handler
 /// returns without taking the data the buffer is freed automatically via
 /// the `TypedBuffer` Drop impl (correct: service must either return or free it).
+///
+/// The handler may also keep the request and reply with a different buffer.
+/// Enduro/X frees the request itself when it sends a reply, so in that case
+/// [`AtmiCtx::tpreturn`] holds the reply back until the handler has returned
+/// and the request is no longer reachable from Rust.
 #[derive(Debug)]
 pub struct TpSvcInfo<'ctx> {
     raw: *mut raw::TPSVCINFO,
@@ -30,7 +35,7 @@ impl<'ctx> TpSvcInfo<'ctx> {
             None
         } else {
             let len = (*raw).len.max(0) as usize;
-            Some(TypedBuffer::from_raw_with_len(ctx, data_ptr, len))
+            Some(TypedBuffer::request_from_raw_with_len(ctx, data_ptr, len))
         };
         TpSvcInfo { raw, ctx, data }
     }
@@ -70,6 +75,12 @@ impl<'ctx> TpSvcInfo<'ctx> {
         self.raw().len
     }
 
+    /// Whether the native request length is zero. Self-describing UBF/VIEW
+    /// buffers may have a zero length while still containing fields.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Update the length in the service metadata; the owned buffer’s tracked length is unchanged.
     ///
     /// # Arguments
@@ -105,7 +116,7 @@ impl<'ctx> TpSvcInfo<'ctx> {
 
     /// Copy the client identifier used to send unsolicited notifications.
     pub fn cltid(&self) -> crate::ClientId {
-        self.raw().cltid
+        crate::ClientId(self.raw().cltid)
     }
 
     /// Return the still-owned request buffer pointer, or null after it has been taken.

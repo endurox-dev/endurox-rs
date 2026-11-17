@@ -55,6 +55,13 @@ fn xatmi_server_single_dispatch_thread_with_oapi() {
     run_xatmi_server_client_scenario_inner("tpcall", Some("ctx-send"), "single");
 }
 
+#[test]
+fn xatmi_server_replies_with_buffer_other_than_request() {
+    run_xatmi_server_client_scenario("reply-new");
+    run_xatmi_server_client_scenario_with_feature("reply-new", "ctx-send");
+    run_xatmi_server_client_scenario_inner("reply-new", None, "single");
+}
+
 fn run_xatmi_server_client_scenario(scenario: &str) {
     run_xatmi_server_client_scenario_inner(scenario, None, "multi");
 }
@@ -96,4 +103,16 @@ fn run_xatmi_server_client_scenario_inner(
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+#[test]
+fn typed_replies_reject_carray_images_and_invalid_forward_replies_with_failure() {
+    run_xatmi_server_client_scenario("reply-types");
+    run_xatmi_server_client_scenario_with_feature("reply-types", "ctx-send");
+}
+
+#[test]
+fn inplace_calls_preserve_ownership_types_and_error_replies() {
+    run_xatmi_server_client_scenario("inplace");
+    run_xatmi_server_client_scenario_with_feature("inplace", "ctx-send");
 }

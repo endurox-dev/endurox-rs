@@ -1,5 +1,6 @@
 use super::endurox_test_env;
-use endurox_rs::{ubf_fields as f, AtmiCtx, UbfError, UbfFieldType, ViewValue};
+use endurox_rs::{AtmiCtx, UbfError, UbfFieldType, ViewValue};
+use ubf_fields as f;
 
 #[test]
 fn text_roundtrip_preserves_escapes_and_nested_layouts() {
@@ -123,4 +124,48 @@ fn unsigned_values_are_preserved_or_rejected_before_writing() {
     assert_eq!(buffer.bget_long(f::T_LONG_FLD, 0).unwrap(), 65535);
     assert_eq!(ctx.boccur(&buffer, f::T_LONG_FLD).unwrap(), 3);
     assert_eq!(view.bvget_i64("tlong", 0, 0).unwrap(), 65535);
+}
+
+#[test]
+fn large_field_and_json_conversions_grow_past_old_limits() {
+    let _guard = endurox_test_env();
+    let ctx = AtmiCtx::new().unwrap();
+    let text = "x".repeat(100000);
+    let bytes = vec![0xAB; 100000];
+    let mut ubf = ctx.tpalloc_ubf(300000).unwrap();
+    ubf.bchg(f::T_STRING_FLD, 0, text.as_str(), false).unwrap();
+    ubf.bchg(f::T_CARRAY_FLD, 0, bytes.clone(), false).unwrap();
+    assert_eq!(ubf.bget_string(f::T_STRING_FLD, 0).unwrap(), text);
+    assert_eq!(ubf.bget_bytes(f::T_CARRAY_FLD, 0).unwrap(), bytes);
+    // Each field remains within the native JSON scratch limit. Many escaped
+    // occurrences make the total exceed both 64 KiB and the 4x initial estimate.
+    ctx.binit(&mut ubf, 300000).unwrap();
+    let escaped = "\u{1}".repeat(16000);
+    for occ in 0..8 {
+        ubf.bchg(f::T_STRING_FLD, occ, escaped.as_str(), false)
+            .unwrap();
+    }
+    let json = ctx.tpubftojson(&ubf).unwrap();
+    assert!(json.len() > 65536);
+    let mut restored = ctx.tpalloc_ubf(300000).unwrap();
+    ctx.tpjsontoubf(&mut restored, &json).unwrap();
+    assert_eq!(restored.bget_string(f::T_STRING_FLD, 7).unwrap(), escaped);
+    let mut view = ctx
+        .tpalloc_view("LARGE_VIEW", ctx.bvsizeof("LARGE_VIEW").unwrap())
+        .unwrap();
+    // Native VIEW element sizes are signed shorts; the overall layout may
+    // exceed 64 KiB, but an individual string/CARRAY cannot exceed 32767.
+    view.bvchg("text", 3, &text[..32000]).unwrap();
+    view.bvchg("blob", 3, ViewValue::Carray(bytes[..32000].to_vec()))
+        .unwrap();
+    assert_eq!(view.bvget_string("text", 3, 0).unwrap(), text[..32000]);
+    assert_eq!(view.bvget_bytes("blob", 3, 0).unwrap(), bytes[..32000]);
+    let mut view = ctx.tpalloc_view("JSON_EXPANSION", 1024).unwrap();
+    for i in 0..48 {
+        view.bvchg(&format!("long_member_name_for_json_{i:03}"), 0, b'X' as i8)
+            .unwrap();
+    }
+    let json = view.tpviewtojson(0).unwrap();
+    assert!(json.len() > 1024);
+    assert!(json.contains("long_member_name_for_json_047"));
 }

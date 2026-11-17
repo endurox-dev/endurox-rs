@@ -1,13 +1,23 @@
 //! Typed UBF field access, conversion, iteration, and borrowed child-buffer views.
 // src/typed_ubf.rs
 use core::ffi::{c_char, c_int, c_long};
-use std::ffi::{CStr, CString};
-use std::ops::{Deref, DerefMut};
+use std::ffi::CString;
+use std::ops::Deref;
 
 use crate::{
     raw, AtmiCtx, AtmiError, BFldLocInfo, TypedBuffer, TypedView, UbfError, UbfExprTree,
     UbfFieldType, UbfResult,
 };
+
+/// Decode the NUL-terminated text at the start of zero-initialised storage.
+///
+/// # Arguments
+///
+/// - `buf`: Storage filled by a native string conversion; text ends at the first NUL.
+fn c_text_lossy(buf: &[u8]) -> String {
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
+}
 
 /// Value that can be written into a UBF field.
 ///
@@ -357,23 +367,15 @@ impl<'a, 'ctx> BorrowedUbf<'a, 'ctx> {
     pub fn bget_string(&self, bfldid: i32, occ: i32) -> UbfResult<String> {
         self.ctx
             .reject_ptr_conversion(bfldid as raw::BFLDID, "bget_string")?;
-        let mut buf = vec![0u8; raw::NDRX_ATMI_MSG_MAX_SIZE as usize];
-        let mut len = buf.len() as raw::BFLDLEN;
-        let rc = self.ctx.cbget_borrowed_ubf_value(
-            self,
-            bfldid as raw::BFLDID,
-            occ as raw::BFLDOCC,
-            buf.as_mut_ptr() as *mut c_char,
-            &mut len,
-            raw::BFLD_STRING as c_int,
-        );
-        if rc != 0 {
-            return Err(self.ctx.ubf_last_error());
-        }
-        let s = unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) }
-            .to_string_lossy()
-            .into_owned();
-        Ok(s)
+        let (buf, _) = unsafe {
+            self.ctx.cbget_sized(
+                self.as_ubfh(),
+                bfldid as raw::BFLDID,
+                occ as raw::BFLDOCC,
+                raw::BFLD_STRING as c_int,
+            )
+        }?;
+        Ok(c_text_lossy(&buf))
     }
 }
 
@@ -443,6 +445,56 @@ impl<'ctx> TypedUbf<'ctx> {
     /// Return the underlying generic typed buffer wrapper.
     pub fn into_inner(self) -> TypedBuffer<'ctx> {
         self.inner
+    }
+
+    /// Reallocate this UBF to `new_size` bytes using `tprealloc`.
+    ///
+    /// # Arguments
+    ///
+    /// - `new_size`: Requested allocation size in bytes.
+    ///
+    /// On failure the buffer is unchanged. See [`TypedBuffer::tprealloc`].
+    pub fn tprealloc(&mut self, new_size: usize) -> Result<(), AtmiError> {
+        self.inner.tprealloc(new_size)
+    }
+
+    /// Adopt a pointer left by a native call that could not be told to keep the buffer type.
+    ///
+    /// # Arguments
+    ///
+    /// - `ptr`: Live successor of this buffer as stored back by Enduro/X.
+    ///
+    /// If the successor is not a UBF it is freed and replaced by an empty UBF,
+    /// and `TPEOTYPE` is returned: this wrapper must never address a foreign
+    /// buffer through UBF calls.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must own the live successor of this buffer, as stored back through
+    /// the `char **` the native call was given.
+    pub(crate) unsafe fn adopt_unverified_value(
+        &mut self,
+        ptr: *mut c_char,
+    ) -> Result<(), AtmiError> {
+        self.inner.replace_ptr(ptr);
+        self.inner.set_len_reported(0);
+        let found = match self.inner.tptypes() {
+            Ok(info) if info.type_name == "UBF" => return Ok(()),
+            Ok(info) => info.type_name,
+            Err(_) => "NULL".to_string(),
+        };
+        let ctx = self.inner.ctx;
+        let replacement = match ctx.tpalloc_ubf(1024) {
+            Ok(fresh) => fresh.into_inner(),
+            // Out of memory: a null UBF is rejected by every native call.
+            Err(_) => TypedBuffer::from_raw(ctx, std::ptr::null_mut()),
+        };
+        // Dropping the foreign buffer frees it.
+        drop(std::mem::replace(&mut self.inner, replacement));
+        Err(AtmiError::new(
+            raw::TPEOTYPE,
+            format!("expected a UBF buffer back, Enduro/X returned {found}"),
+        ))
     }
 
     /// Transfer ownership of the underlying UBF buffer pointer.
@@ -892,23 +944,15 @@ impl<'ctx> TypedUbf<'ctx> {
         self.inner
             .ctx
             .reject_ptr_conversion(bfldid as raw::BFLDID, "bget_string")?;
-        let mut buf = vec![0u8; raw::NDRX_ATMI_MSG_MAX_SIZE as usize];
-        let mut len = buf.len() as raw::BFLDLEN;
-        let rc = self.inner.ctx.cbget_value(
-            self,
-            bfldid as raw::BFLDID,
-            occ as raw::BFLDOCC,
-            buf.as_mut_ptr() as *mut c_char,
-            &mut len,
-            raw::BFLD_STRING as c_int,
-        );
-        if rc != 0 {
-            return Err(self.inner.ctx.ubf_last_error());
-        }
-        let s = unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) }
-            .to_string_lossy()
-            .into_owned();
-        Ok(s)
+        let (buf, _) = unsafe {
+            self.inner.ctx.cbget_sized(
+                self.as_ubfh(),
+                bfldid as raw::BFLDID,
+                occ as raw::BFLDOCC,
+                raw::BFLD_STRING as c_int,
+            )
+        }?;
+        Ok(c_text_lossy(&buf))
     }
 
     /// Read a field occurrence dynamically based on the UBF field id type.
@@ -1098,22 +1142,16 @@ impl<'ctx> TypedUbf<'ctx> {
         self.inner
             .ctx
             .reject_ptr_conversion(bfldid as raw::BFLDID, "bget_bytes")?;
-        let mut buf = vec![0u8; raw::NDRX_ATMI_MSG_MAX_SIZE as usize];
-        let mut len = buf.len() as raw::BFLDLEN;
-        let rc = self.inner.ctx.cbget_value(
-            self,
-            bfldid as raw::BFLDID,
-            occ as raw::BFLDOCC,
-            buf.as_mut_ptr() as *mut c_char,
-            &mut len,
-            raw::BFLD_CARRAY as c_int,
-        );
-        if rc != 0 {
-            return Err(self.inner.ctx.ubf_last_error());
-        }
-        buf.truncate(len as usize);
-        let bytes = buf;
-        Ok(bytes)
+        let (mut buf, len) = unsafe {
+            self.inner.ctx.cbget_sized(
+                self.as_ubfh(),
+                bfldid as raw::BFLDID,
+                occ as raw::BFLDOCC,
+                raw::BFLD_CARRAY as c_int,
+            )
+        }?;
+        buf.truncate(len);
+        Ok(buf)
     }
 
     /// Keep `BFLD_PTR` occurrences and owned buffers paired up.
@@ -1358,8 +1396,12 @@ impl<'ctx> TypedUbf<'ctx> {
     /// # Arguments
     ///
     /// - `tree`: Compiled UBF expression to evaluate against this buffer.
-    pub fn bboolev(&self, tree: &UbfExprTree<'_>) -> bool {
-        self.inner.ctx.bboolev_value(self, tree) == 1
+    pub fn bboolev(&self, tree: &UbfExprTree<'_>) -> UbfResult<bool> {
+        match self.inner.ctx.bboolev_value(self, tree) {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(self.inner.ctx.ubf_last_error()),
+        }
     }
 
     /// Compile and evaluate a boolean expression against this UBF.
@@ -1369,7 +1411,7 @@ impl<'ctx> TypedUbf<'ctx> {
     /// - `expr`: UBF expression text to compile and evaluate.
     pub fn bqboolev(&self, expr: &str) -> UbfResult<bool> {
         let tree = self.inner.ctx.bboolco(expr)?;
-        Ok(self.bboolev(&tree))
+        self.bboolev(&tree)
     }
 
     /// Evaluate a compiled expression as a floating point value.
@@ -1377,7 +1419,7 @@ impl<'ctx> TypedUbf<'ctx> {
     /// # Arguments
     ///
     /// - `tree`: Compiled UBF expression to evaluate against this buffer.
-    pub fn bfloatev(&self, tree: &UbfExprTree<'_>) -> f64 {
+    pub fn bfloatev(&self, tree: &UbfExprTree<'_>) -> UbfResult<f64> {
         self.inner.ctx.bfloatev_value(self, tree)
     }
 
@@ -1460,6 +1502,8 @@ impl<'ctx> TypedUbf<'ctx> {
 /// Fallible iteration over UBF field metadata.
 impl<'a, 'ctx> UbfIterator<'a, 'ctx> {
     /// Advance to the next field occurrence, returning `None` at the end of the buffer.
+    // Preserve the native fallible-next API, with errors outside the optional item.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> UbfResult<Option<UbfField>> {
         let mut occurrence: raw::BFLDOCC = 0;
         let rc = self.ubf.inner.ctx.bnext_value(
@@ -1501,11 +1545,39 @@ impl<'ctx> Deref for TypedUbf<'ctx> {
     }
 }
 
-/// Exclusive access to the underlying typed buffer.
-impl<'ctx> DerefMut for TypedUbf<'ctx> {
-    /// Borrow the underlying typed buffer for exclusive access.
+// There is deliberately no `DerefMut` to `TypedBuffer`. A `&mut TypedBuffer`
+// can be swapped for a buffer of another type, or handed to a call that
+// replaces it with a reply of another type, after which every UBF operation
+// here would address foreign bytes through a header they do not have; libubf
+// only checks the header magic (`validate_entry`, `libubf/ubf_impl.c`).
+
+/// Receives UBF replies only: the call is made with `TPNOCHANGE`.
+impl crate::typed_buf::reply_slot::ReplySlot for TypedUbf<'_> {
     #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
+    fn reply_context(&self) -> &AtmiCtx {
+        self.inner.ctx
+    }
+
+    #[inline]
+    fn reply_ptr(&self) -> *mut c_char {
+        self.inner.as_ptr()
+    }
+
+    #[inline]
+    fn reply_len(&self) -> usize {
+        self.inner.len()
+    }
+
+    #[inline]
+    fn reply_flags(&self) -> i64 {
+        raw::TPNOCHANGE as i64
+    }
+
+    #[inline]
+    unsafe fn reply_adopt(&mut self, ptr: *mut c_char, len: usize) {
+        self.inner.replace_ptr(ptr);
+        self.inner.set_len_reported(len);
     }
 }
+
+impl crate::ReplyBuffer for TypedUbf<'_> {}

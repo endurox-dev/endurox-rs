@@ -1,4 +1,4 @@
-use endurox_rs::{ubf_fields, AtmiCtx};
+use endurox_rs::AtmiCtx;
 use std::thread;
 use std::time::Duration;
 
@@ -17,7 +17,7 @@ fn run() -> Result<(), String> {
     let ctx = AtmiCtx::new().map_err(|e| format!("failed to create AtmiCtx: {e}"))?;
     ctx.tpinit().map_err(|e| format!("tpinit failed: {e}"))?;
 
-    let mut buf = ctx
+    let buf = ctx
         .tpalloc_ubf(1024)
         .map_err(|e| format!("tpalloc_ubf failed: {e}"))?;
 

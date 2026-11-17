@@ -435,7 +435,7 @@ impl UbfFieldDeserialize for UbfCarray {
 }
 
 /// Delegate field serialization to the referenced value.
-impl<'value, T> UbfFieldSerialize for &'value T
+impl<T> UbfFieldSerialize for &T
 where
     T: UbfFieldSerialize + ?Sized,
 {

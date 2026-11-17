@@ -6,6 +6,8 @@ use std::os::raw::{c_long, c_void};
 impl AtmiCtx {
     /// Open automatic resource managers, or all configured RMs with `TPTXOPENALL`.
     pub fn tpopen2(&self, flags: i64) -> AtmiResult<()> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         let flags = c_long::try_from(flags)
             .map_err(|_| AtmiError::new(raw::TPEINVAL, "flags exceed native long"))?;
         #[cfg(not(feature = "ctx-send"))]
@@ -18,6 +20,8 @@ impl AtmiCtx {
     /// Open the configured resource manager `name`.
     /// `flags` is reserved; use zero. Manual RMs require explicit start/end calls.
     pub fn tprmopen(&self, name: &str, flags: i64) -> AtmiResult<()> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         let flags = c_long::try_from(flags)
             .map_err(|_| AtmiError::new(raw::TPEINVAL, "flags exceed native long"))?;
         let name = CString::new(name)
@@ -32,6 +36,8 @@ impl AtmiCtx {
     /// Close the configured resource manager `name`.
     /// `flags` is reserved; use zero. Manual RMs require explicit start/end calls.
     pub fn tprmclose(&self, name: &str, flags: i64) -> AtmiResult<()> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         let flags = c_long::try_from(flags)
             .map_err(|_| AtmiError::new(raw::TPEINVAL, "flags exceed native long"))?;
         let name = CString::new(name)
@@ -46,6 +52,8 @@ impl AtmiCtx {
     /// Associate the current transaction with the configured resource manager `name`.
     /// `flags` is reserved; use zero. Manual RMs require explicit start/end calls.
     pub fn tprmstart(&self, name: &str, flags: i64) -> AtmiResult<()> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         let flags = c_long::try_from(flags)
             .map_err(|_| AtmiError::new(raw::TPEINVAL, "flags exceed native long"))?;
         let name = CString::new(name)
@@ -60,6 +68,8 @@ impl AtmiCtx {
     /// End the current transaction association with the configured resource manager `name`.
     /// `flags` is reserved; use zero. Manual RMs require explicit start/end calls.
     pub fn tprmend(&self, name: &str, flags: i64) -> AtmiResult<()> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         let flags = c_long::try_from(flags)
             .map_err(|_| AtmiError::new(raw::TPEINVAL, "flags exceed native long"))?;
         let name = CString::new(name)

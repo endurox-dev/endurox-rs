@@ -1,5 +1,6 @@
 //! Run with a configured Enduro/X environment: cargo run --example complex_ubf
-use endurox_rs::{ubf_fields as f, AtmiCtx, UbfDeserialize, UbfSerialize};
+use endurox_rs::{AtmiCtx, UbfDeserialize, UbfSerialize};
+use ubf_fields as f;
 
 #[derive(Debug, PartialEq, UbfSerialize, UbfDeserialize)]
 struct Item {

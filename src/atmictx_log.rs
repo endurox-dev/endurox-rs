@@ -1,6 +1,6 @@
 //! Application, middleware, and UBF logging with source locations and formatting macros.
 use crate::raw;
-use crate::{AtmiCtx, AtmiError, AtmiResult, TypedBuffer};
+use crate::{AtmiCtx, AtmiError, AtmiResult, NstdError, NstdResult, TypedBuffer, TypedUbf};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_long};
 
@@ -28,12 +28,27 @@ pub enum LogLevel {
 pub struct ThreadLogger;
 
 impl ThreadLogger {
+    /// Query the calling thread's logger configuration using `TPLOGQI_*` flags.
+    pub fn tplogqinfo(self, level: LogLevel, flags: i64) -> NstdResult<i64> {
+        let info = unsafe { raw::tplogqinfo(level.into(), flags as c_long) };
+        if info < 0 {
+            let code = unsafe { *raw::_Nget_Nerror_addr() };
+            let message = unsafe { CStr::from_ptr(raw::Nstrerror(code)) }
+                .to_string_lossy()
+                .into_owned();
+            Err(NstdError::new(code as u32, message))
+        } else {
+            Ok(info as i64)
+        }
+    }
+
     /// Whether the active application logger accepts `level` under `[@debug]`.
     /// Check before preparing an expensive buffer dump or SQL representation.
     pub fn enabled(self, level: LogLevel) -> bool {
         // tplogqinfo is an NSTD operation and initializes logging independently
         // of ATMI. The fixed flag selects only the application logger.
-        unsafe { raw::tplogqinfo(level.into(), raw::TPLOGQI_GET_TP as c_long) > 0 }
+        self.tplogqinfo(level, raw::TPLOGQI_GET_TP as i64)
+            .is_ok_and(|info| info > 0)
     }
 
     /// Write `msg` through the active thread's application logger, preserving
@@ -99,6 +114,30 @@ fn call_logex(
 
 /// Logging entry points that attach source-file and line information.
 impl AtmiCtx {
+    /// Query this context's logger configuration using `TPLOGQI_*` flags.
+    /// Returns zero when the requested level is disabled; other values contain
+    /// native facility/level bits. Logging macros check this before formatting.
+    pub fn tplogqinfo(&self, level: LogLevel, flags: i64) -> NstdResult<i64> {
+        #[cfg(not(feature = "ctx-send"))]
+        let info = unsafe { raw::tplogqinfo(level.into(), flags as c_long) };
+        #[cfg(feature = "ctx-send")]
+        let info = unsafe { raw::Otplogqinfo(self.c_ctx_ptr(), level.into(), flags as c_long) };
+        if info < 0 {
+            #[cfg(not(feature = "ctx-send"))]
+            return Err(self.nstd_last_error());
+            #[cfg(feature = "ctx-send")]
+            unsafe {
+                let code = *raw::O_Nget_Nerror_addr(self.c_ctx_ptr());
+                let message = CStr::from_ptr(raw::ONstrerror(self.c_ctx_ptr(), code))
+                    .to_string_lossy()
+                    .into_owned();
+                Err(NstdError::new(code as u32, message))
+            }
+        } else {
+            Ok(info as i64)
+        }
+    }
+
     /// Write a message to the application logger, with its source location.
     ///
     /// # Arguments
@@ -182,31 +221,27 @@ impl AtmiCtx {
 impl AtmiCtx {
     /// Select a request log from a UBF, an explicit filename, or a filename service.
     ///
-    /// `data` is optional. When supplied, a UBF stores the selected filename;
+    /// `data` is optional. When supplied, the UBF stores the selected filename;
     /// `filesvc` may replace that buffer even on failure. The service must return
-    /// UBF, since the native API does not return a payload length. Such replies
-    /// retain a tracked length of zero. Without a UBF, supply `filename`.
+    /// UBF: a reply of another type is freed, `data` is left an empty UBF, and
+    /// `TPEOTYPE` is returned. Without a UBF, supply `filename`.
     /// Filename strings must fit the native path limit and contain no NULs.
     /// Native field writes may fail for insufficient UBF space; grow it beforehand.
     /// Use a request filename distinct from the process log in threaded programs.
     pub fn tplogsetreqfile(
         &self,
-        data: Option<&mut TypedBuffer<'_>>,
+        data: Option<&mut TypedUbf<'_>>,
         filename: Option<&str>,
         filesvc: Option<&str>,
     ) -> AtmiResult<()> {
+        #[cfg(feature = "async")]
+        let _resync = self.resync_replies();
         let filename = filename.map(request_log_filename).transpose()?;
         let filesvc = filesvc
             .map(CString::new)
             .transpose()
             .map_err(|_| AtmiError::new(AtmiError::TPEINVAL, "filesvc contains NUL"))?;
-        // Determine whether the native filename service can replace the payload.
-        let is_ubf = data
-            .as_ref()
-            .map(|b| b.tptypes())
-            .transpose()?
-            .is_some_and(|info| matches!(info.type_name.as_str(), "UBF" | "FML" | "FML32"));
-        if !is_ubf && filename.as_ref().is_none_or(|s| s.as_bytes().is_empty()) {
+        if data.is_none() && filename.as_ref().is_none_or(|s| s.as_bytes().is_empty()) {
             return Err(AtmiError::new(
                 AtmiError::TPEINVAL,
                 "filename is required without a UBF",
@@ -231,10 +266,12 @@ impl AtmiCtx {
         // Snapshot the diagnostic before any further native call.
         let result = self.rc_to_result(rc);
         if let Some(data) = data {
-            data.replace_ptr(pointer);
-            if is_ubf {
-                data.set_len_reported(0);
-            }
+            // The native `tpcall` to `filesvc` runs without `TPNOCHANGE`
+            // (`ndrx_tplogsetreqfile`, `libatmi/atmi_tplog.c`), so the buffer
+            // that comes back is checked before it is used as a UBF again.
+            // SAFETY: `pointer` is what the call stored back through `slot`.
+            let adopted = unsafe { data.adopt_unverified_value(pointer) };
+            return result.and(adopted);
         }
         result
     }
@@ -266,7 +303,7 @@ impl AtmiCtx {
     }
 
     /// Delete the request filename field from a UBF without closing the current logger.
-    pub fn tplogdelbufreqfile(&self, data: &mut TypedBuffer<'_>) -> AtmiResult<()> {
+    pub fn tplogdelbufreqfile(&self, data: &mut TypedUbf<'_>) -> AtmiResult<()> {
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tplogdelbufreqfile(data.as_ptr()) };
         #[cfg(feature = "ctx-send")]
@@ -360,8 +397,12 @@ fn request_log_filename(filename: &str) -> AtmiResult<CString> {
 #[macro_export]
 macro_rules! tp_log {
     ($ctx:expr, $lvl:expr, $($arg:tt)*) => {{
-        let __msg = format!($($arg)*);
-        $ctx.tplog_str($lvl, file!(), line!(), &__msg);
+        let __ctx = &$ctx;
+        let __level = $lvl;
+        if __ctx.tplogqinfo(__level, $crate::TPLOGQI_GET_TP).is_ok_and(|info| info > 0) {
+            let __msg = format!($($arg)*);
+            __ctx.tplog_str(__level, file!(), line!(), &__msg);
+        }
     }};
 }
 /// Format and write a message to the application logger at `Always` level.
@@ -424,8 +465,12 @@ macro_rules! tp_dump   { ($ctx:expr, $($arg:tt)*) => { $crate::tp_log!($ctx, $cr
 #[macro_export]
 macro_rules! ndrx_log {
     ($ctx:expr, $lvl:expr, $($arg:tt)*) => {{
-        let __msg = format!($($arg)*);
-        $ctx.ndrxlog_str($lvl, file!(), line!(), &__msg);
+        let __ctx = &$ctx;
+        let __level = $lvl;
+        if __ctx.tplogqinfo(__level, $crate::TPLOGQI_GET_NDRX).is_ok_and(|info| info > 0) {
+            let __msg = format!($($arg)*);
+            __ctx.ndrxlog_str(__level, file!(), line!(), &__msg);
+        }
     }};
 }
 /// Format and write a message to the middleware logger at `Always` level.
@@ -488,8 +533,12 @@ macro_rules! ndrx_dump   { ($ctx:expr, $($arg:tt)*) => { $crate::ndrx_log!($ctx,
 #[macro_export]
 macro_rules! ubf_log {
     ($ctx:expr, $lvl:expr, $($arg:tt)*) => {{
-        let __msg = format!($($arg)*);
-        $ctx.ubflog_str($lvl, file!(), line!(), &__msg);
+        let __ctx = &$ctx;
+        let __level = $lvl;
+        if __ctx.tplogqinfo(__level, $crate::TPLOGQI_GET_UBF).is_ok_and(|info| info > 0) {
+            let __msg = format!($($arg)*);
+            __ctx.ubflog_str(__level, file!(), line!(), &__msg);
+        }
     }};
 }
 /// Format and write a message to the UBF logger at `Always` level.
@@ -540,3 +589,56 @@ macro_rules! ubf_debug  { ($ctx:expr, $($arg:tt)*) => { $crate::ubf_log!($ctx, $
 /// - Remaining arguments: A format string and its values, as accepted by `format!`.
 #[macro_export]
 macro_rules! ubf_dump   { ($ctx:expr, $($arg:tt)*) => { $crate::ubf_log!($ctx, $crate::LogLevel::Dump,   $($arg)*); } }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    struct DisabledLogger;
+    impl DisabledLogger {
+        fn tplogqinfo(&self, _: LogLevel, _: i64) -> NstdResult<i64> {
+            Ok(0)
+        }
+        fn tplog_str(&self, _: LogLevel, _: &'static str, _: u32, _: &str) {
+            panic!("disabled TP log");
+        }
+        fn ndrxlog_str(&self, _: LogLevel, _: &'static str, _: u32, _: &str) {
+            panic!("disabled NDRX log");
+        }
+        fn ubflog_str(&self, _: LogLevel, _: &'static str, _: u32, _: &str) {
+            panic!("disabled UBF log");
+        }
+    }
+
+    #[test]
+    fn disabled_macros_skip_argument_evaluation_and_formatting() {
+        let logger = DisabledLogger;
+        let calls = Cell::new(0);
+        let expensive = || {
+            calls.set(calls.get() + 1);
+            "prepared"
+        };
+        crate::tp_debug!(logger, "{}", expensive());
+        crate::ndrx_debug!(logger, "{}", expensive());
+        crate::ubf_debug!(logger, "{}", expensive());
+        assert_eq!(calls.get(), 0);
+        // The receiver and level expressions are evaluated exactly once.
+        let receivers = Cell::new(0);
+        let levels = Cell::new(0);
+        crate::tp_log!(
+            {
+                receivers.set(receivers.get() + 1);
+                &logger
+            },
+            {
+                levels.set(levels.get() + 1);
+                LogLevel::Debug
+            },
+            "{}",
+            expensive()
+        );
+        assert_eq!(receivers.get(), 1);
+        assert_eq!(levels.get(), 1);
+    }
+}

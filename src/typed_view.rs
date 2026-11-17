@@ -462,6 +462,59 @@ impl<'ctx> TypedView<'ctx> {
         Ok(val)
     }
 
+    /// Read a member converted to `usrtype` into storage sized from the member's declaration.
+    ///
+    /// # Arguments
+    ///
+    /// - `cname`: Member’s C name from the VIEW definition, without embedded NUL bytes.
+    /// - `occ`: Zero-based array element; use `0` for a scalar member.
+    /// - `usrtype`: Native `BFLD_STRING` or `BFLD_CARRAY` output type.
+    /// - `flags`: `0` to read any value, or `BVACCESS_NOTNULL` to reject native NULL values.
+    ///
+    /// Returns zero-initialised storage and the value length Enduro/X reported.
+    /// A member cannot hold more than its declared element size, so that bounds
+    /// the read instead of a 64 KiB scratch area cleared on every call. Numeric
+    /// members rendered as text can exceed their binary size, hence the floor
+    /// and the bounded retry.
+    fn cbvget_sized(
+        &self,
+        cname: &str,
+        occ: i32,
+        usrtype: c_int,
+        flags: i64,
+    ) -> UbfResult<(Vec<u8>, usize)> {
+        const MIN_SCRATCH: usize = 64;
+        const MAX_GROWTHS: usize = 5;
+
+        // An unknown member falls through to `CBvget`, which reports it.
+        let declared = self
+            .bvoccur(cname)
+            .map(|(_, _, _, dim, _)| dim)
+            .or_else(|_| self.bvsizeof())
+            .unwrap_or(0);
+        let mut cap = declared.saturating_add(1).max(MIN_SCRATCH);
+        let mut growths = 0;
+        loop {
+            let mut buf = vec![0u8; cap];
+            let mut len = raw::BFLDLEN::try_from(cap).unwrap_or(raw::BFLDLEN::MAX);
+            match self.cbvget(
+                cname,
+                occ,
+                buf.as_mut_ptr() as *mut c_char,
+                &mut len,
+                usrtype,
+                flags,
+            ) {
+                Ok(()) => return Ok((buf, (len.max(0) as usize).min(cap))),
+                Err(err) if err.code == UbfError::BNOSPACE && growths < MAX_GROWTHS => {
+                    growths += 1;
+                    cap = cap.saturating_mul(2);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
     /// Read a VIEW member as an owned string using native type conversion.
     ///
     /// # Arguments
@@ -470,19 +523,9 @@ impl<'ctx> TypedView<'ctx> {
     /// - `occ`: Zero-based array element; use `0` for a scalar member.
     /// - `flags`: `0` to read any value, or `BVACCESS_NOTNULL` to reject native NULL values.
     pub fn bvget_string(&self, cname: &str, occ: i32, flags: i64) -> UbfResult<String> {
-        let mut buf = vec![0u8; raw::NDRX_ATMI_MSG_MAX_SIZE as usize];
-        let mut len = buf.len() as raw::BFLDLEN;
-        self.cbvget(
-            cname,
-            occ,
-            buf.as_mut_ptr() as *mut c_char,
-            &mut len,
-            raw::BFLD_STRING as c_int,
-            flags,
-        )?;
-        Ok(unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) }
-            .to_string_lossy()
-            .into_owned())
+        let (buf, _) = self.cbvget_sized(cname, occ, raw::BFLD_STRING as c_int, flags)?;
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        Ok(String::from_utf8_lossy(&buf[..end]).into_owned())
     }
 
     /// Read a VIEW member as owned binary bytes, preserving the returned byte length.
@@ -493,17 +536,8 @@ impl<'ctx> TypedView<'ctx> {
     /// - `occ`: Zero-based array element; use `0` for a scalar member.
     /// - `flags`: `0` to read any value, or `BVACCESS_NOTNULL` to reject native NULL values.
     pub fn bvget_bytes(&self, cname: &str, occ: i32, flags: i64) -> UbfResult<Vec<u8>> {
-        let mut buf = vec![0u8; raw::NDRX_ATMI_MSG_MAX_SIZE as usize];
-        let mut len = buf.len() as raw::BFLDLEN;
-        self.cbvget(
-            cname,
-            occ,
-            buf.as_mut_ptr() as *mut c_char,
-            &mut len,
-            raw::BFLD_CARRAY as c_int,
-            flags,
-        )?;
-        buf.truncate(len as usize);
+        let (mut buf, len) = self.cbvget_sized(cname, occ, raw::BFLD_CARRAY as c_int, flags)?;
+        buf.truncate(len);
         Ok(buf)
     }
 
@@ -705,19 +739,30 @@ impl<'ctx> TypedView<'ctx> {
     pub fn tpviewtojson(&self, flags: i64) -> Result<String, AtmiError> {
         let view = CString::new(self.view.as_str())
             .map_err(|e| AtmiError::new(raw::TPEINVAL, e.to_string()))?;
-        let size = self
-            .bvsizeof()
-            .unwrap_or(raw::NDRX_ATMI_MSG_MAX_SIZE as usize);
-        let mut out = vec![0u8; size.saturating_mul(10).max(1024)];
-        self.inner.ctx.tpviewtojson(
-            self.inner.as_ptr(),
-            view.as_ptr() as *mut c_char,
-            out.as_mut_ptr() as *mut c_char,
-            out.len() as i32,
-            flags,
-        )?;
-        let end = out.iter().position(|&b| b == 0).unwrap_or(out.len());
-        Ok(String::from_utf8_lossy(&out[..end]).into_owned())
+        // The JSON size depends on member names and counts, not only on the
+        // layout size, so start from an estimate and grow while Enduro/X
+        // reports `TPEOS` ("buffer too short", `libatmi/view2exjson.c`).
+        let mut cap = self.bvsizeof().unwrap_or(0).saturating_mul(4).max(1024);
+        loop {
+            let bufsize = i32::try_from(cap).unwrap_or(i32::MAX);
+            let mut out = vec![0u8; bufsize as usize];
+            match self.inner.ctx.tpviewtojson(
+                self.inner.as_ptr(),
+                view.as_ptr() as *mut c_char,
+                out.as_mut_ptr() as *mut c_char,
+                bufsize,
+                flags,
+            ) {
+                Ok(()) => {
+                    let end = out.iter().position(|&b| b == 0).unwrap_or(out.len());
+                    return Ok(String::from_utf8_lossy(&out[..end]).into_owned());
+                }
+                Err(err) if err.code == AtmiError::TPEOS && bufsize < i32::MAX => {
+                    cap = cap.saturating_mul(2);
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     /// Return the next member’s `(name, native_type, maximum_count, element_bytes)`, or `None`

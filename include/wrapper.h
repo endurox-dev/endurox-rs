@@ -10,6 +10,7 @@
 #include <ubf.h>
 #include <oubf.h>
 #include <nerror.h>
+#include <onerror.h>
 #include <nstdutil.h>
 
 /* libatmisrvinteg exports these worker lifecycle hooks but public headers do

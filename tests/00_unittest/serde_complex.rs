@@ -1,8 +1,9 @@
 use endurox_rs::{
-    ubf_fields as f, AtmiCtx, EmbeddedUbf, PointerUbf, UbfAdhoc, UbfCarray, UbfDeserialize,
-    UbfFieldDeserialize, UbfFieldSerialize, UbfMappedDeserialize, UbfMappedSerialize, UbfSerialize,
-    ViewDeserialize, ViewSerialize,
+    AtmiCtx, EmbeddedUbf, PointerUbf, UbfAdhoc, UbfCarray, UbfDeserialize, UbfFieldDeserialize,
+    UbfFieldSerialize, UbfMappedDeserialize, UbfMappedSerialize, UbfSerialize, ViewDeserialize,
+    ViewSerialize,
 };
+use ubf_fields as f;
 
 #[derive(Debug, Clone, PartialEq, UbfSerialize, UbfDeserialize)]
 struct Child {

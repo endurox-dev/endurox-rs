@@ -19,6 +19,82 @@ pub struct TpTypeInfo {
     pub subtype: String,
 }
 
+/// Crate-internal access to a buffer that a receiving XATMI call may replace.
+pub(crate) mod reply_slot {
+    use core::ffi::c_char;
+
+    /// The pointer/length slot a native receive call reads and rewrites.
+    pub trait ReplySlot {
+        /// Context owning this allocation.
+        fn reply_context(&self) -> &crate::AtmiCtx;
+
+        /// Current native pointer, passed to the call as `*odata`.
+        fn reply_ptr(&self) -> *mut c_char;
+
+        /// Current tracked payload length, passed to the call as `*olen`.
+        fn reply_len(&self) -> usize;
+
+        /// Flags this wrapper requires on any call that may replace its buffer.
+        fn reply_flags(&self) -> i64;
+
+        /// Adopt the pointer and length the native call left behind.
+        ///
+        /// # Safety
+        ///
+        /// `ptr` must be what an XATMI call that was given [`Self::reply_ptr`]
+        /// and [`Self::reply_flags`] stored back, so that it owns the live
+        /// successor of this buffer, of a type the wrapper accepts, and `len`
+        /// must be the length reported with it.
+        unsafe fn reply_adopt(&mut self, ptr: *mut c_char, len: usize);
+    }
+}
+
+/// A buffer that can receive the reply of an XATMI call such as
+/// [`AtmiCtx::tpcall`], [`AtmiCtx::tpgetrply`] or [`AtmiCtx::tprecv`].
+///
+/// Enduro/X replaces the output buffer when the reply needs more room or has a
+/// different type, and the two implementations differ in what they accept:
+///
+/// - [`TypedBuffer`] takes whatever arrives. Inspect it with
+///   [`TypedBuffer::tptypes`] or convert it with `TypedUbf::from_typed`.
+/// - [`crate::TypedUbf`] must stay a UBF, so the call runs with `TPNOCHANGE`:
+///   a reply of any other type, a NULL reply included, fails with `TPEOTYPE`
+///   and leaves the buffer as it was.
+///
+/// The trait is sealed; it cannot be implemented outside this crate.
+pub trait ReplyBuffer: reply_slot::ReplySlot {}
+
+/// Accepts a reply of any buffer type.
+impl reply_slot::ReplySlot for TypedBuffer<'_> {
+    #[inline]
+    fn reply_context(&self) -> &AtmiCtx {
+        self.ctx
+    }
+
+    #[inline]
+    fn reply_ptr(&self) -> *mut c_char {
+        self.ptr
+    }
+
+    #[inline]
+    fn reply_len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    fn reply_flags(&self) -> i64 {
+        0
+    }
+
+    #[inline]
+    unsafe fn reply_adopt(&mut self, ptr: *mut c_char, len: usize) {
+        self.ptr = ptr;
+        self.len = len;
+    }
+}
+
+impl ReplyBuffer for TypedBuffer<'_> {}
+
 /// Owned XATMI typed buffer allocated by `tpalloc`.
 ///
 /// The buffer is tied to the [`AtmiCtx`] that allocated it and is released with
@@ -34,6 +110,11 @@ pub struct TypedBuffer<'ctx> {
     ptr: *mut c_char,
     pub(crate) ctx: &'ctx AtmiCtx,
     owned: bool,
+    /// This wrapper holds the request of the service call being dispatched.
+    /// Enduro/X tracks that allocation as the call's auto-buffer and frees it
+    /// in `tpreturn`/`tpforward`, so its release must be reported to the
+    /// dispatcher (see `service_request_released`).
+    request: bool,
     len: usize,
 }
 
@@ -53,6 +134,7 @@ impl<'ctx> TypedBuffer<'ctx> {
             ptr: raw,
             ctx,
             owned: true,
+            request: false,
             len: 0,
         }
     }
@@ -76,8 +158,41 @@ impl<'ctx> TypedBuffer<'ctx> {
             ptr: raw,
             ctx,
             owned: true,
+            request: false,
             len,
         }
+    }
+
+    /// Take ownership of the request buffer of the service call being dispatched.
+    ///
+    /// # Arguments
+    ///
+    /// - `ctx`: Context that remains borrowed while this buffer wrapper exists.
+    /// - `raw`: Request allocation from `TPSVCINFO::data`.
+    /// - `len`: Logical payload length in bytes, separate from allocation capacity.
+    ///
+    /// # Safety
+    /// `raw` must be the request buffer of the service call currently being
+    /// dispatched on this thread, and the dispatcher must have opened its reply
+    /// bookkeeping for that call.
+    pub(crate) unsafe fn request_from_raw_with_len(
+        ctx: &'ctx AtmiCtx,
+        raw: *mut c_char,
+        len: usize,
+    ) -> Self {
+        Self {
+            ptr: raw,
+            ctx,
+            owned: true,
+            request: true,
+            len,
+        }
+    }
+
+    /// Whether this wrapper holds the request of the service call being dispatched.
+    #[inline]
+    pub(crate) fn is_request(&self) -> bool {
+        self.request
     }
 
     /// Wrap a native typed buffer without taking responsibility for freeing it.
@@ -94,6 +209,7 @@ impl<'ctx> TypedBuffer<'ctx> {
             ptr: raw,
             ctx,
             owned: false,
+            request: false,
             len: 0,
         }
     }
@@ -131,7 +247,10 @@ impl<'ctx> TypedBuffer<'ctx> {
     /// to be used under `new_ctx`. The lifetime re-tie is unchecked by Rust.
     pub(crate) unsafe fn move_to_context<'new>(self, new_ctx: &'new AtmiCtx) -> TypedBuffer<'new> {
         let len = self.len;
-        TypedBuffer::from_raw_with_len(new_ctx, self.into_raw(), len)
+        let request = self.request;
+        let mut moved = TypedBuffer::from_raw_with_len(new_ctx, self.into_raw(), len);
+        moved.request = request;
+        moved
     }
 
     /// Update the internal pointer after a C API may have reallocated the buffer.
@@ -433,6 +552,13 @@ impl<'ctx> Drop for TypedBuffer<'ctx> {
             #[cfg(feature = "ctx-send")]
             unsafe {
                 raw::Otpfree(self.ctx.c_ctx_ptr(), self.ptr)
+            }
+
+            // `tpfree` of the request also clears the native auto-buffer
+            // (`ndrx_tpfree_inner`, `libatmi/typed_buf.c`), so a reply issued
+            // from here on cannot make Enduro/X free it a second time.
+            if self.request {
+                crate::atmictx_srv::service_request_released();
             }
         }
     }

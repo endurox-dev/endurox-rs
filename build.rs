@@ -6,6 +6,7 @@ use std::{
 };
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(endurox_pollable)");
     // --- 1) Parse env flags --------------------------------------------------
     // We accept typical envs:
     //   CFLAGS   -> -I / -D (compile-time)
@@ -41,14 +42,11 @@ fn main() {
     // --- 2) Rebuild triggers --------------------------------------------------
     // Re-run if wrapper or any env that affects codegen changes.
     println!("cargo:rerun-if-changed=include/wrapper.h");
-    println!("cargo:rerun-if-changed=tests/ubftab/test.fd");
-    println!("cargo:rerun-if-env-changed=ENDUROX_MKFLDHDR");
     println!("cargo:rerun-if-env-changed=CFLAGS");
     println!("cargo:rerun-if-env-changed=LDFLAGS");
     println!("cargo:rerun-if-env-changed=CC");
     println!("cargo:rerun-if-env-changed=LIBCLANG_PATH");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
-    println!("cargo:rustc-check-cfg=cfg(endurox_pollable)");
 
     // Resolve Enduro/X libs and include paths via pkg-config (atmisrvinteg.pc).
     // This emits the appropriate cargo:rustc-link-lib / rustc-link-search lines.
@@ -63,16 +61,12 @@ fn main() {
         }
     }
 
-    generate_ubf_field_constants();
-
     if endurox_config_has_pollable_reply_queue(&include_dirs) {
         println!("cargo:rustc-cfg=endurox_pollable");
     }
 
     // --- 3) Generate bindings with bindgen -----------------------------------
-    // Skip bindgen on docs.rs (no libclang). You can also gate with a feature.
-    let building_docs = env::var("DOCS_RS").is_ok();
-    if !building_docs {
+    {
         let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
         let wrapper = manifest_dir.join("include/wrapper.h");
 
@@ -125,46 +119,6 @@ fn main() {
             .write_to_file(out.join("bindings.rs"))
             .expect("Couldn't write bindings.rs");
     }
-}
-
-fn generate_ubf_field_constants() {
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let fd = manifest_dir.join("tests/ubftab/test.fd");
-    let out = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let mkfldhdr = find_mkfldhdr(&manifest_dir);
-
-    let status = Command::new(&mkfldhdr)
-        .arg("-m4")
-        .arg("-d")
-        .arg(&out)
-        .arg(&fd)
-        .status()
-        .unwrap_or_else(|e| panic!("failed to execute {}: {e}", mkfldhdr.display()));
-
-    if !status.success() {
-        panic!(
-            "{} failed to generate Rust UBF constants from {}",
-            mkfldhdr.display(),
-            fd.display()
-        );
-    }
-}
-
-fn find_mkfldhdr(manifest_dir: &Path) -> PathBuf {
-    if let Ok(path) = env::var("ENDUROX_MKFLDHDR") {
-        return PathBuf::from(path);
-    }
-
-    let sibling = manifest_dir
-        .parent()
-        .map(|parent| parent.join("endurox/mkfldhdr/mkfldhdr"));
-    if let Some(path) = sibling {
-        if path.exists() {
-            return path;
-        }
-    }
-
-    PathBuf::from("mkfldhdr")
 }
 
 fn compiler_builtin_include_dir() -> Option<String> {

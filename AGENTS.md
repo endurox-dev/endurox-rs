@@ -71,8 +71,11 @@ subsystem; preserve both code and diagnostic message.
   `LDFLAGS="-L/path/to/endurox/lib"` supplement native discovery. The build uses
   `atmisrvinteg` package metadata; it does not have a separate `libtux` prerequisite.
 - Bindings are generated into Cargo's `OUT_DIR` and included by private module
-  `raw`. Change the wrapper or safe Rust implementation, not generated files.
-- Test field constants are generated from `tests/ubftab/test.fd` using
+  `raw`. Generated bindings are build artifacts and must not be committed.
+  Change the wrapper or safe Rust implementation, not generated files.
+- Test field constants live in the dev-only `tests/ubf_fields` crate, imported
+  as `ubf_fields`; the runtime does not export them or invoke `mkfldhdr`.
+  They are generated from `tests/ubftab/test.fd` using
   `mkfldhdr -m4`. Lookup order is `ENDUROX_MKFLDHDR`, the sibling executable
   `../endurox/mkfldhdr/mkfldhdr`, then `PATH`.
 - UBF tests compile `tests/views/test.v`. Their compiler lookup uses
@@ -104,6 +107,9 @@ subsystem; preserve both code and diagnostic message.
 
 ## Contexts and server callbacks
 
+- Default `AtmiCtx` handles share one thread session. A thread-local view count
+  prevents secondary drops from terminating it; borrowed callbacks count too.
+  Explicit `tpterm()` remains immediate.
 - Default `AtmiCtx` is neither `Send` nor `Sync`. Feature `ctx-send` makes it
   `Send`, still not `Sync`, using a distinct native Object API context.
 - Keep the default C API and `ctx-send` Object API paths equivalent. Ordinary
@@ -146,6 +152,18 @@ subsystem; preserve both code and diagnostic message.
 - Raw byte access and length mutation are restricted to CARRAY. UBF/VIEW have
   native layouts, while STRING/JSON have terminator requirements. Keep these
   type checks and allocation bounds intact.
+- `TypedUbf` has no `DerefMut` to `TypedBuffer`. Sync/async receive methods use
+  sealed `ReplyBuffer`: UBF outputs require `TPNOCHANGE`, generic outputs may
+  change type. Async handover validates native allocation metadata, including
+  NULL and VIEW subtype, before adopting a reply. `into_inner`/`from_typed`
+  explicitly remove/restore the UBF type guarantee without payload copies.
+- Replies using a different buffer are deferred while Rust retains the service
+  request. The dispatcher sends the first reply after the handler returns;
+  returning the request itself or dropping it first permits an immediate send.
+- Preserve existing `tpcall(svc, &request, &mut reply, flags)` callers. The
+  distinct `tpcall_inplace(svc, &mut data, flags)` form reuses the request owner.
+  Both sync and async forms share their call implementation; async input views
+  must be read-only, unowned and dropped before receiving into the same buffer.
 - Receive/call APIs can replace output pointers even when returning an error.
   Preserve pointer, length and descriptor updates before returning that error.
 - `BFLD_PTR` stores a pointer value: native writes receive the address of a
@@ -247,6 +265,14 @@ These are custom `UbfSerialize`/`UbfDeserialize` and
   `AsyncAtmiCtx::tpsprio` keeps the next async submission's priority in the
   adapter, separate from temporary native settings. Native operations use
   `context().tpsprio`; `into_inner` transfers an unused adapter priority back.
+- Synchronous operations which may receive internally notify an attached async
+  demux through a drop guard, waking collectors to drain the native memory queue.
+  Notification makes no native call, preserving diagnostics/one-shot settings.
+  The demux is pinned; clear the context hook before releasing it or returning
+  the context from `into_inner`. Keep new queue/transaction/RPC wrappers covered.
+- Explicit async cancellation preserves a claimed `TPEBADDESC` result and wakes
+  its collector. The descriptor stays reserved until that collector consumes
+  the result or drops, preventing interference with a later descriptor reuse.
 - One reply registration serves a context. Drain using `TPGETANY | TPNOBLOCK`
   and route by descriptor. Per-descriptor native collection can strand other
   replies in Enduro/X's memory queue, where fd readiness cannot wake their owner.
@@ -373,6 +399,8 @@ domain runs are not needed. Report which checks ran and what remains untested.
   sources; the root's `--all-targets` does not compile all nested crate binaries.
   Likewise, root formatting does not cover them: use
   `cargo fmt --manifest-path tests/<suite>/Cargo.toml --all --check` for each.
+- Documentation builds use the same native discovery and bindgen generation as
+  executable builds; install the native dependencies before running `cargo doc`.
 - Forced `endurox_pollable` compilation checks otherwise hidden branches only.
   It does not make a System V installation support reply-fd integration. Generic
   demux/timer tests and the send-only fixture still run on this backend; the
@@ -386,7 +414,10 @@ domain runs are not needed. Report which checks ran and what remains untested.
   through `run.sh --send-only`. Its ignored library test is invoked by the
   fixture with the proper environment. It uses a socket for an unused reply
   registration, so it proves real queue-send behavior on non-pollable backends
-  without proving native reply-reactor integration. Report that distinction.
+  without proving native reply-reactor integration. It also tests native mixed
+  synchronous/asynchronous receives and untimed cancellation with both drivers
+  and a silent socket: those wakes come from the binding's notification path.
+  Report that distinction.
 - Exercise both default and `ctx-send` paths for native-wrapper changes.
   Async changes should cover cancellation, deadline/priority preservation,
   descriptor routing and both runtime drivers as appropriate.

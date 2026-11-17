@@ -1,5 +1,5 @@
 use endurox_rs::{
-    ubf_fields, AtmiCtx, AtmiResult, PollerEvent, ServerHooks, TpReturnStatus, TpSvcInfo, UbfValue,
+    AtmiCtx, AtmiResult, PollerEvent, ServerHooks, TpReturnStatus, TpSvcInfo, UbfValue,
 };
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
