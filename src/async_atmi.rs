@@ -2356,6 +2356,67 @@ mod tests {
         assert!(native.reply_demux.is_none());
     }
 
+    /// Send-only and conversational calls never read the call reply queue, so
+    /// they must not notify the router. The adapter submits through
+    /// `AtmiCtx::tpacall`; a notification there woke every parked waiter on
+    /// each send.
+    #[test]
+    fn send_only_calls_do_not_wake_parked_waiters() {
+        let demux = Box::pin(ReplyDemux::default());
+        let mut native = AtmiCtx::new().unwrap();
+        native.reply_demux = Some(std::ptr::NonNull::from(demux.as_ref().get_ref()));
+        let ctx = AsyncAtmiCtx {
+            driver: PendingReplyDriver { fail_read: false },
+            demux,
+            context: native,
+            next_priority: Cell::new(None),
+        };
+        ctx.demux.register_fresh(7, false);
+        let counter = Arc::new(CountingWaker(AtomicUsize::new(0)));
+        let waker = Waker::from(counter.clone());
+        let mut task = std::task::Context::from_waker(&waker);
+        let mut one = Box::pin(ctx.wait_for_wake(Target::One(7), None));
+        assert!(one.as_mut().poll(&mut task).is_pending());
+
+        let request = ctx.tpalloc_carray(b"x").unwrap();
+        let ubf = ctx.tpalloc_ubf(1024).unwrap();
+        // The NUL is rejected before any native call, so no domain is needed.
+        let native = ctx.context();
+        for code in [
+            native
+                .tpacall("bad\0service", &request, 0)
+                .unwrap_err()
+                .code,
+            native
+                .tpconnect("bad\0service", &request, 0)
+                .unwrap_err()
+                .code,
+            native.tpdlmacall("bad\0service", &ubf, 0).unwrap_err().code,
+            native
+                .tpdlmconnect("bad\0service", &ubf, 0)
+                .unwrap_err()
+                .code,
+        ] {
+            assert_eq!(code, raw::TPEINVAL);
+        }
+        assert_eq!(counter.0.load(Ordering::SeqCst), 0);
+        assert!(!ctx.demux.resync.get());
+        assert!(one.as_mut().poll(&mut task).is_pending());
+
+        // A call that can receive on the reply queue still notifies.
+        let mut reply = ctx.tpalloc_carray(b"y").unwrap();
+        assert_eq!(
+            native
+                .tpcall("bad\0service", &request, &mut reply, 0)
+                .unwrap_err()
+                .code,
+            raw::TPEINVAL
+        );
+        assert!(counter.0.load(Ordering::SeqCst) >= 1);
+        assert!(ctx.demux.resync.get());
+        drop((one, request, ubf, reply));
+    }
+
     #[test]
     fn released_specific_wait_remains_collectable_by_any() {
         // A nonblocking probe, dropped wait, dropped ready wait, and driver

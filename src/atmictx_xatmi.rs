@@ -180,8 +180,10 @@ impl AtmiCtx {
     /// - `flags`: Submission flags; `TPNOBLOCK` fails on a full queue, and `TPNOREPLY` requests
     ///   no reply.
     pub fn tpacall(&self, svc: &str, data: &TypedBuffer<'_>, flags: i64) -> AtmiResult<i32> {
-        #[cfg(feature = "async")]
-        let _resync = self.resync_replies();
+        // No reply-router notification: native `tpacall` only sends. It never
+        // reads the reply queue, so it cannot move another call's reply into
+        // Enduro/X's in-memory queue. The async adapter submits through this
+        // method, and notifying here woke every parked waiter on each send.
         let c_svc =
             CString::new(svc).map_err(|_| AtmiError::new(raw::TPEINVAL, "svc contains NUL"))?;
         let ilen = data.len() as c_long;
@@ -532,8 +534,9 @@ impl AtmiCtx {
     /// argument bypassed the allocation checks on `set_len`, so a value larger
     /// than the buffer reached the native copy.
     pub fn tpconnect(&self, svc: &str, data: &TypedBuffer<'_>, flags: i64) -> AtmiResult<i32> {
-        #[cfg(feature = "async")]
-        let _resync = self.resync_replies();
+        // No reply-router notification: conversations receive on their own
+        // queue (`conv->my_listen_q`, `libatmi/conversation.c`), never on the
+        // call reply queue.
         let c_svc =
             CString::new(svc).map_err(|_| AtmiError::new(raw::TPEINVAL, "svc contains NUL"))?;
 
@@ -571,8 +574,9 @@ impl AtmiCtx {
     ///
     /// - `cd`: Conversation descriptor returned by `tpconnect` or supplied to a service.
     pub fn tpdiscon(&self, cd: i32) -> AtmiResult<()> {
-        #[cfg(feature = "async")]
-        let _resync = self.resync_replies();
+        // No reply-router notification: conversations receive on their own
+        // queue (`conv->my_listen_q`, `libatmi/conversation.c`), never on the
+        // call reply queue.
         #[cfg(not(feature = "ctx-send"))]
         let rc = unsafe { raw::tpdiscon(cd as c_int) };
 
@@ -603,8 +607,9 @@ impl AtmiCtx {
         flags: i64,
         revent: &mut i64,
     ) -> AtmiResult<usize> {
-        #[cfg(feature = "async")]
-        let _resync = self.resync_replies();
+        // No reply-router notification: conversations receive on their own
+        // queue (`conv->my_listen_q`, `libatmi/conversation.c`), never on the
+        // call reply queue.
         // A typed wrapper such as `TypedUbf` adds `TPNOCHANGE` here.
         let flags = flags | data.reply_flags();
         let mut odata = data.reply_ptr();
@@ -673,8 +678,9 @@ impl AtmiCtx {
         flags: i64,
         revent: &mut i64,
     ) -> AtmiResult<()> {
-        #[cfg(feature = "async")]
-        let _resync = self.resync_replies();
+        // No reply-router notification: conversations receive on their own
+        // queue (`conv->my_listen_q`, `libatmi/conversation.c`), never on the
+        // call reply queue.
         let mut c_revent: c_long = 0;
 
         #[cfg(not(feature = "ctx-send"))]

@@ -217,8 +217,9 @@ impl AtmiCtx {
     /// Collect the reply with `tpgetrply`. Submission is synchronous and can block;
     /// only submission is retried. The core enforces `TPNOTRAN`.
     pub fn tpdlmacall(&self, svc: &str, data: &TypedUbf<'_>, flags: i64) -> AtmiResult<i32> {
-        #[cfg(feature = "async")]
-        let _resync = self.resync_replies();
+        // No reply-router notification: the native retry loop only issues
+        // `tpacall`/`tpconnect` (`ndrx_tpdlm_estab`, `libatmi/eeapi.c`), which
+        // do not read the call reply queue.
         let svc = CString::new(svc)
             .map_err(|_| AtmiError::new(AtmiError::TPEINVAL, "DLM service contains NUL"))?;
         #[cfg(not(feature = "ctx-send"))]
@@ -251,8 +252,9 @@ impl AtmiCtx {
     /// Subsequent `tpsend`/`tprecv` calls and reconnection belong to the caller.
     /// The core enforces `TPNOTRAN`.
     pub fn tpdlmconnect(&self, svc: &str, data: &TypedUbf<'_>, flags: i64) -> AtmiResult<i32> {
-        #[cfg(feature = "async")]
-        let _resync = self.resync_replies();
+        // No reply-router notification: the native retry loop only issues
+        // `tpacall`/`tpconnect` (`ndrx_tpdlm_estab`, `libatmi/eeapi.c`), which
+        // do not read the call reply queue.
         let svc = CString::new(svc)
             .map_err(|_| AtmiError::new(AtmiError::TPEINVAL, "DLM service contains NUL"))?;
         #[cfg(not(feature = "ctx-send"))]

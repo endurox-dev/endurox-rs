@@ -270,6 +270,10 @@ These are custom `UbfSerialize`/`UbfDeserialize` and
   Notification makes no native call, preserving diagnostics/one-shot settings.
   The demux is pinned; clear the context hook before releasing it or returning
   the context from `into_inner`. Keep new queue/transaction/RPC wrappers covered.
+  Do not hook calls that never read the call reply queue: `tpacall` only sends,
+  conversations (`tpconnect`, `tpsend`, `tprecv`, `tpdiscon`) use their own
+  queue, and `tpdlmacall`/`tpdlmconnect` only wrap those. The adapter submits
+  through `tpacall`, so a hook there wakes every parked waiter on each send.
 - Explicit async cancellation preserves a claimed `TPEBADDESC` result and wakes
   its collector. The descriptor stays reserved until that collector consumes
   the result or drops, preventing interference with a later descriptor reuse.
